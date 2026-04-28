@@ -242,17 +242,26 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       // Execute each tool call in parallel
       const toolResults = await Promise.all(msg.tool_calls.map(async (toolCall) => {
         const functionName = toolCall.function.name.replace(/<.*$/, "").trim();
+        const rawArgs = toolCall.function.arguments;
         let functionArgs;
 
-        try {
-          functionArgs = JSON.parse(toolCall.function.arguments);
-        } catch {
+        // Some models (Claude Haiku 4.5, GPT-OSS) emit "" or whitespace for tools
+        // with no required parameters. Treat that as empty object instead of failing.
+        if (rawArgs == null || (typeof rawArgs === "string" && rawArgs.trim() === "")) {
+          functionArgs = {};
+        } else if (typeof rawArgs === "object") {
+          functionArgs = rawArgs;
+        } else {
           try {
-            functionArgs = JSON.parse(jsonrepair(toolCall.function.arguments));
-            log("warn", `Repaired malformed JSON args for ${functionName}`);
-          } catch (parseError) {
-            log("error", `Failed to parse args for ${functionName}: ${parseError.message}`);
-            functionArgs = {};
+            functionArgs = JSON.parse(rawArgs);
+          } catch {
+            try {
+              functionArgs = JSON.parse(jsonrepair(rawArgs));
+              log("warn", `Repaired malformed JSON args for ${functionName}`);
+            } catch (parseError) {
+              log("error", `Failed to parse args for ${functionName}: ${parseError.message}`);
+              functionArgs = {};
+            }
           }
         }
 

@@ -59,16 +59,35 @@ export async function getWalletBalances() {
   }
 
   const HELIUS_KEY = process.env.HELIUS_API_KEY;
+
+  // RPC-only fallback: at least surface SOL balance so safety checks don't
+  // wrongly conclude the wallet is empty when Helius is missing/unauthorised.
+  async function rpcOnlySolBalance(reason) {
+    try {
+      const connection = getConnection();
+      const lamports = await connection.getBalance(getWallet().publicKey);
+      const sol = Math.round((lamports / 1e9) * 1e6) / 1e6;
+      log("wallet_warn", `${reason} — falling back to RPC getBalance (SOL only); USD/SPL data unavailable`);
+      return { wallet: walletAddress, sol, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, degraded: reason };
+    } catch (err) {
+      log("wallet_error", `${reason} and RPC getBalance failed: ${err.message}`);
+      return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: `${reason}; rpc fallback failed: ${err.message}` };
+    }
+  }
+
   if (!HELIUS_KEY) {
-    log("wallet_error", "HELIUS_API_KEY not set in .env");
-    return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Helius API key missing" };
+    return rpcOnlySolBalance("HELIUS_API_KEY not set in .env");
   }
 
   try {
     const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
     const res = await fetch(url);
-    
+
     if (!res.ok) {
+      // 401/403 → key invalid; fall through to RPC fallback so the bot can still operate
+      if (res.status === 401 || res.status === 403) {
+        return rpcOnlySolBalance(`Helius API ${res.status} (check HELIUS_API_KEY)`);
+      }
       throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
     }
 
