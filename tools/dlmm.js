@@ -889,7 +889,7 @@ export async function deployPosition({
         totalXAmount: totalXLamports,
         totalYAmount: totalYLamports,
         strategy: { maxBinId, minBinId, strategyType },
-        slippage: 1000, // 10% in bps
+        slippage: 10, // 10% — Meteora SDK caps to 0–100 (percentage), not bps
       });
       const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
       txHashes.push(txHash);

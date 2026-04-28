@@ -65,6 +65,7 @@ export const config = {
     source:            u.screeningSource    ?? "meteora", // meteora | gmgn
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
+    maxVolatility:     u.maxVolatility     ?? 5.0,   // ceiling for pool.volatility — auto-evolved by lessons.js
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
     minVolume:         u.minVolume         ?? 500,
@@ -294,6 +295,7 @@ export function reloadScreeningThresholds() {
     const s = config.screening;
     if (fresh.screeningSource != null) s.source = fresh.screeningSource;
     if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
+    if (fresh.maxVolatility        != null) s.maxVolatility        = fresh.maxVolatility;
     if (fresh.useDiscordSignals !== undefined) s.useDiscordSignals = fresh.useDiscordSignals;
     if (fresh.discordSignalMode != null) s.discordSignalMode = fresh.discordSignalMode;
     if (fresh.excludeHighSupplyConcentration !== undefined) s.excludeHighSupplyConcentration = fresh.excludeHighSupplyConcentration;
