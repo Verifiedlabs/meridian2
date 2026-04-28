@@ -28,6 +28,7 @@ import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
+import { watchPosition, unwatchPosition } from "../src/realtime-watcher.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -774,6 +775,12 @@ export async function deployPosition({
           active_bin: activeBin.binId,
           initial_value_usd,
         });
+        watchPosition({
+          positionAddress,
+          poolAddress: pool_address,
+          lowerBin: minBinId,
+          upperBin: maxBinId,
+        }).catch((err) => log("realtime_warn", `watchPosition failed: ${err.message}`));
       }
 
       appendDecision({
@@ -920,6 +927,12 @@ export async function deployPosition({
       active_bin: activeBin.binId,
       initial_value_usd,
     });
+    watchPosition({
+      positionAddress: newPosition.publicKey.toString(),
+      poolAddress: pool_address,
+      lowerBin: minBinId,
+      upperBin: maxBinId,
+    }).catch((err) => log("realtime_warn", `watchPosition failed: ${err.message}`));
 
     appendDecision({
       type: "deploy",
@@ -1610,6 +1623,8 @@ export async function closePosition({ position_address, reason }) {
           };
         }
 
+        unwatchPosition({ positionAddress: position_address, poolAddress: tracked?.pool || poolAddress })
+          .catch((err) => log("realtime_warn", `unwatchPosition failed: ${err.message}`));
         recordClose(position_address, reason || "agent decision");
 
         if (tracked) {
@@ -1853,6 +1868,8 @@ export async function closePosition({ position_address, reason }) {
       };
     }
 
+    unwatchPosition({ positionAddress: position_address, poolAddress: tracked?.pool })
+      .catch((err) => log("realtime_warn", `unwatchPosition failed: ${err.message}`));
     recordClose(position_address, reason || "agent decision");
 
     // Record performance for learning

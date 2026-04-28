@@ -47,6 +47,13 @@ import {
   formatHelpText,
 } from "./src/format.js";
 import { getDeterministicCloseRule } from "./src/deterministic.js";
+import {
+  initRealtimeWatcher,
+  reconcileWatchers,
+  shutdownRealtimeWatcher,
+  getWatcherStats,
+} from "./src/realtime-watcher.js";
+import { getConnection } from "./rpc.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -778,6 +785,64 @@ Summarize the current portfolio health, total fees earned, and performance of al
   // Store interval ref so stopCronJobs can clear it
   _cronTasks._pnlPollInterval = pnlPollInterval;
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
+
+  // ── Realtime WS watcher (opt-in via management.realtimeMonitoring) ──
+  if (config.management?.realtimeMonitoring) {
+    initRealtimeWatcher({
+      connection: getConnection(),
+      getActiveBin,
+      enabled: true,
+      debounceMs: config.management.realtimeRefetchDebounceMs ?? 3000,
+      oorThrottleMs: (config.management.realtimeOorThrottleSec ?? 60) * 1000,
+      onOor: handleRealtimeOor,
+    });
+    // Reconcile against currently open positions so we re-subscribe
+    // after process restart.
+    getMyPositions({ force: true, silent: true })
+      .then((res) => reconcileWatchers(res?.positions || []))
+      .then(() => {
+        const stats = getWatcherStats();
+        log("realtime", `Reconciled — watching ${stats.positions} position(s) across ${stats.pools} pool(s)`);
+      })
+      .catch((err) => log("realtime_warn", `Initial reconcile failed: ${err.message}`));
+  } else {
+    log("realtime", "Realtime monitoring disabled (set management.realtimeMonitoring=true to enable)");
+  }
+}
+
+// Throttle map: positionAddress -> lastCloseAttemptMs
+const _realtimeCloseAttempts = new Map();
+
+async function handleRealtimeOor({ positionAddress, poolAddress, activeBin, lower, upper, minutesOOR }) {
+  // Avoid double-firing close while a previous attempt is in-flight.
+  const last = _realtimeCloseAttempts.get(positionAddress) || 0;
+  if (Date.now() - last < 90_000) return;
+
+  // Re-fetch positions to get fresh PnL/fee data for deterministic rule eval.
+  const fresh = await getMyPositions({ force: true, silent: true }).catch(() => null);
+  const pos = fresh?.positions?.find((p) => p.position === positionAddress);
+  if (!pos) return; // Already closed by another path.
+
+  const rule = getDeterministicCloseRule(pos, config.management);
+  if (!rule || rule.action !== "CLOSE") {
+    // Not yet eligible — likely waiting for outOfRangeWaitMinutes to elapse.
+    // The next WS event (or polling cycle) will re-evaluate.
+    return;
+  }
+
+  _realtimeCloseAttempts.set(positionAddress, Date.now());
+  log(
+    "realtime",
+    `Fast-close ${positionAddress.slice(0, 8)} pool=${poolAddress.slice(0, 8)} reason=${rule.reason} active=${activeBin} range=[${lower},${upper}]`,
+  );
+  try {
+    await closePosition({ position_address: positionAddress, reason: `realtime: ${rule.reason}` });
+  } catch (err) {
+    log("realtime_error", `closePosition failed for ${positionAddress.slice(0, 8)}: ${err.message}`);
+  } finally {
+    // Don't clear the throttle until next minute — protects against retry storm.
+    setTimeout(() => _realtimeCloseAttempts.delete(positionAddress), 90_000);
+  }
 }
 
 // ═══════════════════════════════════════════
@@ -786,6 +851,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
 async function shutdown(signal) {
   log("shutdown", `Received ${signal}. Shutting down...`);
   stopPolling();
+  await shutdownRealtimeWatcher().catch(() => {});
   const positions = await getMyPositions();
   log("shutdown", `Open positions at shutdown: ${positions.total_positions}`);
   process.exit(0);
