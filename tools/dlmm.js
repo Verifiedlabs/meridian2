@@ -1,5 +1,4 @@
 import {
-  Connection,
   Keypair,
   PublicKey,
   SystemInstruction,
@@ -9,6 +8,8 @@ import {
   VersionedTransaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
+import { getConnection, withRpcRetry } from "../rpc.js";
+import { applyPriorityInstructions } from "../tx-priority.js";
 import BN from "bn.js";
 import bs58 from "bs58";
 import { config, computeDeployAmount } from "../config.js";
@@ -71,18 +72,12 @@ async function getDLMM() {
   };
 }
 
-// ─── Lazy wallet/connection init ──────────────────────────────
+// ─── Lazy wallet init ──────────────────────────────────────────
 // Avoids crashing on import when WALLET_PRIVATE_KEY is not yet set
-// (e.g. during screening-only tests).
-let _connection = null;
+// (e.g. during screening-only tests). RPC connection is managed by ../rpc.js
+// which supports multi-endpoint failover via the RPC_URL_FALLBACK_N env vars
+// or comma-separated RPC_URL.
 let _wallet = null;
-
-function getConnection() {
-  if (!_connection) {
-    _connection = new Connection(process.env.RPC_URL, "confirmed");
-  }
-  return _connection;
-}
 
 function getWallet() {
   if (!_wallet) {
@@ -861,7 +856,11 @@ export async function deployPosition({
       const createTxArray = Array.isArray(createTxs) ? createTxs : [createTxs];
       for (let i = 0; i < createTxArray.length; i++) {
         const signers = i === 0 ? [wallet, newPosition] : [wallet];
-        const txHash = await sendAndConfirmTransaction(getConnection(), createTxArray[i], signers);
+        await applyPriorityInstructions(createTxArray[i]);
+        const txHash = await withRpcRetry(
+          () => sendAndConfirmTransaction(getConnection(), createTxArray[i], signers),
+          { label: "deploy_create" },
+        );
         txHashes.push(txHash);
         log("deploy", `Create tx ${i + 1}/${createTxArray.length}: ${txHash}`);
       }
@@ -877,7 +876,11 @@ export async function deployPosition({
       });
       const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
       for (let i = 0; i < addTxArray.length; i++) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet]);
+        await applyPriorityInstructions(addTxArray[i]);
+        const txHash = await withRpcRetry(
+          () => sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet]),
+          { label: "deploy_addLiquidity" },
+        );
         txHashes.push(txHash);
         log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
       }
@@ -891,7 +894,11 @@ export async function deployPosition({
         strategy: { maxBinId, minBinId, strategyType },
         slippage: 10, // 10% — Meteora SDK caps to 0–100 (percentage), not bps
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
+      await applyPriorityInstructions(tx);
+      const txHash = await withRpcRetry(
+        () => sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]),
+        { label: "deploy_initAndAdd" },
+      );
       txHashes.push(txHash);
     }
 
@@ -1471,7 +1478,11 @@ export async function claimFees({ position_address }) {
 
     const txHashes = [];
     for (const tx of txs) {
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+      await applyPriorityInstructions(tx);
+      const txHash = await withRpcRetry(
+        () => sendAndConfirmTransaction(getConnection(), tx, [wallet]),
+        { label: "claim_fees" },
+      );
       txHashes.push(txHash);
     }
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
@@ -1523,7 +1534,7 @@ export async function closePosition({ position_address, reason }) {
             positionId: position_address,
             owner: wallet.publicKey.toString(),
             bps: 10000,
-            slippageBps: 5000,
+            slippageBps: config.management?.closeSlippageBps ?? 1000,
             output: closeOutput,
             provider: "OKX",
             type: "meteora",
@@ -1743,7 +1754,11 @@ export async function closePosition({ position_address, reason }) {
         });
         if (claimTxs && claimTxs.length > 0) {
           for (const tx of claimTxs) {
-            const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+            await applyPriorityInstructions(tx);
+            const claimHash = await withRpcRetry(
+              () => sendAndConfirmTransaction(getConnection(), tx, [wallet]),
+              { label: "close_claim" },
+            );
             claimTxHashes.push(claimHash);
           }
           log("close", `Step 1 OK (claim only): ${claimTxHashes.join(", ")}`);
@@ -1782,7 +1797,11 @@ export async function closePosition({ position_address, reason }) {
       });
 
       for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+        await applyPriorityInstructions(tx);
+        const txHash = await withRpcRetry(
+          () => sendAndConfirmTransaction(getConnection(), tx, [wallet]),
+          { label: "close_position_local" },
+        );
         closeTxHashes.push(txHash);
       }
     } else {
@@ -1791,7 +1810,11 @@ export async function closePosition({ position_address, reason }) {
         owner: wallet.publicKey,
         position: { publicKey: positionPubKey },
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), closeTx, [wallet]);
+      await applyPriorityInstructions(closeTx);
+      const txHash = await withRpcRetry(
+        () => sendAndConfirmTransaction(getConnection(), closeTx, [wallet]),
+        { label: "close_position_remove" },
+      );
       closeTxHashes.push(txHash);
     }
     const txHashes = [...claimTxHashes, ...closeTxHashes];

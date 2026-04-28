@@ -177,6 +177,9 @@ export const config = {
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
+    // Slippage tolerance for close-position auto-swap (LPAgent zap-out & local Jupiter fallback).
+    // Expressed in basis points (10000 = 100%). Default 1000 (10%) — was 5000 (50%) which is excessive.
+    closeSlippageBps:      u.closeSlippageBps      ?? 1000,
   },
 
   // ─── Strategy Mapping ───────────────────
@@ -222,9 +225,24 @@ export const config = {
     USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
   },
 
+  // ─── Priority Fee / Compute Budget ──────
+  // Prepended to every on-chain Solana tx (deploy, claim, close).
+  // Keep enabled in production — without these, txs drop during congestion.
+  priorityFee: {
+    enabled:           u.priorityFeeEnabled           ?? true,
+    computeUnitLimit:  u.priorityFeeComputeUnitLimit  ?? 600_000,
+    minMicroLamports:  u.priorityFeeMinMicroLamports  ?? 1_000,
+    maxMicroLamports:  u.priorityFeeMaxMicroLamports  ?? 1_000_000,
+    percentile:        u.priorityFeePercentile        ?? 75,
+    cacheTtlMs:        u.priorityFeeCacheTtlMs        ?? 15_000,
+  },
+
   // ─── HiveMind ─────────────────────────
+  // Opt-in. Set hiveMindEnabled=true (or HIVEMIND_ENABLED=true env) to participate.
+  // README documents this as an explicit opt-in feature; do not enable by default.
   hiveMind: {
-    url: nonEmptyString(u.hiveMindUrl, DEFAULT_HIVEMIND_URL),
+    enabled: u.hiveMindEnabled ?? (process.env.HIVEMIND_ENABLED === "true"),
+    url: nonEmptyString(u.hiveMindUrl, process.env.HIVEMIND_URL, DEFAULT_HIVEMIND_URL),
     apiKey: nonEmptyString(u.hiveMindApiKey, process.env.HIVEMIND_API_KEY, DEFAULT_HIVEMIND_API_KEY),
     agentId: u.agentId ?? null,
     pullMode: u.hiveMindPullMode ?? "auto",

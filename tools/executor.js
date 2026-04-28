@@ -54,6 +54,144 @@ function redactAppliedConfig(applied) {
 let _cronRestarter = null;
 export function registerCronRestarter(fn) { _cronRestarter = fn; }
 
+// ─── update_config validators ──────────────────────────────────────
+// Each validator: (value) => { value } on success, { error } on failure.
+// Validators may coerce types (e.g. "5" → 5) but must reject obviously
+// dangerous values: negatives where positive expected, NaN, out-of-range,
+// wrong types. Keys without a validator are accepted as-is for backward
+// compatibility — add validators here as you encounter risky keys.
+const num = (min, max, { allowNull = false, integer = false } = {}) => (v) => {
+  if (allowNull && (v === null || v === undefined)) return { value: null };
+  if (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v))) v = Number(v);
+  if (typeof v !== "number" || !isFinite(v)) return { error: `expected number, got ${typeof v}` };
+  if (integer && !Number.isInteger(v)) return { error: `expected integer, got ${v}` };
+  if (v < min) return { error: `value ${v} below minimum ${min}` };
+  if (v > max) return { error: `value ${v} above maximum ${max}` };
+  return { value: v };
+};
+const bool = () => (v) => {
+  if (typeof v === "boolean") return { value: v };
+  if (v === "true" || v === 1) return { value: true };
+  if (v === "false" || v === 0) return { value: false };
+  return { error: `expected boolean, got ${JSON.stringify(v)}` };
+};
+const str = ({ allowEmpty = false, maxLen = 1024, allowNull = false } = {}) => (v) => {
+  if (allowNull && (v === null || v === undefined)) return { value: null };
+  if (typeof v !== "string") return { error: `expected string, got ${typeof v}` };
+  if (!allowEmpty && v === "") return { error: "expected non-empty string" };
+  if (v.length > maxLen) return { error: `string length ${v.length} exceeds max ${maxLen}` };
+  return { value: v };
+};
+const oneOf = (allowed) => (v) => {
+  if (typeof v === "string" && allowed.includes(v)) return { value: v };
+  return { error: `expected one of ${JSON.stringify(allowed)}, got ${JSON.stringify(v)}` };
+};
+const arrOf = (itemValidator) => (v) => {
+  if (!Array.isArray(v)) return { error: `expected array, got ${typeof v}` };
+  const out = [];
+  for (let i = 0; i < v.length; i++) {
+    const r = itemValidator(v[i]);
+    if (r.error) return { error: `index ${i}: ${r.error}` };
+    out.push(r.value);
+  }
+  return { value: out };
+};
+
+const CONFIG_VALIDATORS = {
+  // ─── risk-critical (wallet-touching) ──────────────────────────
+  maxPositions:           num(0, 50, { integer: true }),
+  maxDeployAmount:        num(0, 10000),
+  deployAmountSol:        num(0, 1000),
+  positionSizePct:        num(0.01, 1.0),
+  gasReserve:             num(0, 100),
+  minSolToOpen:           num(0, 1000),
+  minClaimAmount:         num(0, 1000),
+  stopLossPct:            num(-100, 0),
+  takeProfitPct:          num(0, 10000),
+  takeProfitFeePct:       num(0, 10000),
+  trailingTakeProfit:     bool(),
+  trailingTriggerPct:     num(0, 10000),
+  trailingDropPct:        num(0, 100),
+  pnlSanityMaxDiffPct:    num(0, 100),
+  closeSlippageBps:       num(0, 5000, { integer: true }),
+  // ─── screening bounds ─────────────────────────────────────────
+  minTvl:                 num(0, 1e12),
+  maxTvl:                 num(0, 1e12),
+  minVolume:              num(0, 1e12),
+  minOrganic:             num(0, 100),
+  minQuoteOrganic:        num(0, 100),
+  minHolders:             num(0, 1e9, { integer: true }),
+  minMcap:                num(0, 1e15),
+  maxMcap:                num(0, 1e15),
+  minBinStep:             num(1, 10000, { integer: true }),
+  maxBinStep:             num(1, 10000, { integer: true }),
+  minFeeActiveTvlRatio:   num(0, 100),
+  maxVolatility:          num(0, 1000),
+  minTokenFeesSol:        num(0, 1e9),
+  maxBundlePct:           num(0, 100),
+  maxBotHoldersPct:       num(0, 100),
+  maxTop10Pct:            num(0, 100),
+  excludeHighSupplyConcentration: bool(),
+  useDiscordSignals:      bool(),
+  discordSignalMode:      oneOf(["merge", "only"]),
+  avoidPvpSymbols:        bool(),
+  blockPvpSymbols:        bool(),
+  minTokenAgeHours:       num(0, 1e6, { allowNull: true }),
+  maxTokenAgeHours:       num(0, 1e6, { allowNull: true }),
+  athFilterPct:           num(-100, 0, { allowNull: true }),
+  timeframe:              oneOf(["1m", "5m", "15m", "30m", "1h", "4h", "12h", "24h"]),
+  category:               oneOf(["trending", "newest", "top", "rising", "all"]),
+  screeningSource:        oneOf(["meteora", "gmgn"]),
+  allowedLaunchpads:      arrOf((v) => str({ allowEmpty: false, maxLen: 64 })(v)),
+  blockedLaunchpads:      arrOf((v) => str({ allowEmpty: false, maxLen: 64 })(v)),
+  // ─── schedule ─────────────────────────────────────────────────
+  managementIntervalMin:  num(1, 1440, { integer: true }),
+  screeningIntervalMin:   num(1, 1440, { integer: true }),
+  healthCheckIntervalMin: num(1, 1440, { integer: true }),
+  // ─── management toggles & limits ──────────────────────────────
+  outOfRangeBinsToClose:  num(0, 10000, { integer: true }),
+  outOfRangeWaitMinutes:  num(0, 100000),
+  oorCooldownTriggerCount: num(0, 1000, { integer: true }),
+  oorCooldownHours:        num(0, 8760),
+  repeatDeployCooldownEnabled:        bool(),
+  repeatDeployCooldownTriggerCount:   num(0, 1000, { integer: true }),
+  repeatDeployCooldownHours:          num(0, 8760),
+  repeatDeployCooldownMinFeeEarnedPct: num(0, 1000),
+  minVolumeToRebalance:   num(0, 1e12),
+  autoSwapAfterClaim:     bool(),
+  solMode:                oneOf(["always", "auto", "never"]),
+  minAgeBeforeYieldCheck: num(0, 100000),
+  minFeePerTvl24h:        num(0, 100),
+  minBinsBelow:           num(0, 1000, { integer: true }),
+  maxBinsBelow:           num(0, 1000, { integer: true }),
+  // ─── llm ──────────────────────────────────────────────────────
+  temperature:            num(0, 2),
+  maxTokens:              num(1, 1_000_000, { integer: true }),
+  maxSteps:               num(1, 1000, { integer: true }),
+  // ─── priority fee / compute budget ────────────────────────────
+  priorityFeeEnabled:           bool(),
+  priorityFeeComputeUnitLimit:  num(0, 1_400_000, { integer: true }),
+  priorityFeeMinMicroLamports:  num(0, 1_000_000_000, { integer: true }),
+  priorityFeeMaxMicroLamports:  num(0, 1_000_000_000, { integer: true }),
+  priorityFeePercentile:        num(1, 100, { integer: true }),
+  priorityFeeCacheTtlMs:        num(0, 600_000, { integer: true }),
+  // ─── hivemind / api keys ──────────────────────────────────────
+  hiveMindEnabled:        bool(),
+  hiveMindUrl:            str({ allowEmpty: false, allowNull: true }),
+  hiveMindApiKey:         str({ allowEmpty: false, maxLen: 4096, allowNull: true }),
+  hiveMindPullMode:       oneOf(["auto", "manual"]),
+  agentId:                str({ allowEmpty: false, maxLen: 256, allowNull: true }),
+  publicApiKey:           str({ allowEmpty: false, maxLen: 4096, allowNull: true }),
+  agentMeridianApiUrl:    str({ allowEmpty: false, allowNull: true }),
+  lpAgentRelayEnabled:    bool(),
+};
+
+function validateConfigChange(key, value) {
+  const validator = CONFIG_VALIDATORS[key];
+  if (!validator) return { value }; // no validator = accept (back-compat for unmapped keys)
+  return validator(value);
+}
+
 // Map tool names to implementations
 const toolMap = {
   discover_pools: discoverPools,
@@ -200,6 +338,7 @@ const toolMap = {
       trailingDropPct: ["management", "trailingDropPct"],
       pnlSanityMaxDiffPct: ["management", "pnlSanityMaxDiffPct"],
       solMode: ["management", "solMode"],
+      closeSlippageBps: ["management", "closeSlippageBps"],
       minSolToOpen: ["management", "minSolToOpen"],
       deployAmountSol: ["management", "deployAmountSol"],
       gasReserve: ["management", "gasReserve"],
@@ -223,7 +362,15 @@ const toolMap = {
       strategy:     ["strategy", "strategy"],
       minBinsBelow: ["strategy", "minBinsBelow"],
       maxBinsBelow: ["strategy", "maxBinsBelow"],
+      // priority fee / compute budget
+      priorityFeeEnabled:           ["priorityFee", "enabled"],
+      priorityFeeComputeUnitLimit:  ["priorityFee", "computeUnitLimit"],
+      priorityFeeMinMicroLamports:  ["priorityFee", "minMicroLamports"],
+      priorityFeeMaxMicroLamports:  ["priorityFee", "maxMicroLamports"],
+      priorityFeePercentile:        ["priorityFee", "percentile"],
+      priorityFeeCacheTtlMs:        ["priorityFee", "cacheTtlMs"],
       // hivemind
+      hiveMindEnabled: ["hiveMind", "enabled"],
       hiveMindUrl: ["hiveMind", "url"],
       hiveMindApiKey: ["hiveMind", "apiKey"],
       agentId: ["hiveMind", "agentId"],
@@ -294,21 +441,29 @@ const toolMap = {
 
     const applied = {};
     const unknown = [];
+    const rejected = []; // [{ key, value, error }]
 
     // Build case-insensitive lookup
     const CONFIG_MAP_LOWER = Object.fromEntries(
       Object.entries(CONFIG_MAP).map(([k, v]) => [k.toLowerCase(), [k, v]])
     );
 
-    for (const [key, val] of Object.entries(changes)) {
-      const match = CONFIG_MAP[key] ? [key, CONFIG_MAP[key]] : CONFIG_MAP_LOWER[key.toLowerCase()];
-      if (!match) { unknown.push(key); continue; }
-      applied[match[0]] = val;
+    for (const [rawKey, rawVal] of Object.entries(changes)) {
+      const match = CONFIG_MAP[rawKey] ? [rawKey, CONFIG_MAP[rawKey]] : CONFIG_MAP_LOWER[rawKey.toLowerCase()];
+      if (!match) { unknown.push(rawKey); continue; }
+      const key = match[0];
+      const validation = validateConfigChange(key, rawVal);
+      if (validation.error) {
+        rejected.push({ key, value: rawVal, error: validation.error });
+        log("config", `update_config rejected ${key}=${JSON.stringify(rawVal)} — ${validation.error}`);
+        continue;
+      }
+      applied[key] = validation.value;
     }
 
     if (Object.keys(applied).length === 0) {
-      log("config", `update_config failed — unknown keys: ${JSON.stringify(unknown)}, raw changes: ${JSON.stringify(changes)}`);
-      return { success: false, unknown, reason };
+      log("config", `update_config failed — unknown: ${JSON.stringify(unknown)}, rejected: ${JSON.stringify(rejected)}, raw changes: ${JSON.stringify(changes)}`);
+      return { success: false, unknown, rejected, reason };
     }
 
     // Apply to live config immediately
@@ -395,7 +550,7 @@ const toolMap = {
     }
 
     log("config", `Agent self-tuned: ${JSON.stringify(redactAppliedConfig(applied))} — ${reason}`);
-    return { success: true, applied: redactAppliedConfig(applied), unknown, reason };
+    return { success: true, applied: redactAppliedConfig(applied), unknown, rejected, reason };
   },
 };
 

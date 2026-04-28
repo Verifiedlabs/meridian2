@@ -85,6 +85,9 @@ export function getHiveMindPullMode() {
 }
 
 export function isHiveMindEnabled() {
+  // Opt-in: require explicit hiveMind.enabled=true. Even if URL+apiKey have
+  // defaults from config.js, we won't sync until the user opts in.
+  if (!config.hiveMind?.enabled) return false;
   return !!(getBaseUrl() && getApiKey());
 }
 
