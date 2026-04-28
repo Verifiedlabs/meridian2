@@ -134,6 +134,8 @@ export const config = {
     athFilterPct: gmgnValue("athFilterPct", "gmgnAthFilterPct", null),
     preferredKolNames: gmgnArray("preferredKolNames", "gmgnPreferredKolNames", []),
     dumpKolNames: gmgnArray("dumpKolNames", "gmgnDumpKolNames", []),
+    rejectSingleVolumeSpike: gmgnValue("rejectSingleVolumeSpike", "gmgnRejectSingleVolumeSpike", true),
+    maxSingleCandleVolumeShare: gmgnValue("maxSingleCandleVolumeShare", "gmgnMaxSingleCandleVolumeShare", 0.7),
     indicatorFilter: gmgnValue("indicatorFilter", "gmgnIndicatorFilter", true),
     indicatorInterval: gmgnValue("indicatorInterval", "gmgnIndicatorInterval", "15_MINUTE"),
     indicatorRules: (() => {
