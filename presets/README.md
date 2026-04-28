@@ -7,15 +7,22 @@ cp presets/aggressive.json user-config.json
 # or balanced.json / conservative.json
 ```
 
-| Preset | Wallet size | Max positions | Stop loss | Take profit | Mgmt interval | OpenRouter cost |
-|---|---|---|---|---|---|---|
-| **conservative** | <5 SOL | 2 | -25% | +8% (trailing 4/1.5) | 15 min | low |
-| **balanced** | 5-20 SOL | 4 | -40% | +5% (trailing 3/1.5) | 10 min | medium |
-| **aggressive** | >20 SOL | 8 | -55% | +4% (trailing 2/1) | 5 min | high |
+| Preset | Wallet size | Max positions | Stop loss | Take profit | Mgmt interval | OpenRouter cost | Purpose |
+|---|---|---|---|---|---|---|---|
+| **micro-live** | ~0.5-1 SOL | 1 (0.05 SOL/pos) | -40% | +5% (trailing 3/1.5) | 5 min | medium | Data collection — record real closed positions to seed darwin tuner |
+| **conservative** | <5 SOL | 2 | -25% | +8% (trailing 4/1.5) | 15 min | low | Capital preservation |
+| **balanced** | 5-20 SOL | 4 | -40% | +5% (trailing 3/1.5) | 10 min | medium | Recommended default |
+| **aggressive** | >20 SOL | 8 | -55% | +4% (trailing 2/1) | 5 min | high | High-frequency, max compounding |
 
-## What's the same across all three
+## When to use which
 
-- `dryRun: true` — **always start with DRY RUN to verify candidates make sense before going live**.
+- **First-time user, want to learn the agent**: `dryRun: true` with any preset — observe candidates and decisions for 24-48 hours, then go live.
+- **Want real performance data before scaling up**: `micro-live` — runs live with tiny size (0.05 SOL/position, 1 slot). After ~20-30 closed positions, darwin tuner starts evolving thresholds based on your actual win/loss data, and you have enough sample size to evaluate the agent's edge in current pool conditions.
+- **Profit mode after micro-live validation**: switch to `conservative` / `balanced` / `aggressive` based on wallet size — scale up size + slots once you trust the data.
+
+## What's the same across all four
+
+- `dryRun: true` for `conservative` / `balanced` / `aggressive` — **always start with DRY RUN to verify candidates make sense before going live**. (`micro-live` is the exception: it's `dryRun: false` by design since the entire point is to collect real data; size is capped to 0.05-0.1 SOL so risk is bounded.)
 - `darwinEnabled: true` — adaptive threshold tuner (Meridian learns from closed positions).
 - `pnlSanityMaxDiffPct: 5` — guards against PnL oracle glitches.
 - `trailingTakeProfit: true` — locks in profit on a drop after a peak.
