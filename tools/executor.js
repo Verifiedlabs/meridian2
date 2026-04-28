@@ -675,7 +675,7 @@ export async function executeTool(name, args) {
 /**
  * Run safety checks before executing write operations.
  */
-async function runSafetyChecks(name, args) {
+export async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
       // Reject pools with bin_step out of configured range

@@ -14,7 +14,12 @@
     "dev": "DRY_RUN=true node index.js",
     "test:screen": "node test/test-screening.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "postinstall": "node scripts/patch-anchor.js"
+  },
+  "devDependencies": {
+    "vitest": "^1.6.0"
   },
   "dependencies": {
     "@meteora-ag/dlmm": "1.9.4",
