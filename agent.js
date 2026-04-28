@@ -222,11 +222,26 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         }
         if (mustUseRealTool && !sawToolCall) {
           noToolRetryCount += 1;
+          // Capture model's reasoning before popping so we can surface it
+          // if the model insists on a no-tool answer across all retries.
+          const skipText = String(msg.content || "").trim();
           messages.pop();
-          log("agent", `Rejected no-tool final answer (${noToolRetryCount}/2) for tool-required request`);
+          // Log a clipped preview so operators can see WHY the model wants
+          // to skip — previously the rejection logged nothing useful.
+          const preview = skipText.length > 280 ? `${skipText.slice(0, 280)}…` : skipText;
+          log(
+            "agent",
+            `Rejected no-tool final answer (${noToolRetryCount}/2) — model said: ${preview || "(empty)"}`,
+          );
           if (noToolRetryCount >= 2) {
+            // Honour the model's reasoned decision instead of replacing it
+            // with a generic error. Most often the model is correctly
+            // declining (e.g. "skip — candidate too risky") and the right
+            // behaviour is to let the cycle log that decision and move on.
             return {
-              content: "I couldn't complete that reliably because no tool call was made. Please retry after checking the logs.",
+              content: skipText
+                ? `[no-tool] ${skipText}`
+                : "I couldn't complete that reliably because no tool call was made. Please retry after checking the logs.",
               userMessage: goal,
             };
           }
