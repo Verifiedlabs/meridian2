@@ -33,6 +33,20 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import {
+  stripThink,
+  sanitizeUntrustedPromptText,
+  nextRunIn,
+  formatCountdown,
+  fmtPct,
+  formatCandidates,
+  buildGmgnFunnelReport,
+  computeBinsBelow,
+  formatWalletStatus,
+  formatConfigSnapshot,
+  formatHelpText,
+} from "./src/format.js";
+import { getDeterministicCloseRule } from "./src/deterministic.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -51,19 +65,6 @@ const timers = {
   managementLastRun: null,
   screeningLastRun: null,
 };
-
-function nextRunIn(lastRun, intervalMin) {
-  if (!lastRun) return intervalMin * 60;
-  const elapsed = (Date.now() - lastRun) / 1000;
-  return Math.max(0, intervalMin * 60 - elapsed);
-}
-
-function formatCountdown(seconds) {
-  if (seconds <= 0) return "now";
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return m > 0 ? `${m}m ${s}s` : `${s}s`;
-}
 
 function buildPrompt() {
   const mgmt = formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin));
@@ -85,23 +86,6 @@ const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
 const TRAILING_DROP_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_DROP_CONFIRM_TOLERANCE_PCT = 1.0;
-
-/** Strip <think>...</think> reasoning blocks that some models leak into output */
-function stripThink(text) {
-  if (!text) return text;
-  return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-}
-
-function sanitizeUntrustedPromptText(text, maxLen = 500) {
-  if (!text) return null;
-  const cleaned = String(text)
-    .replace(/[\r\n\t]+/g, " ")
-    .replace(/\s+/g, " ")
-    .replace(/[<>`]/g, "")
-    .trim()
-    .slice(0, maxLen);
-  return cleaned ? JSON.stringify(cleaned) : null;
-}
 
 function shouldUsePnlRecheck() {
   return !config.api.lpAgentRelayEnabled;
@@ -812,95 +796,6 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 // ═══════════════════════════════════════════
-//  FORMAT CANDIDATES TABLE
-// ═══════════════════════════════════════════
-function formatCandidates(candidates) {
-  if (!candidates.length) return "  No eligible pools found right now.";
-
-  const lines = candidates.map((p, i) => {
-    const name = (p.name || "unknown").padEnd(20);
-    const ftvl = `${p.fee_active_tvl_ratio ?? p.fee_tvl_ratio}%`.padStart(8);
-    const vol = `$${((p.volume_window || 0) / 1000).toFixed(1)}k`.padStart(8);
-    const active = `${p.active_pct}%`.padStart(6);
-    const org = String(p.organic_score).padStart(4);
-    return `  [${i + 1}]  ${name}  fee/aTVL:${ftvl}  vol:${vol}  in-range:${active}  organic:${org}`;
-  });
-
-  return [
-    "  #   pool                  fee/aTVL     vol    in-range  organic",
-    "  " + "─".repeat(68),
-    ...lines,
-  ].join("\n");
-}
-
-function getDeterministicCloseRule(position, managementConfig) {
-  const tracked = getTrackedPosition(position.position);
-  const pnlSuspect = (() => {
-    if (position.pnl_pct == null) return false;
-    if (position.pnl_pct > -90) return false;
-    if (tracked?.amount_sol && (position.total_value_usd ?? 0) > 0.01) {
-      log("cron_warn", `Suspect PnL for ${position.pair}: ${position.pnl_pct}% but position still has value — skipping PnL rules`);
-      return true;
-    }
-    return false;
-  })();
-
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
-    return { action: "CLOSE", rule: 1, reason: "stop loss" };
-  }
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
-    return { action: "CLOSE", rule: 2, reason: "take profit" };
-  }
-  if (
-    position.active_bin != null &&
-    position.upper_bin != null &&
-    position.active_bin > position.upper_bin + managementConfig.outOfRangeBinsToClose
-  ) {
-    return { action: "CLOSE", rule: 3, reason: "pumped far above range" };
-  }
-  if (
-    position.active_bin != null &&
-    position.upper_bin != null &&
-    position.active_bin > position.upper_bin &&
-    (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
-  ) {
-    return { action: "CLOSE", rule: 4, reason: "OOR" };
-  }
-  if (
-    position.fee_per_tvl_24h != null &&
-    position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
-    (position.age_minutes ?? 0) >= 60
-  ) {
-    return { action: "CLOSE", rule: 5, reason: "low yield" };
-  }
-  return null;
-}
-
-function buildGmgnFunnelReport(stageCounts, allFiltered = [], { fromStage = 1 } = {}) {
-  if (!stageCounts) return null;
-  const sc = stageCounts;
-  const funnel = `GMGN funnel: ranked=${sc.ranked ?? "?"} → S1=${sc.s1 ?? "?"} → S2=${sc.s2 ?? "?"} → S3=${sc.s3 ?? "?"} → S4=${sc.s4 ?? "?"} → final=${sc.s5 ?? "?"}`;
-  const byStage = {};
-  for (const f of allFiltered) {
-    if (f.stage < fromStage) continue;
-    const key = `s${f.stage}`;
-    if (!byStage[key]) byStage[key] = [];
-    byStage[key].push(`${f.name}: ${f.reason}`);
-  }
-  const stageLabels = { s2: "S2 info", s3: "S3 pool", s4: "S4 indicators", s5: "S5 pick" };
-  const details = Object.entries(byStage)
-    .map(([key, items]) => `${stageLabels[key] || key}:\n${items.map(r => `  • ${r}`).join("\n")}`)
-    .join("\n");
-  return details ? `${funnel}\n\n${details}` : funnel;
-}
-
-function computeBinsBelow(volatility) {
-  const lo = config.strategy.minBinsBelow;
-  const hi = config.strategy.maxBinsBelow;
-  return Math.max(lo, Math.min(hi, Math.round(lo + ((Number(volatility) || 0) / 5) * (hi - lo))));
-}
-
-// ═══════════════════════════════════════════
 //  INTERACTIVE REPL
 // ═══════════════════════════════════════════
 const isTTY = process.stdin.isTTY;
@@ -938,38 +833,6 @@ function describeLatestCandidates(limit = 5) {
   });
   const age = _latestCandidatesAt ? new Date(_latestCandidatesAt).toLocaleString("en-US", { hour12: false }) : "unknown";
   return `Latest candidates (${_latestCandidates.length}) — updated ${age}\n\n${lines.join("\n")}`;
-}
-
-function formatWalletStatus(wallet, positions) {
-  const deployAmount = computeDeployAmount(wallet.sol);
-  const hive = isHiveMindEnabled() ? "on" : "off";
-  return [
-    `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
-    `SOL price: $${wallet.sol_price}`,
-    `Open positions: ${positions.total_positions}/${config.risk.maxPositions}`,
-    `Next deploy amount: ${deployAmount} SOL`,
-    `Dry run: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
-    `HiveMind: ${hive}`,
-  ].join("\n");
-}
-
-function formatConfigSnapshot() {
-  return [
-    "Config snapshot",
-    "",
-    `Screening source: ${config.screening.source}`,
-    `Strategy: ${config.strategy.strategy} | bins: [${config.strategy.minBinsBelow}–${config.strategy.maxBinsBelow}] (volatility-scaled)`,
-    `Deploy: ${config.management.deployAmountSol} SOL | gasReserve: ${config.management.gasReserve} | maxPositions: ${config.risk.maxPositions}`,
-    `Stop loss: ${config.management.stopLossPct}% | take profit: ${config.management.takeProfitPct}%`,
-    `Trailing: ${config.management.trailingTakeProfit ? "on" : "off"} | trigger ${config.management.trailingTriggerPct}% | drop ${config.management.trailingDropPct}%`,
-    `OOR: ${config.management.outOfRangeWaitMinutes}m | cooldown ${config.management.oorCooldownTriggerCount}x / ${config.management.oorCooldownHours}h`,
-    `Repeat deploy cooldown: ${config.management.repeatDeployCooldownEnabled ? "on" : "off"} | ${config.management.repeatDeployCooldownTriggerCount}x / ${config.management.repeatDeployCooldownHours}h | min fee earned ${config.management.repeatDeployCooldownMinFeeEarnedPct}% | ${config.management.repeatDeployCooldownScope}`,
-    `Yield floor: ${config.management.minFeePerTvl24h}% | min age ${config.management.minAgeBeforeYieldCheck}m`,
-    `Screening: ${config.screening.category} / ${config.screening.timeframe} | TVL ${config.screening.minTvl}-${config.screening.maxTvl}`,
-    `GMGN interval: ${config.gmgn.interval} | OrderBy: ${config.gmgn.orderBy} | Dir: ${config.gmgn.direction}`,
-    `Intervals: manage ${config.schedule.managementIntervalMin}m | screen ${config.schedule.screeningIntervalMin}m`,
-    `HiveMind: ${isHiveMindEnabled() ? "enabled" : "disabled"}${config.hiveMind.agentId ? ` | ${config.hiveMind.agentId}` : ""}`,
-  ].join("\n");
 }
 
 function parseConfigValue(raw) {
@@ -1327,33 +1190,6 @@ async function applySettingsMenuCallback(msg) {
             : "risk";
   await answerCallbackQuery(msg.callbackQueryId, `Updated ${key}`);
   await showSettingsMenu({ messageId: msg.messageId, page });
-}
-
-function formatHelpText() {
-  return [
-    "Telegram commands",
-    "",
-    "/help — show commands",
-    "/status — wallet + positions snapshot",
-    "/wallet — wallet, deploy amount, HiveMind status",
-    "/positions — list open positions",
-    "/pool <n> — detailed info for one open position",
-    "/close <n> — close one position by index",
-    "/closeall — close all open positions",
-    "/set <n> <note> — set note/instruction on position",
-    "/config — show important runtime config",
-    "/settings — button menu for common config",
-    "/setcfg <key> <value> — update persisted config",
-    "/screen — refresh deterministic candidate list",
-    "/candidates — show latest cached candidates",
-    "/deploy <n> — deploy candidate by cached index",
-    "/briefing — morning briefing",
-    "/hive — HiveMind sync status",
-    "/hive pull — manual HiveMind pull now",
-    "/pause — stop cron cycles",
-    "/resume — start cron cycles again",
-    "/stop — shut down agent",
-  ].join("\n");
 }
 
 async function runDeterministicScreen(limit = 5) {
@@ -1733,11 +1569,6 @@ async function telegramHandler(msg) {
     refreshPrompt();
     drainTelegramQueue().catch(() => {});
   }
-}
-
-function fmtPct(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? `${n.toFixed(2)}%` : "?";
 }
 
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
