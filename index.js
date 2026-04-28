@@ -55,7 +55,6 @@ ensureAgentId();
 bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
 startHiveMindBackgroundSync();
 
-const TP_PCT = config.management.takeProfitPct;
 const DEPLOY = config.management.deployAmountSol;
 
 // ═══════════════════════════════════════════
