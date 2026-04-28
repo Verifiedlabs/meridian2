@@ -135,14 +135,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
       let response;
       let usedModel = activeModel;
-      // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes.
-      // Also force on subsequent steps if the must-use-real-tool guard is on and the model has yet to call any
-      // tool — this stops models that are reluctant to use tools (e.g. Claude Haiku 4.5 in some prompts) from
-      // burning all retry slots returning text answers.
+      // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
-      const stepZeroForceTool = step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool);
-      const retryForceTool = mustUseRealTool && !sawToolCall && noToolRetryCount > 0;
-      let toolChoice = (stepZeroForceTool || retryForceTool) ? "required" : "auto";
+      let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
