@@ -139,6 +139,7 @@ const CONFIG_VALIDATORS = {
   minTokenAgeHours:       num(0, 1e6, { allowNull: true }),
   maxTokenAgeHours:       num(0, 1e6, { allowNull: true }),
   athFilterPct:           num(-100, 0, { allowNull: true }),
+  dropOkxRugpull:         bool(),
   timeframe:              oneOf(["1m", "5m", "15m", "30m", "1h", "4h", "12h", "24h"]),
   category:               oneOf(["trending", "newest", "top", "rising", "all"]),
   screeningSource:        oneOf(["meteora", "gmgn"]),
@@ -316,6 +317,7 @@ const toolMap = {
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
       athFilterPct:     ["screening", "athFilterPct"],
+      dropOkxRugpull:   ["screening", "dropOkxRugpull"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],

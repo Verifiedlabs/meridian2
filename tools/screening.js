@@ -410,6 +410,18 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       return true;
     }));
 
+    // Rugpull hard filter (opt-out via config.screening.dropOkxRugpull = false)
+    if (config.screening.dropOkxRugpull !== false) {
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        if (p.is_rugpull) {
+          log("screening", `Risk filter: dropped ${p.name} — rugpull flagged by OKX`);
+          pushFilteredReason(filteredOut, p, "rugpull flagged by OKX");
+          return false;
+        }
+        return true;
+      }));
+    }
+
     // ATH filter — drop pools where price is too close to ATH
     const athFilter = config.screening.athFilterPct;
     if (athFilter != null) {
