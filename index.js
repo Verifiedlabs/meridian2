@@ -1038,6 +1038,7 @@ function renderSettingsMenu(page = "main") {
 
   const nav = [
     [
+      settingButton("↩ Panel", "panel:refresh"),
       settingButton("Main", "cfg:page:main"),
       settingButton("Risk", "cfg:page:risk"),
       settingButton("Strategy", "cfg:page:strategy"),
@@ -1382,7 +1383,7 @@ async function applyControlPanelCallback(msg) {
   }
   if (action === "settings") {
     await ack();
-    await showSettingsMenu();
+    await showSettingsMenu({ messageId: msg.messageId });
     return;
   }
   if (action === "mute_toggle") {
