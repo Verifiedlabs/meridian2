@@ -270,6 +270,23 @@ export const config = {
     ),
   },
 
+  // ─── Telegram Notifications ─────────────
+  // All flags default to false (= notification IS sent). Set to true to mute
+  // a specific category. `muteAll` overrides every per-category flag — when
+  // true, NO notifications are sent. Logs (logger.js) always fire regardless.
+  telegram: (() => {
+    const t = u.telegram ?? {};
+    return {
+      muteAll:     t.muteAll     ?? u.telegramMuteAll     ?? false,
+      muteDeploy:  t.muteDeploy  ?? u.telegramMuteDeploy  ?? false,
+      muteClose:   t.muteClose   ?? u.telegramMuteClose   ?? false,
+      muteSwap:    t.muteSwap    ?? u.telegramMuteSwap    ?? false,
+      muteOor:     t.muteOor     ?? u.telegramMuteOor     ?? false,
+      muteCycle:   t.muteCycle   ?? u.telegramMuteCycle   ?? false,
+      muteClaim:   t.muteClaim   ?? u.telegramMuteClaim   ?? false,
+    };
+  })(),
+
   indicators: {
     enabled: indicatorUserConfig.enabled ?? false,
     entryPreset: indicatorUserConfig.entryPreset ?? "supertrend_break",

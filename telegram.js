@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { config } from "./config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -396,9 +397,49 @@ export function stopPolling() {
   _polling = false;
 }
 
+// ─── Notification mute helpers ──────────────────────────────────
+const MUTE_LABELS = {
+  deploy:  "deploy",
+  close:   "close",
+  swap:    "swap",
+  oor:     "out-of-range",
+  cycle:   "cycle report",
+  claim:   "claim",
+};
+
+/**
+ * Returns true when the given notification category should be suppressed
+ * (i.e. NOT sent to Telegram). Logs (logger.js) always fire regardless.
+ * Categories: "deploy" | "close" | "swap" | "oor" | "cycle" | "claim".
+ * `muteAll` overrides per-category flags.
+ */
+export function isMuted(category) {
+  const t = config?.telegram;
+  if (!t) return false;
+  if (t.muteAll) return true;
+  switch (category) {
+    case "deploy": return !!t.muteDeploy;
+    case "close":  return !!t.muteClose;
+    case "swap":   return !!t.muteSwap;
+    case "oor":    return !!t.muteOor;
+    case "cycle":  return !!t.muteCycle;
+    case "claim":  return !!t.muteClaim;
+    default:       return false;
+  }
+}
+
+function logMuteSkip(category, summary) {
+  const label = MUTE_LABELS[category] || category;
+  log("telegram_mute", `Suppressed ${label} notification — ${summary}`);
+}
+
 // ─── Notification helpers ────────────────────────────────────────
 export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee }) {
   if (hasActiveLiveMessage()) return;
+  if (isMuted("deploy")) {
+    logMuteSkip("deploy", `${pair} amount=${amountSol} pos=${position?.slice(0, 8)}…`);
+    return;
+  }
   const priceStr = priceRange
     ? `Price range: ${priceRange.min < 0.0001 ? priceRange.min.toExponential(3) : priceRange.min.toFixed(6)} – ${priceRange.max < 0.0001 ? priceRange.max.toExponential(3) : priceRange.max.toFixed(6)}\n`
     : "";
@@ -421,6 +462,10 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
 
 export async function notifyClose({ pair, pnlUsd, pnlPct }) {
   if (hasActiveLiveMessage()) return;
+  if (isMuted("close")) {
+    logMuteSkip("close", `${pair} pnl=${(pnlUsd ?? 0).toFixed(2)} pct=${(pnlPct ?? 0).toFixed(2)}%`);
+    return;
+  }
   const sign = pnlUsd >= 0 ? "+" : "";
   await sendHTML(
     `🔒 <b>Closed</b> ${pair}\n` +
@@ -430,6 +475,10 @@ export async function notifyClose({ pair, pnlUsd, pnlPct }) {
 
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
   if (hasActiveLiveMessage()) return;
+  if (isMuted("swap")) {
+    logMuteSkip("swap", `${inputSymbol} → ${outputSymbol} in=${amountIn} out=${amountOut}`);
+    return;
+  }
   await sendHTML(
     `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
     `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
@@ -439,6 +488,10 @@ export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOu
 
 export async function notifyOutOfRange({ pair, minutesOOR }) {
   if (hasActiveLiveMessage()) return;
+  if (isMuted("oor")) {
+    logMuteSkip("oor", `${pair} minutesOOR=${minutesOOR}`);
+    return;
+  }
   await sendHTML(
     `⚠️ <b>Out of Range</b> ${pair}\n` +
     `Been OOR for ${minutesOOR} minutes`

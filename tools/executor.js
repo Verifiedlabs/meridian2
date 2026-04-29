@@ -188,6 +188,14 @@ const CONFIG_VALIDATORS = {
   publicApiKey:           str({ allowEmpty: false, maxLen: 4096, allowNull: true }),
   agentMeridianApiUrl:    str({ allowEmpty: false, allowNull: true }),
   lpAgentRelayEnabled:    bool(),
+  // ─── telegram notification mute toggles ───────────────────────
+  telegramMuteAll:    bool(),
+  telegramMuteDeploy: bool(),
+  telegramMuteClose:  bool(),
+  telegramMuteSwap:   bool(),
+  telegramMuteOor:    bool(),
+  telegramMuteCycle:  bool(),
+  telegramMuteClaim:  bool(),
 };
 
 function validateConfigChange(key, value) {
@@ -387,6 +395,14 @@ const toolMap = {
       publicApiKey: ["api", "publicApiKey"],
       agentMeridianApiUrl: ["api", "url"],
       lpAgentRelayEnabled: ["api", "lpAgentRelayEnabled"],
+      // telegram notification mute toggles
+      telegramMuteAll:    ["telegram", "muteAll"],
+      telegramMuteDeploy: ["telegram", "muteDeploy"],
+      telegramMuteClose:  ["telegram", "muteClose"],
+      telegramMuteSwap:   ["telegram", "muteSwap"],
+      telegramMuteOor:    ["telegram", "muteOor"],
+      telegramMuteCycle:  ["telegram", "muteCycle"],
+      telegramMuteClaim:  ["telegram", "muteClaim"],
       // GMGN screening
       gmgnApiKey: ["gmgn", "apiKey"],
       gmgnBaseUrl: ["gmgn", "baseUrl"],

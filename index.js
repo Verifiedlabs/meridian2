@@ -21,6 +21,7 @@ import {
   answerCallbackQuery,
   notifyOutOfRange,
   isEnabled as telegramEnabled,
+  isMuted as telegramMuted,
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
@@ -189,7 +190,7 @@ export async function runManagementCycle({ silent = false } = {}) {
   const screeningCooldownMs = 5 * 60 * 1000;
 
   try {
-    if (!silent && telegramEnabled()) {
+    if (!silent && telegramEnabled() && !telegramMuted("cycle")) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
@@ -344,9 +345,11 @@ After executing, write a brief one-line result per position.
   } finally {
     _managementBusy = false;
     if (!silent && telegramEnabled()) {
-      if (mgmtReport) {
+      if (mgmtReport && !telegramMuted("cycle")) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
         else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
+      } else if (mgmtReport) {
+        log("telegram_mute", `Suppressed cycle report — management: ${stripThink(mgmtReport).slice(0, 120)}…`);
       }
       for (const p of positions) {
         if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
@@ -404,7 +407,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     _screeningBusy = false;
     return screenReport;
   }
-  if (!silent && telegramEnabled()) {
+  if (!silent && telegramEnabled() && !telegramMuted("cycle")) {
     liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
   }
   timers.screeningLastRun = Date.now();
@@ -680,9 +683,11 @@ IMPORTANT:
   } finally {
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {
-      if (screenReport) {
+      if (screenReport && !telegramMuted("cycle")) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
         else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
+      } else if (screenReport) {
+        log("telegram_mute", `Suppressed cycle report — screening: ${stripThink(screenReport).slice(0, 120)}…`);
       }
     }
   }
@@ -963,6 +968,14 @@ function settingValue(key) {
     rsiLength: config.indicators.rsiLength,
     indicatorIntervals: config.indicators.intervals,
     requireAllIntervals: config.indicators.requireAllIntervals,
+    // telegram notification mute toggles
+    telegramMuteAll:    config.telegram?.muteAll,
+    telegramMuteDeploy: config.telegram?.muteDeploy,
+    telegramMuteClose:  config.telegram?.muteClose,
+    telegramMuteSwap:   config.telegram?.muteSwap,
+    telegramMuteOor:    config.telegram?.muteOor,
+    telegramMuteCycle:  config.telegram?.muteCycle,
+    telegramMuteClaim:  config.telegram?.muteClaim,
   };
   return values[key];
 }
@@ -971,6 +984,19 @@ function fmtSettingValue(value) {
   if (Array.isArray(value)) return value.join(",");
   if (typeof value === "boolean") return value ? "on" : "off";
   return String(value);
+}
+
+function formatNotifSummary() {
+  const t = config.telegram || {};
+  if (t.muteAll) return "ALL muted";
+  const muted = [];
+  if (t.muteDeploy) muted.push("deploy");
+  if (t.muteClose)  muted.push("close");
+  if (t.muteSwap)   muted.push("swap");
+  if (t.muteOor)    muted.push("oor");
+  if (t.muteCycle)  muted.push("cycle");
+  if (t.muteClaim)  muted.push("claim");
+  return muted.length ? `muted ${muted.join(",")}` : "all on";
 }
 
 function settingButton(label, data) {
@@ -1007,6 +1033,7 @@ function renderSettingsMenu(page = "main") {
     `Strategy: ${config.strategy.strategy} | deploy ${config.management.deployAmountSol} SOL | max pos ${config.risk.maxPositions}`,
     `TP/SL: ${config.management.takeProfitPct}% / ${config.management.stopLossPct}% | trailing ${config.management.trailingTakeProfit ? "on" : "off"}`,
     `Indicators: ${config.indicators.enabled ? "on" : "off"} | entry ${config.indicators.entryPreset} | ${fmtSettingValue(config.indicators.intervals)}`,
+    `Notif: ${formatNotifSummary()}`,
   ].join("\n");
 
   const nav = [
@@ -1020,6 +1047,9 @@ function renderSettingsMenu(page = "main") {
       settingButton("Indicators", "cfg:page:indicators"),
       settingButton("GMGN", "cfg:page:gmgn"),
       settingButton("KOL", "cfg:page:kol"),
+    ],
+    [
+      settingButton("Notif", "cfg:page:notif"),
     ],
   ];
 
@@ -1125,6 +1155,13 @@ function renderSettingsMenu(page = "main") {
       ],
       inputButton("rsiLength", "RSI length"),
     ];
+  } else if (page === "notif") {
+    rows = [
+      [toggleButton("telegramMuteAll", "Mute ALL")],
+      [toggleButton("telegramMuteDeploy", "Deploy mute"),  toggleButton("telegramMuteClose", "Close mute")],
+      [toggleButton("telegramMuteSwap",   "Swap mute"),    toggleButton("telegramMuteOor",   "OOR mute")],
+      [toggleButton("telegramMuteCycle",  "Cycle mute"),   toggleButton("telegramMuteClaim", "Claim mute")],
+    ];
   } else {
     rows = [
       [
@@ -1133,6 +1170,7 @@ function renderSettingsMenu(page = "main") {
       ],
       [toggleButton("solMode", "SOL mode"), toggleButton("lpAgentRelayEnabled", "LPAgent relay")],
       [toggleButton("chartIndicatorsEnabled", "Chart indicators"), toggleButton("trailingTakeProfit", "Trailing TP")],
+      [toggleButton("telegramMuteAll", "Mute ALL"), settingButton("Notif page", "cfg:page:notif")],
       [
         settingButton("Risk / deploy", "cfg:page:risk"),
         settingButton("Screening", "cfg:page:screen"),
@@ -1242,7 +1280,8 @@ async function applySettingsMenuCallback(msg) {
     await answerCallbackQuery(msg.callbackQueryId, "Config update failed");
     return;
   }
-  page = ["gmgnPreferredKolNames", "gmgnPreferredKolMinHoldPct", "gmgnDumpKolNames", "gmgnDumpKolMinHoldPct"].includes(key) ? "kol"
+  page = key.startsWith("telegramMute") ? "notif"
+    : ["gmgnPreferredKolNames", "gmgnPreferredKolMinHoldPct", "gmgnDumpKolNames", "gmgnDumpKolMinHoldPct"].includes(key) ? "kol"
     : ["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours"].includes(key) ? "screen"
     : key.startsWith("gmgn") && key !== "gmgnRequireKol"
       ? "gmgn"

@@ -104,6 +104,13 @@
     "requireAllIntervals": false
   },
   "telegramChatId": "",
+  "telegramMuteAll": false,
+  "telegramMuteDeploy": false,
+  "telegramMuteClose": false,
+  "telegramMuteSwap": false,
+  "telegramMuteOor": false,
+  "telegramMuteCycle": false,
+  "telegramMuteClaim": false,
   "hiveMindUrl": "",
   "hiveMindApiKey": "",
   "hiveMindPullMode": "auto"
