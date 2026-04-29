@@ -1440,31 +1440,42 @@ async function sendHistoryMessage(limit = 10) {
   await sendMessage(buildHistoryMessagePlain(limit)).catch(() => {});
 }
 
+// Render a sub-view (Positions / History / Wallet / etc.) in place of the
+// control panel. Always includes a [↩ Back to Panel] button so the user can
+// return without spawning a second message.
+async function showPanelView({ messageId, title, body, parseMode = null, extraButtons = [] }) {
+  const text = title ? `${title}\n\n${body}` : body;
+  const backRow = [{ text: "↩ Back to Panel", callback_data: "panel:refresh" }];
+  const keyboard = [...extraButtons, backRow];
+  await editMessageWithButtons(text, messageId, keyboard, parseMode ? { parseMode } : {})
+    .catch(async () => {
+      // edit failed (e.g. message too old) — send a fresh one with the buttons
+      await sendMessageWithButtons(text, keyboard, parseMode ? { parseMode } : {});
+    });
+}
+
 async function applyControlPanelCallback(msg) {
   const data = msg.callbackData || msg.text || "";
   const parts = data.split(":");
   const action = parts[1];
   const cur = config.management.solMode ? "◎" : "$";
+  const messageId = msg.messageId;
 
   // ack first so Telegram doesn't show the spinner forever
   const ack = (note) => answerCallbackQuery(msg.callbackQueryId, note).catch(() => {});
 
-  if (action === "refresh") {
+  if (action === "refresh" || action === "dashboard") {
     await ack();
-    await showControlPanel({ messageId: msg.messageId });
-    return;
-  }
-  if (action === "dashboard") {
-    await ack();
-    await showControlPanel({ messageId: msg.messageId });
+    await showControlPanel({ messageId });
     return;
   }
   if (action === "positions") {
     await ack();
+    let body;
     try {
       const { positions, total_positions } = await getMyPositions({ force: true });
       if (!total_positions) {
-        await sendMessage("No open positions.");
+        body = "No open positions.";
       } else {
         const lines = positions.map((p, i) => {
           const pnl = (p.pnl_usd ?? 0) >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
@@ -1472,54 +1483,102 @@ async function applyControlPanelCallback(msg) {
           const oor = !p.in_range ? " ⚠️OOR" : "";
           return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
         });
-        await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note>`);
+        body = `${lines.join("\n")}\n\n<i>/close &lt;n&gt; to close · /set &lt;n&gt; &lt;note&gt;</i>`;
       }
-    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
-    await showControlPanel({ messageId: msg.messageId });
+    } catch (e) { body = `Error: ${e.message}`; }
+    await showPanelView({
+      messageId,
+      title: "📊 <b>Open Positions</b>",
+      body,
+      parseMode: "HTML",
+    });
     return;
   }
   if (action === "history") {
     await ack();
-    await sendHistoryMessage(10);
-    await showControlPanel({ messageId: msg.messageId });
+    let body;
+    try {
+      body = await buildHistoryMessage(10);
+    } catch (e) { body = `Error: ${e.message}`; }
+    // buildHistoryMessage already includes the title; pass body only
+    await editMessageWithButtons(body, messageId,
+      [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      { parseMode: "HTML" },
+    ).catch(async () => {
+      // HTML rejected — fallback to plain text
+      const plain = buildHistoryMessagePlain(10);
+      await editMessageWithButtons(plain, messageId,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ).catch(() => sendMessageWithButtons(plain,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ));
+    });
     return;
   }
   if (action === "candidates") {
     await ack();
-    await sendMessage(describeLatestCandidates(5)).catch(() => {});
-    await showControlPanel({ messageId: msg.messageId });
+    let body;
+    try { body = describeLatestCandidates(5); }
+    catch (e) { body = `Error: ${e.message}`; }
+    await showPanelView({
+      messageId,
+      title: "📋 <b>Latest Candidates</b>",
+      body: escapeHtml(body),
+      parseMode: "HTML",
+    });
     return;
   }
   if (action === "screen") {
     await ack("Running screening cycle…");
-    try {
-      const out = await runDeterministicScreen(5);
-      await sendMessage(out);
-    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
-    await showControlPanel({ messageId: msg.messageId });
+    // show "running" placeholder so user sees something while screening runs
+    await editMessageWithButtons("🔍 <b>Running screening cycle…</b>\n<i>This may take 10–30 seconds.</i>", messageId, [], { parseMode: "HTML" }).catch(() => {});
+    let body;
+    try { body = await runDeterministicScreen(5); }
+    catch (e) { body = `Error: ${e.message}`; }
+    await showPanelView({
+      messageId,
+      title: "🔍 <b>Screening Result</b>",
+      body: escapeHtml(body),
+      parseMode: "HTML",
+    });
     return;
   }
   if (action === "wallet") {
     await ack();
+    let body;
     try {
       const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
-      await sendMessage(formatWalletStatus(wallet, positions));
-    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
-    await showControlPanel({ messageId: msg.messageId });
+      body = formatWalletStatus(wallet, positions);
+    } catch (e) { body = `Error: ${e.message}`; }
+    await showPanelView({
+      messageId,
+      title: "💼 <b>Wallet</b>",
+      body: escapeHtml(body),
+      parseMode: "HTML",
+    });
     return;
   }
   if (action === "briefing") {
     await ack("Generating briefing…");
-    try {
-      const briefing = await generateBriefing();
-      await sendHTML(briefing);
-    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
-    await showControlPanel({ messageId: msg.messageId });
+    await editMessageWithButtons("☀️ <b>Generating briefing…</b>", messageId, [], { parseMode: "HTML" }).catch(() => {});
+    let html;
+    try { html = await generateBriefing(); }
+    catch (e) { html = `Error: ${e.message}`; }
+    // briefing is already HTML — append back button row
+    await editMessageWithButtons(html, messageId,
+      [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      { parseMode: "HTML" },
+    ).catch(async () => {
+      // fallback if HTML rejected
+      await editMessageWithButtons(html.replace(/<[^>]+>/g, ""), messageId,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ).catch(() => {});
+    });
     return;
   }
   if (action === "settings") {
     await ack();
-    await showSettingsMenu({ messageId: msg.messageId });
+    await showSettingsMenu({ messageId });
     return;
   }
   if (action === "mute_toggle") {
@@ -1570,25 +1629,36 @@ async function applyControlPanelCallback(msg) {
   }
   if (action === "closeall_do") {
     await ack("Closing all positions…");
+    let body;
     try {
       const { positions } = await getMyPositions({ force: true });
       if (!positions.length) {
-        await sendMessage("No open positions.");
+        body = "No open positions to close.";
       } else {
-        await sendMessage(`Closing ${positions.length} position(s)…`);
+        await editMessageWithButtons(
+          `🔒 <b>Closing ${positions.length} position(s)…</b>\n<i>Please wait, do not click anything.</i>`,
+          messageId, [], { parseMode: "HTML" },
+        ).catch(() => {});
         const results = [];
         for (const pos of positions) {
           try {
             const r = await closePosition({ position_address: pos.position });
-            results.push(r.success ? `✅ ${pos.pair} | PnL ${cur}${r.pnl_usd ?? "?"}` : `❌ ${pos.pair}`);
+            results.push(r.success
+              ? `✅ ${escapeHtml(pos.pair)} · PnL ${escapeHtml(`${cur}${r.pnl_usd ?? "?"}`)}`
+              : `❌ ${escapeHtml(pos.pair)}`);
           } catch (e) {
-            results.push(`❌ ${pos.pair}: ${e.message}`);
+            results.push(`❌ ${escapeHtml(pos.pair)}: ${escapeHtml(e.message)}`);
           }
         }
-        await sendMessage(`Close-all finished.\n\n${results.join("\n")}`);
+        body = `<b>Close-all finished.</b>\n\n${results.join("\n")}`;
       }
-    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
-    await showControlPanel({ messageId: msg.messageId });
+    } catch (e) { body = `Error: ${escapeHtml(e.message)}`; }
+    await showPanelView({
+      messageId,
+      title: "🔒 <b>Close All</b>",
+      body,
+      parseMode: "HTML",
+    });
     return;
   }
 
