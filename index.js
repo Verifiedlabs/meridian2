@@ -1080,18 +1080,19 @@ function renderSettingsMenu(page = "main") {
       inputButton("repeatDeployCooldownMinFeeEarnedPct", "Min fee earned %", { digits: 1 }),
     ];
   } else if (page === "screen") {
+    const src = String(config.screening?.source || "meteora").toLowerCase();
     rows = [
       [
-        settingButton("Source: Meteora", "cfg:set:screeningSource:meteora"),
-        settingButton("Source: GMGN", "cfg:set:screeningSource:gmgn"),
+        settingButton(`${src === "meteora" ? "✅ " : "   "}Source: Meteora`, "cfg:set:screeningSource:meteora"),
+        settingButton(`${src === "gmgn" ? "✅ " : "   "}Source: GMGN`, "cfg:set:screeningSource:gmgn"),
       ],
       [toggleButton("gmgnRequireKol", "GMGN require KOL")],
       [toggleButton("useDiscordSignals", "Discord signals"), toggleButton("blockPvpSymbols", "PVP hard block")],
       [
-        settingButton("5m", "cfg:set:gmgnInterval:5m"),
-        settingButton("1h", "cfg:set:gmgnInterval:1h"),
-        settingButton("6h", "cfg:set:gmgnInterval:6h"),
-        settingButton("24h", "cfg:set:gmgnInterval:24h"),
+        settingButton(`${(config.gmgn?.interval || "1h") === "5m" ? "✅ " : ""}5m`, "cfg:set:gmgnInterval:5m"),
+        settingButton(`${(config.gmgn?.interval || "1h") === "1h" ? "✅ " : ""}1h`, "cfg:set:gmgnInterval:1h"),
+        settingButton(`${(config.gmgn?.interval || "1h") === "6h" ? "✅ " : ""}6h`, "cfg:set:gmgnInterval:6h"),
+        settingButton(`${(config.gmgn?.interval || "1h") === "24h" ? "✅ " : ""}24h`, "cfg:set:gmgnInterval:24h"),
       ],
       [
         inputButton("gmgnMinVolume", "Min volume")[0],
@@ -1106,21 +1107,23 @@ function renderSettingsMenu(page = "main") {
       inputButton("screeningIntervalMin", "Screen interval (min)"),
     ];
   } else if (page === "strategy") {
+    const strat = String(config.screening?.strategy || "spot").toLowerCase();
     rows = [
       [
-        settingButton("spot", "cfg:set:strategy:spot"),
-        settingButton("bid_ask", "cfg:set:strategy:bid_ask"),
+        settingButton(`${strat === "spot" ? "✅ " : "   "}spot`, "cfg:set:strategy:spot"),
+        settingButton(`${strat === "bid_ask" ? "✅ " : "   "}bid_ask`, "cfg:set:strategy:bid_ask"),
       ],
       inputButton("minBinsBelow", "Min bins"),
       inputButton("maxBinsBelow", "Max bins"),
     ];
   } else if (page === "gmgn") {
+    const gtf = String(config.gmgn?.indicatorInterval || "15_MINUTE");
     rows = [
       [toggleButton("gmgnIndicatorFilter", "Indicator filter"), toggleButton("gmgnRequireKol", "Require KOL")],
       [
-        settingButton("TF: 5m", "cfg:set:gmgnIndicatorInterval:5_MINUTE"),
-        settingButton("TF: 15m", "cfg:set:gmgnIndicatorInterval:15_MINUTE"),
-        settingButton("TF: 1h", "cfg:set:gmgnIndicatorInterval:1h"),
+        settingButton(`${gtf === "5_MINUTE" ? "✅ " : ""}TF: 5m`, "cfg:set:gmgnIndicatorInterval:5_MINUTE"),
+        settingButton(`${gtf === "15_MINUTE" ? "✅ " : ""}TF: 15m`, "cfg:set:gmgnIndicatorInterval:15_MINUTE"),
+        settingButton(`${gtf === "1h" ? "✅ " : ""}TF: 1h`, "cfg:set:gmgnIndicatorInterval:1h"),
       ],
       [toggleButton("gmgnRequireBullishSt", "Bullish ST"), toggleButton("gmgnRejectAtBottom", "Reject at bottom"), toggleButton("gmgnRequireAboveSt", "Above ST")],
       inputButton("gmgnMinRsi", "Min RSI"),
@@ -1138,22 +1141,27 @@ function renderSettingsMenu(page = "main") {
       inputButton("gmgnDumpKolMinHoldPct", "Dump KOL min hold %"),
     ];
   } else if (page === "indicators") {
+    const intervals = Array.isArray(config.indicators?.intervals) ? config.indicators.intervals : [];
+    const tfIs = (v) => intervals.length === 1 && intervals[0] === v;
+    const tfBoth = intervals.length >= 2;
+    const entry = String(config.indicators?.entryPreset || "");
+    const exit = String(config.indicators?.exitPreset || "");
     rows = [
       [toggleButton("chartIndicatorsEnabled", "Chart indicators"), toggleButton("requireAllIntervals", "Require all TF")],
       [
-        settingButton("TF: 5m", "cfg:set:indicatorIntervals:5_MINUTE"),
-        settingButton("TF: 15m", "cfg:set:indicatorIntervals:15_MINUTE"),
-        settingButton("TF: both", "cfg:set:indicatorIntervals:both"),
+        settingButton(`${tfIs("5_MINUTE") ? "✅ " : ""}TF: 5m`, "cfg:set:indicatorIntervals:5_MINUTE"),
+        settingButton(`${tfIs("15_MINUTE") ? "✅ " : ""}TF: 15m`, "cfg:set:indicatorIntervals:15_MINUTE"),
+        settingButton(`${tfBoth ? "✅ " : ""}TF: both`, "cfg:set:indicatorIntervals:both"),
       ],
       [
-        settingButton("Entry: ST", "cfg:set:indicatorEntryPreset:supertrend_break"),
-        settingButton("Entry: RSI", "cfg:set:indicatorEntryPreset:rsi_reversal"),
-        settingButton("Entry: ST/RSI", "cfg:set:indicatorEntryPreset:supertrend_or_rsi"),
+        settingButton(`${entry === "supertrend_break" ? "✅ " : ""}Entry: ST`, "cfg:set:indicatorEntryPreset:supertrend_break"),
+        settingButton(`${entry === "rsi_reversal" ? "✅ " : ""}Entry: RSI`, "cfg:set:indicatorEntryPreset:rsi_reversal"),
+        settingButton(`${entry === "supertrend_or_rsi" ? "✅ " : ""}Entry: ST/RSI`, "cfg:set:indicatorEntryPreset:supertrend_or_rsi"),
       ],
       [
-        settingButton("Exit: ST", "cfg:set:indicatorExitPreset:supertrend_break"),
-        settingButton("Exit: RSI", "cfg:set:indicatorExitPreset:rsi_reversal"),
-        settingButton("Exit: BB+RSI", "cfg:set:indicatorExitPreset:bb_plus_rsi"),
+        settingButton(`${exit === "supertrend_break" ? "✅ " : ""}Exit: ST`, "cfg:set:indicatorExitPreset:supertrend_break"),
+        settingButton(`${exit === "rsi_reversal" ? "✅ " : ""}Exit: RSI`, "cfg:set:indicatorExitPreset:rsi_reversal"),
+        settingButton(`${exit === "bb_plus_rsi" ? "✅ " : ""}Exit: BB+RSI`, "cfg:set:indicatorExitPreset:bb_plus_rsi"),
       ],
       inputButton("rsiLength", "RSI length"),
     ];
@@ -1165,10 +1173,11 @@ function renderSettingsMenu(page = "main") {
       [toggleButton("telegramMuteCycle",  "Cycle mute"),   toggleButton("telegramMuteClaim", "Claim mute")],
     ];
   } else {
+    const src = String(config.screening?.source || "meteora").toLowerCase();
     rows = [
       [
-        settingButton("Source: Meteora", "cfg:set:screeningSource:meteora"),
-        settingButton("Source: GMGN", "cfg:set:screeningSource:gmgn"),
+        settingButton(`${src === "meteora" ? "✅ " : "   "}Source: Meteora`, "cfg:set:screeningSource:meteora"),
+        settingButton(`${src === "gmgn" ? "✅ " : "   "}Source: GMGN`, "cfg:set:screeningSource:gmgn"),
       ],
       [toggleButton("solMode", "SOL mode"), toggleButton("lpAgentRelayEnabled", "LPAgent relay")],
       [toggleButton("chartIndicatorsEnabled", "Chart indicators"), toggleButton("trailingTakeProfit", "Trailing TP")],
@@ -1253,6 +1262,7 @@ async function renderControlPanel() {
     `${cycleDot}  🤖 Bot      <b>${cycleText}</b>`,
     `${notifDot}  Notif      <i>${notifLabel}</i>`,
     `💱  Mode       <b>${config.management.solMode ? "SOL" : "USD"}</b>`,
+    `🔎  Source     <b>${(config.screening?.source || "meteora").toUpperCase()}</b>`,
     `⏱  Updated    <i>${updated}</i>`,
   ].join("\n");
 
