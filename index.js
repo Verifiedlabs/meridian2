@@ -1230,7 +1230,7 @@ async function renderControlPanel() {
 
   // Status indicators
   const cycleDot = cyclesOn ? "🟢" : "🔴";
-  const cycleText = cyclesOn ? "running" : "paused";
+  const cycleText = cyclesOn ? "active" : "paused";
   const notifDot = muteAll ? "🔕" : "🔔";
 
   const walletStr = walletSol != null ? `<b>${walletSol.toFixed(2)}</b> SOL` : "<i>?</i>";
@@ -1250,7 +1250,7 @@ async function renderControlPanel() {
     `📁  Positions  ${posStr}`,
     `📊  Open PnL   ${pnlStr}`,
     "━━━━━━━━━━━━━━━━━━━━━━━",
-    `${cycleDot}  Cycles     <b>${cycleText}</b>`,
+    `${cycleDot}  🤖 Bot      <b>${cycleText}</b>`,
     `${notifDot}  Notif      <i>${notifLabel}</i>`,
     `💱  Mode       <b>${config.management.solMode ? "SOL" : "USD"}</b>`,
     `⏱  Updated    <i>${updated}</i>`,
