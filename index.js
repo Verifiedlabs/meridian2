@@ -8,7 +8,7 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { formatGmgnCandidateForPrompt } from "./tools/gmgn.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
-import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
+import { evolveThresholds, getPerformanceSummary, getPerformanceHistory } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
   startPolling,
@@ -1194,6 +1194,270 @@ async function showSettingsMenu({ messageId = null, page = "main" } = {}) {
   }
 }
 
+// ─── Control Panel ─────────────────────────────────────────────
+// "MERIDIAN CONTROL PANEL" — main entry point with quick-action buttons.
+// Each button either runs a self-contained action (sends a separate reply)
+// or refreshes the panel after toggling state.
+async function renderControlPanel() {
+  const cur = config.management.solMode ? "◎" : "$";
+  let walletLine = "wallet: …";
+  let positionsLine = "positions: …";
+  let pnlLine = "";
+  try {
+    const [wallet, posResult] = await Promise.all([
+      getWalletBalances().catch(() => null),
+      getMyPositions({ force: false, silent: true }).catch(() => null),
+    ]);
+    if (wallet) {
+      walletLine = `💰 ${(wallet.sol ?? 0).toFixed(2)} SOL`;
+    }
+    if (posResult) {
+      const positions = posResult.positions || [];
+      const oor = positions.filter((p) => !p.in_range).length;
+      const totalPnl = positions.reduce((s, p) => s + (Number(p.pnl_usd) || 0), 0);
+      positionsLine = `📁 ${positions.length} positions${oor ? ` (⚠️ ${oor} OOR)` : ""}`;
+      if (positions.length > 0) {
+        const sign = totalPnl >= 0 ? "+" : "";
+        pnlLine = `Open PnL: ${sign}${cur}${totalPnl.toFixed(2)}`;
+      }
+    }
+  } catch { /* best-effort, panel still renders */ }
+
+  const muteState = config.telegram?.muteAll ? "🔇 ALL MUTED"
+    : formatNotifSummary() === "all on" ? "🔔 all on"
+    : `🔕 ${formatNotifSummary()}`;
+  const cycleState = cronStarted ? "ON" : "PAUSED";
+  const updated = new Date().toLocaleString("en-US", { hour12: false, timeStyle: "short" });
+
+  const text = [
+    "🎛 <b>MERIDIAN CONTROL PANEL</b>",
+    `${walletLine}  •  ${positionsLine}`,
+    [pnlLine, `Mode: ${config.management.solMode ? "SOL" : "USD"}`, `Cycles: ${cycleState}`].filter(Boolean).join("  |  "),
+    `Notif: ${muteState}  •  Updated: ${updated}`,
+  ].join("\n");
+
+  const muteLabel = config.telegram?.muteAll ? "🔔 Unmute" : "🔇 Mute";
+  const pauseLabel = cronStarted ? "⏸ Pause" : "▶️ Resume";
+
+  const keyboard = [
+    [
+      { text: "📊 Dashboard",  callback_data: "panel:dashboard" },
+      { text: "📁 Positions",  callback_data: "panel:positions" },
+    ],
+    [
+      { text: "📜 History",    callback_data: "panel:history" },
+      { text: "📋 Candidates", callback_data: "panel:candidates" },
+    ],
+    [
+      { text: "🔍 Screen Now", callback_data: "panel:screen" },
+      { text: "💼 Wallet",     callback_data: "panel:wallet" },
+    ],
+    [
+      { text: "☀️ Briefing",   callback_data: "panel:briefing" },
+      { text: "⚙ Settings",    callback_data: "panel:settings" },
+    ],
+    [
+      { text: muteLabel,        callback_data: "panel:mute_toggle" },
+      { text: "❌ Close All",   callback_data: "panel:closeall_confirm" },
+    ],
+    [
+      { text: pauseLabel,       callback_data: "panel:pause_toggle" },
+      { text: "🔄 Refresh",     callback_data: "panel:refresh" },
+    ],
+  ];
+
+  return { text, keyboard };
+}
+
+async function showControlPanel({ messageId = null } = {}) {
+  const panel = await renderControlPanel();
+  if (messageId) {
+    await editMessageWithButtons(panel.text, messageId, panel.keyboard, { parseMode: "HTML" })
+      .catch(async () => { await sendMessageWithButtons(panel.text, panel.keyboard, { parseMode: "HTML" }); });
+  } else {
+    await sendMessageWithButtons(panel.text, panel.keyboard, { parseMode: "HTML" });
+  }
+}
+
+async function buildHistoryMessage(limit = 10) {
+  const cur = config.management.solMode ? "◎" : "$";
+  try {
+    const hist = getPerformanceHistory({ hours: 24 * 7, limit });
+    if (!hist.count) return "No closed positions in the last 7 days.";
+    const lines = (hist.positions || []).slice(-limit).reverse().map((r, i) => {
+      const sign = (r.pnl_usd ?? 0) >= 0 ? "+" : "";
+      const age = r.minutes_held != null ? `${r.minutes_held}m` : "?";
+      const reason = r.close_reason ? ` | ${r.close_reason}` : "";
+      const date = r.closed_at ? new Date(r.closed_at).toLocaleString("en-US", { hour12: false, dateStyle: "short", timeStyle: "short" }) : "?";
+      return `${i + 1}. ${r.pool_name || "?"} | ${sign}${cur}${(r.pnl_usd ?? 0).toFixed(2)} (${sign}${(r.pnl_pct ?? 0).toFixed(1)}%) | ${age}${reason} | ${date}`;
+    });
+    const totalSign = (hist.total_pnl_usd ?? 0) >= 0 ? "+" : "";
+    return [
+      `📜 Closed positions (last ${hist.count}/${hist.hours}h):`,
+      `Total PnL: ${totalSign}${cur}${(hist.total_pnl_usd ?? 0).toFixed(2)}  •  Wins: ${hist.wins ?? 0}/${hist.count}`,
+      "",
+      ...lines,
+    ].join("\n");
+  } catch (e) {
+    return `History error: ${e.message}`;
+  }
+}
+
+async function applyControlPanelCallback(msg) {
+  const data = msg.callbackData || msg.text || "";
+  const parts = data.split(":");
+  const action = parts[1];
+  const cur = config.management.solMode ? "◎" : "$";
+
+  // ack first so Telegram doesn't show the spinner forever
+  const ack = (note) => answerCallbackQuery(msg.callbackQueryId, note).catch(() => {});
+
+  if (action === "refresh") {
+    await ack();
+    await showControlPanel({ messageId: msg.messageId });
+    return;
+  }
+  if (action === "dashboard") {
+    await ack();
+    await showControlPanel({ messageId: msg.messageId });
+    return;
+  }
+  if (action === "positions") {
+    await ack();
+    try {
+      const { positions, total_positions } = await getMyPositions({ force: true });
+      if (!total_positions) {
+        await sendMessage("No open positions.");
+      } else {
+        const lines = positions.map((p, i) => {
+          const pnl = (p.pnl_usd ?? 0) >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
+          const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
+          const oor = !p.in_range ? " ⚠️OOR" : "";
+          return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+        });
+        await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note>`);
+      }
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    await showControlPanel({ messageId: msg.messageId });
+    return;
+  }
+  if (action === "history") {
+    await ack();
+    await sendMessage(await buildHistoryMessage(10)).catch(() => {});
+    await showControlPanel({ messageId: msg.messageId });
+    return;
+  }
+  if (action === "candidates") {
+    await ack();
+    await sendMessage(describeLatestCandidates(5)).catch(() => {});
+    await showControlPanel({ messageId: msg.messageId });
+    return;
+  }
+  if (action === "screen") {
+    await ack("Running screening cycle…");
+    try {
+      const out = await runDeterministicScreen(5);
+      await sendMessage(out);
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    await showControlPanel({ messageId: msg.messageId });
+    return;
+  }
+  if (action === "wallet") {
+    await ack();
+    try {
+      const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
+      await sendMessage(formatWalletStatus(wallet, positions));
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    await showControlPanel({ messageId: msg.messageId });
+    return;
+  }
+  if (action === "briefing") {
+    await ack("Generating briefing…");
+    try {
+      const briefing = await generateBriefing();
+      await sendHTML(briefing);
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    await showControlPanel({ messageId: msg.messageId });
+    return;
+  }
+  if (action === "settings") {
+    await ack();
+    await showSettingsMenu();
+    return;
+  }
+  if (action === "mute_toggle") {
+    const current = !!config.telegram?.muteAll;
+    const next = !current;
+    const result = await executeTool("update_config", {
+      changes: { telegramMuteAll: next },
+      reason: "Telegram control panel mute toggle",
+    });
+    if (!result?.success) {
+      await ack("Toggle failed");
+      return;
+    }
+    await ack(next ? "Muted ALL notifications" : "Unmuted — notifications back on");
+    await showControlPanel({ messageId: msg.messageId });
+    return;
+  }
+  if (action === "pause_toggle") {
+    if (cronStarted) {
+      stopCronJobs();
+      cronStarted = false;
+      await ack("Cycles paused");
+    } else {
+      cronStarted = true;
+      timers.managementLastRun = Date.now();
+      timers.screeningLastRun = Date.now();
+      startCronJobs();
+      await ack("Cycles resumed");
+    }
+    await showControlPanel({ messageId: msg.messageId });
+    return;
+  }
+  if (action === "closeall_confirm") {
+    await ack();
+    const confirmKb = [
+      [
+        { text: "✅ Yes, close all", callback_data: "panel:closeall_do" },
+        { text: "↩ Cancel",          callback_data: "panel:refresh" },
+      ],
+    ];
+    await editMessageWithButtons(
+      "⚠️ <b>Close ALL open positions?</b>\nThis cannot be undone.",
+      msg.messageId,
+      confirmKb,
+      { parseMode: "HTML" },
+    ).catch(() => sendMessageWithButtons("⚠️ Close ALL? Cannot be undone.", confirmKb));
+    return;
+  }
+  if (action === "closeall_do") {
+    await ack("Closing all positions…");
+    try {
+      const { positions } = await getMyPositions({ force: true });
+      if (!positions.length) {
+        await sendMessage("No open positions.");
+      } else {
+        await sendMessage(`Closing ${positions.length} position(s)…`);
+        const results = [];
+        for (const pos of positions) {
+          try {
+            const r = await closePosition({ position_address: pos.position });
+            results.push(r.success ? `✅ ${pos.pair} | PnL ${cur}${r.pnl_usd ?? "?"}` : `❌ ${pos.pair}`);
+          } catch (e) {
+            results.push(`❌ ${pos.pair}: ${e.message}`);
+          }
+        }
+        await sendMessage(`Close-all finished.\n\n${results.join("\n")}`);
+      }
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    await showControlPanel({ messageId: msg.messageId });
+    return;
+  }
+
+  await ack("Unknown action");
+}
+
 function normalizeMenuValue(key, raw) {
   if (key === "indicatorIntervals") {
     if (raw === "both") return ["5_MINUTE", "15_MINUTE"];
@@ -1400,8 +1664,24 @@ async function telegramHandler(msg) {
     }
     return;
   }
+  if (msg?.isCallback && text.startsWith("panel:")) {
+    try {
+      await applyControlPanelCallback(msg);
+    } catch (e) {
+      await answerCallbackQuery(msg.callbackQueryId, e.message).catch(() => {});
+    }
+    return;
+  }
   if (text === "/settings" || text === "/menu" || text === "/configmenu") {
     await showSettingsMenu().catch((e) => sendMessage(`Settings error: ${e.message}`).catch(() => {}));
+    return;
+  }
+  if (text === "/panel" || text === "/dashboard" || text === "/start" || text === "/control") {
+    await showControlPanel().catch((e) => sendMessage(`Panel error: ${e.message}`).catch(() => {}));
+    return;
+  }
+  if (text === "/history") {
+    await sendMessage(await buildHistoryMessage(10)).catch(() => {});
     return;
   }
   if (_managementBusy || _screeningBusy || busy) {

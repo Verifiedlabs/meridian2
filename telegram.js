@@ -127,12 +127,14 @@ export async function sendMessage(text) {
   return postTelegram("sendMessage", { text: String(text).slice(0, 4096) });
 }
 
-export async function sendMessageWithButtons(text, inlineKeyboard) {
+export async function sendMessageWithButtons(text, inlineKeyboard, options = {}) {
   if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", {
+  const body = {
     text: String(text).slice(0, 4096),
     reply_markup: { inline_keyboard: inlineKeyboard },
-  });
+  };
+  if (options.parseMode) body.parse_mode = options.parseMode;
+  return postTelegram("sendMessage", body);
 }
 
 export async function sendHTML(html) {
@@ -148,13 +150,15 @@ export async function editMessage(text, messageId) {
   });
 }
 
-export async function editMessageWithButtons(text, messageId, inlineKeyboard) {
+export async function editMessageWithButtons(text, messageId, inlineKeyboard, options = {}) {
   if (!TOKEN || !chatId || !messageId) return null;
-  return postTelegram("editMessageText", {
+  const body = {
     message_id: messageId,
     text: String(text).slice(0, 4096),
     reply_markup: { inline_keyboard: inlineKeyboard },
-  });
+  };
+  if (options.parseMode) body.parse_mode = options.parseMode;
+  return postTelegram("editMessageText", body);
 }
 
 export async function answerCallbackQuery(callbackQueryId, text = "") {
