@@ -147,6 +147,7 @@ export function formatHelpText() {
     "/panel — open MERIDIAN CONTROL PANEL with quick-action buttons",
     "/dashboard — alias for /panel",
     "/history — last 7d of closed positions with PnL",
+    "/lessons — auto-derived lessons + close-reason breakdown",
     "/status — wallet + positions snapshot",
     "/wallet — wallet, deploy amount, HiveMind status",
     "/positions — list open positions",

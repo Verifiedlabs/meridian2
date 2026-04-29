@@ -8,7 +8,7 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { formatGmgnCandidateForPrompt } from "./tools/gmgn.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
-import { evolveThresholds, getPerformanceSummary, getPerformanceHistory } from "./lessons.js";
+import { evolveThresholds, getPerformanceSummary, getPerformanceHistory, listLessons } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
   startPolling,
@@ -1269,11 +1269,14 @@ async function renderControlPanel() {
       { text: "📋 Candidates", callback_data: "panel:candidates" },
     ],
     [
+      { text: "📚 Lessons",    callback_data: "panel:lessons" },
       { text: "🔍 Screen Now", callback_data: "panel:screen" },
-      { text: "💼 Wallet",     callback_data: "panel:wallet" },
     ],
     [
+      { text: "💼 Wallet",     callback_data: "panel:wallet" },
       { text: "☀️ Briefing",   callback_data: "panel:briefing" },
+    ],
+    [
       { text: "⚙ Settings",    callback_data: "panel:settings" },
     ],
     [
@@ -1399,6 +1402,98 @@ async function buildHistoryMessage(limit = 10) {
   }
 }
 
+// Build the Lessons panel view: pinned + recent + close-reason breakdown.
+// Pulls from listLessons() and getPerformanceSummary() in lessons.js.
+// Group close reasons by a normalized key (e.g. "OOR pumped above range",
+// "low yield", "stop loss") so the breakdown isn't fragmented by tiny
+// wording differences.
+function bucketCloseReason(raw) {
+  if (!raw) return "unknown";
+  const r = String(raw).toLowerCase();
+  if (r.includes("low yield") || r.includes("fee/tvl")) return "low yield (fee/TVL)";
+  if (r.includes("stop loss") || r.includes("stop-loss") || r.includes("stoploss")) return "stop loss";
+  if (r.includes("take profit") || r.includes("trailing tp") || r.includes("trail-tp")) return "take profit / trailing TP";
+  if (r.includes("pumped") || r.includes("above range")) return "OOR pumped above range";
+  if (r.includes("dumped") || r.includes("below range")) return "OOR dumped below range";
+  if (r.includes("oor") || r.includes("out of range")) return "OOR (other)";
+  if (r.includes("manual")) return "manual close";
+  return raw.slice(0, 36);
+}
+
+function buildLessonsMessage(limit = 8) {
+  try {
+    const cur = config.management.solMode ? "◎" : "$";
+    const pinned = listLessons({ pinned: true, limit: 5 }).lessons || [];
+    const recent = listLessons({ pinned: false, limit }).lessons || [];
+    const summary = getPerformanceSummary();
+    const hist = getPerformanceHistory({ hours: 24 * 30, limit: 500 }); // last 30d, up to 500
+
+    const sections = ["📚 <b>Lessons</b> · auto-learned + pinned"];
+    sections.push("━━━━━━━━━━━━━━━━━━━━━━━");
+
+    if (summary) {
+      const tp = summary.total_pnl_usd ?? 0;
+      const sign = tp >= 0 ? "+" : "-";
+      const totalPnl = `${sign}${cur}${Math.abs(tp).toFixed(2)}`;
+      sections.push(`<b>Performance</b>  ·  ${summary.total_positions_closed} closed`);
+      sections.push(`Total PnL: <b>${totalPnl}</b>  ·  Win rate: <b>${summary.win_rate_pct}%</b>  ·  Avg PnL: <b>${(summary.avg_pnl_pct ?? 0).toFixed(2)}%</b>`);
+      sections.push(`Avg range efficiency: <b>${summary.avg_range_efficiency_pct ?? 0}%</b>`);
+    } else {
+      sections.push("<i>No closed positions yet.</i>");
+    }
+
+    // Build per-bucket breakdown from history (last 30d)
+    if (hist?.count) {
+      const buckets = new Map();
+      for (const r of hist.positions || []) {
+        const key = bucketCloseReason(r.close_reason);
+        const b = buckets.get(key) || { count: 0, wins: 0, totalPnl: 0 };
+        b.count += 1;
+        if ((r.pnl_usd ?? 0) > 0.005) b.wins += 1;
+        b.totalPnl += r.pnl_usd ?? 0;
+        buckets.set(key, b);
+      }
+      const sorted = [...buckets.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 6);
+      if (sorted.length) {
+        sections.push("");
+        sections.push("<i>Top close reasons (last 30d):</i>");
+        for (const [reason, stats] of sorted) {
+          const pct = Math.round((stats.count / hist.count) * 100);
+          const wr = Math.round((stats.wins / stats.count) * 100);
+          const pnlSign = stats.totalPnl >= 0 ? "+" : "-";
+          const pnlStr = `${pnlSign}${cur}${Math.abs(stats.totalPnl).toFixed(2)}`;
+          sections.push(`  • <b>${stats.count}×</b> <i>(${pct}%)</i> ${escapeHtml(reason)} · WR ${wr}% · ${escapeHtml(pnlStr)}`);
+        }
+      }
+    }
+    sections.push("━━━━━━━━━━━━━━━━━━━━━━━");
+
+    if (pinned.length) {
+      sections.push("📌 <b>Pinned</b>");
+      for (const l of pinned) {
+        sections.push(`  • <i>${escapeHtml(l.rule)}</i>`);
+      }
+      sections.push("");
+    }
+
+    if (recent.length) {
+      sections.push(`💡 <b>Recent</b>  <i>(${recent.length})</i>`);
+      const recentSorted = [...recent].reverse(); // newest first
+      for (const l of recentSorted) {
+        const tagPrefix = l.tags?.length ? `[${l.tags.slice(0, 2).join(",")}] ` : "";
+        const date = l.created_at || "";
+        sections.push(`  • <i>${escapeHtml(date)}</i> <code>${escapeHtml(tagPrefix)}</code>${escapeHtml(l.rule)}`);
+      }
+    } else if (!pinned.length) {
+      sections.push("<i>No lessons yet. Bot will auto-derive lessons after closing positions.</i>");
+    }
+
+    return sections.join("\n");
+  } catch (e) {
+    return `Lessons error: ${e.message}`;
+  }
+}
+
 // Plain-text fallback for /history when HTML parse fails (e.g. weird chars
 // in pool names that escapeHtml didn't anticipate).
 function buildHistoryMessagePlain(limit = 10) {
@@ -1507,6 +1602,25 @@ async function applyControlPanelCallback(msg) {
     ).catch(async () => {
       // HTML rejected — fallback to plain text
       const plain = buildHistoryMessagePlain(10);
+      await editMessageWithButtons(plain, messageId,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ).catch(() => sendMessageWithButtons(plain,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ));
+    });
+    return;
+  }
+  if (action === "lessons") {
+    await ack();
+    let body;
+    try { body = buildLessonsMessage(8); }
+    catch (e) { body = `Error: ${e.message}`; }
+    await editMessageWithButtons(body, messageId,
+      [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      { parseMode: "HTML" },
+    ).catch(async () => {
+      // HTML rejected — strip tags
+      const plain = body.replace(/<[^>]+>/g, "");
       await editMessageWithButtons(plain, messageId,
         [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
       ).catch(() => sendMessageWithButtons(plain,
@@ -1911,6 +2025,12 @@ async function telegramHandler(msg) {
   }
   if (text === "/history") {
     await sendHistoryMessage(10);
+    return;
+  }
+  if (text === "/lessons") {
+    const html = buildLessonsMessage(8);
+    const ok = await sendHTML(html).catch(() => null);
+    if (!ok) await sendMessage(html.replace(/<[^>]+>/g, "")).catch(() => {});
     return;
   }
   if (_managementBusy || _screeningBusy || busy) {
