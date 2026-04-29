@@ -161,6 +161,11 @@ export async function editMessageWithButtons(text, messageId, inlineKeyboard, op
   return postTelegram("editMessageText", body);
 }
 
+export async function deleteMessage(messageId) {
+  if (!TOKEN || !chatId || !messageId) return null;
+  return postTelegram("deleteMessage", { message_id: messageId });
+}
+
 export async function answerCallbackQuery(callbackQueryId, text = "") {
   if (!TOKEN || !callbackQueryId) return null;
   return postTelegramRaw("answerCallbackQuery", {

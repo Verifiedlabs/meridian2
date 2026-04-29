@@ -18,6 +18,7 @@ import {
   sendHTML,
   editMessage,
   editMessageWithButtons,
+  deleteMessage,
   answerCallbackQuery,
   notifyOutOfRange,
   isEnabled as telegramEnabled,
@@ -1201,40 +1202,58 @@ async function showSettingsMenu({ messageId = null, page = "main" } = {}) {
 // or refreshes the panel after toggling state.
 async function renderControlPanel() {
   const cur = config.management.solMode ? "◎" : "$";
-  let walletLine = "wallet: …";
-  let positionsLine = "positions: …";
-  let pnlLine = "";
+  let walletSol = null;
+  let openCount = 0;
+  let oorCount = 0;
+  let totalPnl = null;
   try {
     const [wallet, posResult] = await Promise.all([
       getWalletBalances().catch(() => null),
       getMyPositions({ force: false, silent: true }).catch(() => null),
     ]);
-    if (wallet) {
-      walletLine = `💰 ${(wallet.sol ?? 0).toFixed(2)} SOL`;
-    }
+    if (wallet) walletSol = wallet.sol ?? 0;
     if (posResult) {
       const positions = posResult.positions || [];
-      const oor = positions.filter((p) => !p.in_range).length;
-      const totalPnl = positions.reduce((s, p) => s + (Number(p.pnl_usd) || 0), 0);
-      positionsLine = `📁 ${positions.length} positions${oor ? ` (⚠️ ${oor} OOR)` : ""}`;
+      openCount = positions.length;
+      oorCount = positions.filter((p) => !p.in_range).length;
       if (positions.length > 0) {
-        const sign = totalPnl >= 0 ? "+" : "";
-        pnlLine = `Open PnL: ${sign}${cur}${totalPnl.toFixed(2)}`;
+        totalPnl = positions.reduce((s, p) => s + (Number(p.pnl_usd) || 0), 0);
       }
     }
   } catch { /* best-effort, panel still renders */ }
 
-  const muteState = config.telegram?.muteAll ? "🔇 ALL MUTED"
-    : formatNotifSummary() === "all on" ? "🔔 all on"
-    : `🔕 ${formatNotifSummary()}`;
-  const cycleState = cronStarted ? "ON" : "PAUSED";
+  const cyclesOn = cronStarted;
+  const muteAll = !!config.telegram?.muteAll;
+  const notifLabel = muteAll ? "ALL muted"
+    : formatNotifSummary() === "all on" ? "all on"
+    : formatNotifSummary();
+
+  // Status indicators
+  const cycleDot = cyclesOn ? "🟢" : "🔴";
+  const cycleText = cyclesOn ? "running" : "paused";
+  const notifDot = muteAll ? "🔕" : "🔔";
+
+  const walletStr = walletSol != null ? `<b>${walletSol.toFixed(2)}</b> SOL` : "<i>?</i>";
+  const posStr = `<b>${openCount}</b> open` + (oorCount ? ` <i>(⚠️ ${oorCount} OOR)</i>` : "");
+  const pnlStr = totalPnl != null
+    ? `<b>${totalPnl >= 0 ? "+" : ""}${cur}${totalPnl.toFixed(2)}</b>`
+    : "<i>—</i>";
+
   const updated = new Date().toLocaleString("en-US", { hour12: false, timeStyle: "short" });
 
+  // Card-style header. Telegram supports HTML <b><i><code>; we use ─ separators
+  // to give it a panel/dashboard feel without breaking on small screens.
   const text = [
-    "🎛 <b>MERIDIAN CONTROL PANEL</b>",
-    `${walletLine}  •  ${positionsLine}`,
-    [pnlLine, `Mode: ${config.management.solMode ? "SOL" : "USD"}`, `Cycles: ${cycleState}`].filter(Boolean).join("  |  "),
-    `Notif: ${muteState}  •  Updated: ${updated}`,
+    "🎛  <b>MERIDIAN CONTROL PANEL</b>",
+    "━━━━━━━━━━━━━━━━━━━━━━━",
+    `💼  Wallet     ${walletStr}`,
+    `📁  Positions  ${posStr}`,
+    `📊  Open PnL   ${pnlStr}`,
+    "━━━━━━━━━━━━━━━━━━━━━━━",
+    `${cycleDot}  Cycles     <b>${cycleText}</b>`,
+    `${notifDot}  Notif      <i>${notifLabel}</i>`,
+    `💱  Mode       <b>${config.management.solMode ? "SOL" : "USD"}</b>`,
+    `⏱  Updated    <i>${updated}</i>`,
   ].join("\n");
 
   const muteLabel = config.telegram?.muteAll ? "🔔 Unmute" : "🔇 Mute";
@@ -1490,9 +1509,28 @@ async function applySettingsMenuCallback(msg) {
       : ["minBinsBelow", "maxBinsBelow"].includes(inputKey) ? "strategy"
       : ["useDiscordSignals", "blockPvpSymbols", "managementIntervalMin", "screeningIntervalMin", "screeningSource", "gmgnRequireKol"].includes(inputKey) ? "screen"
       : "risk";
-    _pendingInput = { key: inputKey, page: inputPage, menuMsgId: msg.messageId };
     await answerCallbackQuery(msg.callbackQueryId);
-    await sendMessage(`Enter new value for ${inputKey} (current: ${currentVal ?? "off"}):\nSend a number, or "off" to clear.`);
+    const promptText = [
+      `✏️ <b>Edit ${inputKey}</b>`,
+      `Current: <code>${currentVal ?? "off"}</code>`,
+      "",
+      `Send a number as the next message, or "<code>off</code>" to clear.`,
+      `Press <b>↩ Cancel</b> below to abort.`,
+    ].join("\n");
+    const cancelKb = [[{ text: "↩ Cancel", callback_data: "cfg:cancel_input" }]];
+    const sent = await sendMessageWithButtons(promptText, cancelKb, { parseMode: "HTML" });
+    const promptMsgId = sent?.result?.message_id ?? null;
+    _pendingInput = { key: inputKey, page: inputPage, menuMsgId: msg.messageId, promptMsgId };
+    return;
+  }
+  if (action === "cancel_input") {
+    const promptMsgId = _pendingInput?.promptMsgId ?? msg.messageId;
+    const menuMsgId = _pendingInput?.menuMsgId ?? null;
+    const restorePage = _pendingInput?.page ?? "main";
+    _pendingInput = null;
+    await answerCallbackQuery(msg.callbackQueryId, "Cancelled");
+    if (promptMsgId) await deleteMessage(promptMsgId).catch(() => {});
+    if (menuMsgId) await showSettingsMenu({ messageId: menuMsgId, page: restorePage }).catch(() => {});
     return;
   }
   if (action === "close") {
@@ -1637,7 +1675,7 @@ async function telegramHandler(msg) {
   if (!text) return;
 
   if (_pendingInput && !msg.isCallback && !text.startsWith("/")) {
-    const { key, page, menuMsgId } = _pendingInput;
+    const { key, page, menuMsgId, promptMsgId } = _pendingInput;
     _pendingInput = null;
     let value;
     if (text.toLowerCase() === "off" || text.toLowerCase() === "null") {
@@ -1645,11 +1683,14 @@ async function telegramHandler(msg) {
     } else {
       value = Number(text);
       if (!Number.isFinite(value)) {
+        // re-arm for another attempt; keep prompt visible so user can retry or cancel
+        _pendingInput = { key, page, menuMsgId, promptMsgId };
         await sendMessage(`Invalid value "${text}" — must be a number or "off".`);
         return;
       }
     }
     const result = await executeTool("update_config", { changes: { [key]: value }, reason: "Telegram input field" });
+    if (promptMsgId) await deleteMessage(promptMsgId).catch(() => {});
     if (!result?.success) {
       await sendMessage(`Failed to update ${key}.`);
       return;
