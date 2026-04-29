@@ -977,6 +977,9 @@ function settingValue(key) {
     telegramMuteOor:    config.telegram?.muteOor,
     telegramMuteCycle:  config.telegram?.muteCycle,
     telegramMuteClaim:  config.telegram?.muteClaim,
+    // hivemind on/off (read-only deps: hiveMindUrl + hiveMindApiKey must be set
+    // for the toggle to actually do anything; UI just flips the flag)
+    hiveMindEnabled:    !!config.hiveMind?.enabled,
   };
   return values[key];
 }
@@ -1034,7 +1037,7 @@ function renderSettingsMenu(page = "main") {
     `Strategy: ${config.strategy.strategy} | deploy ${config.management.deployAmountSol} SOL | max pos ${config.risk.maxPositions}`,
     `TP/SL: ${config.management.takeProfitPct}% / ${config.management.stopLossPct}% | trailing ${config.management.trailingTakeProfit ? "on" : "off"}`,
     `Indicators: ${config.indicators.enabled ? "on" : "off"} | entry ${config.indicators.entryPreset} | ${fmtSettingValue(config.indicators.intervals)}`,
-    `Notif: ${formatNotifSummary()}`,
+    `Notif: ${formatNotifSummary()} | HiveMind: ${isHiveMindEnabled() ? "on" : "off"}`,
   ].join("\n");
 
   const nav = [
@@ -1181,7 +1184,8 @@ function renderSettingsMenu(page = "main") {
       ],
       [toggleButton("solMode", "SOL mode"), toggleButton("lpAgentRelayEnabled", "LPAgent relay")],
       [toggleButton("chartIndicatorsEnabled", "Chart indicators"), toggleButton("trailingTakeProfit", "Trailing TP")],
-      [toggleButton("telegramMuteAll", "Mute ALL"), settingButton("Notif page", "cfg:page:notif")],
+      [toggleButton("hiveMindEnabled", "HiveMind"), toggleButton("telegramMuteAll", "Mute ALL")],
+      [settingButton("Notif page", "cfg:page:notif")],
       [
         settingButton("Risk / deploy", "cfg:page:risk"),
         settingButton("Screening", "cfg:page:screen"),
@@ -1428,6 +1432,46 @@ function bucketCloseReason(raw) {
   if (r.includes("oor") || r.includes("out of range")) return "OOR (other)";
   if (r.includes("manual")) return "manual close";
   return raw.slice(0, 36);
+}
+
+// Card-style wallet view for the panel. Returns HTML with all
+// user-controlled values pre-escaped — callers must NOT re-escape.
+function buildWalletPanelMessage(wallet, positions) {
+  const cur = config.management.solMode ? "◎" : "$";
+  const sol = Number(wallet?.sol ?? 0).toFixed(3);
+  const solUsd = wallet?.sol_usd != null ? `$${Number(wallet.sol_usd).toFixed(2)}` : "—";
+  const solPrice = wallet?.sol_price != null ? `$${Number(wallet.sol_price).toFixed(2)}` : "—";
+  const open = positions?.total_positions ?? 0;
+  const max = config.risk?.maxPositions ?? 0;
+  const slotPct = max > 0 ? Math.round((open / max) * 100) : 0;
+  const slotBar = (() => {
+    const filled = Math.round((slotPct / 100) * 10);
+    return "█".repeat(filled) + "░".repeat(10 - filled);
+  })();
+  const deployAmount = computeDeployAmount(wallet?.sol ?? 0);
+  const deployStr = config.management.solMode
+    ? `◎${Number(deployAmount).toFixed(3)} SOL`
+    : `${Number(deployAmount).toFixed(3)} SOL`;
+  const dryRun = process.env.DRY_RUN === "true";
+  const hiveOn = isHiveMindEnabled();
+  const hiveDot = hiveOn ? "🟢" : "⚪️";
+  const hiveText = hiveOn ? "on" : "off";
+  const dryDot = dryRun ? "🟡" : "🟢";
+  const dryText = dryRun ? "DRY RUN" : "live";
+
+  return [
+    "💼  <b>Wallet</b>",
+    "━━━━━━━━━━━━━━━━━━━━━━━",
+    `💰  Balance    <b>${escapeHtml(sol)} SOL</b>  <i>(${escapeHtml(solUsd)})</i>`,
+    `📈  SOL price  <b>${escapeHtml(solPrice)}</b>`,
+    "━━━━━━━━━━━━━━━━━━━━━━━",
+    `📁  Slots      <b>${open}/${max}</b>  <code>${slotBar}</code>  ${slotPct}%`,
+    `🚀  Next deploy <b>${escapeHtml(deployStr)}</b>`,
+    "━━━━━━━━━━━━━━━━━━━━━━━",
+    `${dryDot}  Mode       <b>${escapeHtml(dryText)}</b>`,
+    `${hiveDot}  HiveMind   <b>${escapeHtml(hiveText)}</b>`,
+    `💱  Currency   <b>${config.management.solMode ? "SOL" : "USD"}</b>`,
+  ].join("\n");
 }
 
 function buildLessonsMessage(limit = 8) {
@@ -1684,13 +1728,19 @@ async function applyControlPanelCallback(msg) {
     let body;
     try {
       const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
-      body = formatWalletStatus(wallet, positions);
-    } catch (e) { body = `Error: ${e.message}`; }
-    await showPanelView({
-      messageId,
-      title: "💼 <b>Wallet</b>",
-      body: escapeHtml(body),
-      parseMode: "HTML",
+      body = buildWalletPanelMessage(wallet, positions);
+    } catch (e) { body = `Error: ${escapeHtml(e.message)}`; }
+    // body is already HTML-formatted with escaped values — do NOT re-escape
+    await editMessageWithButtons(body, messageId,
+      [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      { parseMode: "HTML" },
+    ).catch(async () => {
+      const plain = body.replace(/<[^>]+>/g, "");
+      await editMessageWithButtons(plain, messageId,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ).catch(() => sendMessageWithButtons(plain,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ));
     });
     return;
   }
