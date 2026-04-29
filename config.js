@@ -264,7 +264,7 @@ export const config = {
     apiKey: process.env.JUPITER_API_KEY ?? "",
     referralAccount:
       process.env.JUPITER_REFERRAL_ACCOUNT ??
-      "9MzhDUnq3KxecyPzvhguQMMPbooXQ3VAoCMPDnoijwey",
+      "7kf8boZvTSaBv3wmDdY59VFK9U2LfMsUDB2op8CmwBFy",
     referralFeeBps: Number(
       process.env.JUPITER_REFERRAL_FEE_BPS ?? 50,
     ),
