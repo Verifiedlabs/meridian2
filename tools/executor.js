@@ -562,13 +562,21 @@ const toolMap = {
       log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
     }
 
-    // Save as a lesson — but skip ephemeral per-deploy interval changes
-    // (managementIntervalMin / screeningIntervalMin change every deploy based on volatility;
-    //  the rule is already in the system prompt, storing it 75+ times is pure noise)
+    // Save as a lesson — but skip:
+    // - ephemeral per-deploy interval tweaks (managementIntervalMin / screeningIntervalMin
+    //   change every deploy based on volatility, the rule is already in the system prompt,
+    //   storing it 75+ times is pure noise)
+    // - pure UI prefs (telegramMute*) — these are user toggles, never tuning-relevant
+    // - any change initiated from the Telegram UI (settings menu / control panel buttons).
+    //   The reason string starts with "Telegram " for those — they're operator actions,
+    //   not learned knowledge, and pollute the lesson list.
+    const isUiDrivenChange = typeof reason === "string" && /^Telegram\b/i.test(reason);
     const lessonsKeys = Object.keys(applied).filter(
-      k => k !== "managementIntervalMin" && k !== "screeningIntervalMin"
+      k => k !== "managementIntervalMin"
+        && k !== "screeningIntervalMin"
+        && !k.startsWith("telegramMute"),
     );
-    if (lessonsKeys.length > 0) {
+    if (lessonsKeys.length > 0 && !isUiDrivenChange) {
       const summary = lessonsKeys.map(k => `${k}=${redactConfigValue(k, applied[k])}`).join(", ");
       addLesson(`[SELF-TUNED] Changed ${summary} — ${reason}`, ["self_tune", "config_change"]);
     }

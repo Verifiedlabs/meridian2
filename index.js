@@ -1424,7 +1424,19 @@ function buildLessonsMessage(limit = 8) {
   try {
     const cur = config.management.solMode ? "◎" : "$";
     const pinned = listLessons({ pinned: true, limit: 5 }).lessons || [];
-    const recent = listLessons({ pinned: false, limit }).lessons || [];
+    // Pull more than `limit` then drop UI-toggle pollution from the existing
+    // lessons.json (telegramMute / screeningSource flips that were recorded
+    // before we added the executor-side filter). User-facing Lessons view
+    // should only show genuinely actionable knowledge.
+    const isUiPollution = (l) => {
+      const r = String(l.rule || "");
+      if (/telegramMute/i.test(r)) return true;
+      if (/screeningSource=/i.test(r) && /Telegram/i.test(r)) return true;
+      return false;
+    };
+    const recent = (listLessons({ pinned: false, limit: limit * 4 }).lessons || [])
+      .filter(l => !isUiPollution(l))
+      .slice(0, limit);
     const summary = getPerformanceSummary();
     const hist = getPerformanceHistory({ hours: 24 * 30, limit: 500 }); // last 30d, up to 500
 

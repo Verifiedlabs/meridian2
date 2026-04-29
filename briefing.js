@@ -22,40 +22,78 @@ export async function generateBriefing() {
   const totalPnLUsd = perfLast24h.reduce((sum, p) => sum + (p.pnl_usd || 0), 0);
   const totalFeesUsd = perfLast24h.reduce((sum, p) => sum + (p.fees_earned_usd || 0), 0);
 
-  // 3. Lessons Learned
-  const lessonsLast24h = (lessonsData.lessons || []).filter(l => new Date(l.created_at) > last24h);
+  // 3. Highlight noteworthy lessons (skip the noisy SELF-TUNED ones — those
+  //    belong in /lessons, not the briefing). We surface up to 2 actionable
+  //    or pinned lessons from the last 24h, plus a pointer to /lessons.
+  const lessonsLast24h = (lessonsData.lessons || [])
+    .filter(l => new Date(l.created_at) > last24h)
+    .filter(l => !(l.tags || []).includes("self_tune"))
+    .filter(l => !/^\[SELF-TUNED\]/i.test(l.rule));
+  const pinnedAll = (lessonsData.lessons || []).filter(l => l.pinned);
+  const noteworthy = [...pinnedAll, ...lessonsLast24h]
+    .reduce((acc, l) => acc.find(x => x.id === l.id) ? acc : [...acc, l], [])
+    .slice(0, 2);
 
-  // 4. Current State
+  // 4. Top close reasons over the last 24h — actually useful for daily review.
+  const reasonBuckets = new Map();
+  for (const p of perfLast24h) {
+    const key = (p.close_reason || "unknown").split(/[,\(]/)[0].trim().slice(0, 36);
+    const b = reasonBuckets.get(key) || { count: 0, wins: 0, pnl: 0 };
+    b.count++;
+    if ((p.pnl_usd || 0) > 0.005) b.wins++;
+    b.pnl += p.pnl_usd || 0;
+    reasonBuckets.set(key, b);
+  }
+  const topReasons = [...reasonBuckets.entries()]
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, 3);
+
+  // 5. Current State
   const openPositions = allPositions.filter(p => !p.closed);
   const perfSummary = getPerformanceSummary();
 
-  // 5. Format Message
+  // 6. Format Message — operational summary, NOT a lessons dump.
   const lines = [
     "☀️ <b>Morning Briefing</b> (Last 24h)",
     "────────────────",
     `<b>Activity:</b>`,
-    `📥 Positions Opened: ${openedLast24h.length}`,
-    `📤 Positions Closed: ${closedLast24h.length}`,
+    `📥 Opened: ${openedLast24h.length}  ·  📤 Closed: ${closedLast24h.length}`,
     "",
-    `<b>Performance:</b>`,
-    `💰 Net PnL: ${totalPnLUsd >= 0 ? "+" : ""}$${totalPnLUsd.toFixed(2)}`,
-    `💎 Fees Earned: $${totalFeesUsd.toFixed(2)}`,
+    `<b>Performance (24h):</b>`,
+    `💰 Net PnL: ${totalPnLUsd >= 0 ? "+" : ""}$${totalPnLUsd.toFixed(2)}  ·  💎 Fees: $${totalFeesUsd.toFixed(2)}`,
     perfLast24h.length > 0
-      ? `📈 Win Rate (24h): ${Math.round((perfLast24h.filter(p => p.pnl_usd > 0).length / perfLast24h.length) * 100)}%`
-      : "📈 Win Rate (24h): N/A",
-    "",
-    `<b>Lessons Learned:</b>`,
-    lessonsLast24h.length > 0
-      ? lessonsLast24h.map(l => `• ${l.rule}`).join("\n")
-      : "• No new lessons recorded overnight.",
-    "",
-    `<b>Current Portfolio:</b>`,
-    `📂 Open Positions: ${openPositions.length}`,
-    perfSummary
-      ? `📊 All-time PnL: $${perfSummary.total_pnl_usd.toFixed(2)} (${perfSummary.win_rate_pct}% win)`
-      : "",
-    "────────────────"
+      ? `📈 Win Rate: ${Math.round((perfLast24h.filter(p => p.pnl_usd > 0).length / perfLast24h.length) * 100)}% (${perfLast24h.length} closed)`
+      : "📈 Win Rate: N/A",
   ];
+
+  if (topReasons.length) {
+    lines.push("");
+    lines.push(`<b>Top close reasons (24h):</b>`);
+    for (const [reason, b] of topReasons) {
+      const wr = Math.round((b.wins / b.count) * 100);
+      const pnlSign = b.pnl >= 0 ? "+" : "-";
+      lines.push(`  • ${b.count}× ${reason} · WR ${wr}% · ${pnlSign}$${Math.abs(b.pnl).toFixed(2)}`);
+    }
+  }
+
+  if (noteworthy.length) {
+    lines.push("");
+    lines.push(`<b>Highlights:</b>`);
+    for (const l of noteworthy) {
+      const tag = l.pinned ? "📌 " : "💡 ";
+      lines.push(`  ${tag}${l.rule.slice(0, 120)}`);
+    }
+    lines.push(`<i>(See /lessons for full knowledge base.)</i>`);
+  }
+
+  lines.push("");
+  lines.push(`<b>Current Portfolio:</b>`);
+  lines.push(`📂 Open Positions: ${openPositions.length}`);
+  if (perfSummary) {
+    const pnlAll = perfSummary.total_pnl_usd ?? 0;
+    lines.push(`📊 All-time: $${pnlAll.toFixed(2)} · ${perfSummary.win_rate_pct}% win · ${perfSummary.total_positions_closed} closed`);
+  }
+  lines.push("────────────────");
 
   return lines.join("\n");
 }
