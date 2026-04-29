@@ -1299,25 +1299,92 @@ async function showControlPanel({ messageId = null } = {}) {
   }
 }
 
+// Strip noisy parentheticals like "(active bin -427, position upper -436)"
+// and shorten common verbose phrases so reasons fit on one line.
+function cleanCloseReason(raw) {
+  if (!raw) return "";
+  let r = String(raw)
+    .replace(/\([^)]*active bin[^)]*\)/gi, "") // drop "(active bin ...)" blocks
+    .replace(/\([^)]*OOR[^)]*\)/gi, "")        // drop "(... OOR)" blocks
+    .replace(/\bRule\s*\d+:\s*/gi, "")          // drop "Rule 3:" prefix
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  // common rewrites
+  r = r.replace(/pumped far above range/gi, "pumped above range")
+       .replace(/pumped far below range/gi, "dumped below range")
+       .replace(/^realtime:\s*/i, "RT: ")
+       .replace(/^OOR\s*[-–]\s*/i, "OOR: ")
+       .replace(/^trailing TP:\s*/i, "trail-TP: ")
+       .replace(/fee\/TVL\s*([\d.]+)%\s*<\s*min\s*([\d.]+)%/i, "fee/TVL $1% < $2%")
+       .replace(/\(position age \d+m\)/i, "")
+       .replace(/\(age:\s*\d+m\)/i, "")
+       .trim();
+  if (r.length > 48) r = r.slice(0, 45) + "…";
+  return r;
+}
+
+function fmtSigned(n, decimals = 2) {
+  if (n == null || !Number.isFinite(n)) return "—";
+  const v = Math.abs(n) < 1e-9 ? 0 : n; // collapse -0 to 0
+  const sign = v > 0 ? "+" : v < 0 ? "-" : "";
+  return `${sign}${Math.abs(v).toFixed(decimals)}`;
+}
+
+function fmtPnl(usd, cur) {
+  if (usd == null || !Number.isFinite(usd)) return "—";
+  const v = Math.abs(usd) < 0.005 ? 0 : usd;
+  if (v === 0) return `${cur}0.00`;
+  const sign = v > 0 ? "+" : "-";
+  return `${sign}${cur}${Math.abs(v).toFixed(2)}`;
+}
+
 async function buildHistoryMessage(limit = 10) {
   const cur = config.management.solMode ? "◎" : "$";
   try {
     const hist = getPerformanceHistory({ hours: 24 * 7, limit });
-    if (!hist.count) return "No closed positions in the last 7 days.";
-    const lines = (hist.positions || []).slice(-limit).reverse().map((r, i) => {
-      const sign = (r.pnl_usd ?? 0) >= 0 ? "+" : "";
+    if (!hist.count) return "📜 No closed positions in the last 7 days.";
+
+    // Re-derive wins/losses from filtered positions (lessons.js doesn't expose `wins`)
+    const positions = hist.positions || [];
+    const wins = positions.filter((r) => (r.pnl_usd ?? 0) > 0.005).length;
+    const losses = positions.filter((r) => (r.pnl_usd ?? 0) < -0.005).length;
+    const flat = positions.length - wins - losses;
+    const winRate = positions.length ? Math.round((wins / positions.length) * 100) : 0;
+
+    const best = [...positions].sort((a, b) => (b.pnl_usd ?? 0) - (a.pnl_usd ?? 0))[0];
+    const worst = [...positions].sort((a, b) => (a.pnl_usd ?? 0) - (b.pnl_usd ?? 0))[0];
+
+    const totalLine = `Total PnL: <b>${fmtPnl(hist.total_pnl_usd, cur)}</b>`;
+    const wrLine = `Win rate: <b>${winRate}%</b> <i>(${wins}W · ${losses}L${flat ? ` · ${flat}flat` : ""})</i>`;
+    const bestLine = best ? `🏆 Best:  <b>${best.pool_name || "?"}</b> ${fmtPnl(best.pnl_usd, cur)}` : "";
+    const worstLine = worst && worst !== best ? `📉 Worst: <b>${worst.pool_name || "?"}</b> ${fmtPnl(worst.pnl_usd, cur)}` : "";
+
+    const rows = positions.slice(-limit).reverse().map((r, i) => {
+      const pnl = r.pnl_usd ?? 0;
+      const icon = pnl > 0.005 ? "✅" : pnl < -0.005 ? "❌" : "➖";
+      const pnlStr = fmtPnl(pnl, cur);
+      const pctStr = `${fmtSigned(r.pnl_pct, 1)}%`;
       const age = r.minutes_held != null ? `${r.minutes_held}m` : "?";
-      const reason = r.close_reason ? ` | ${r.close_reason}` : "";
-      const date = r.closed_at ? new Date(r.closed_at).toLocaleString("en-US", { hour12: false, dateStyle: "short", timeStyle: "short" }) : "?";
-      return `${i + 1}. ${r.pool_name || "?"} | ${sign}${cur}${(r.pnl_usd ?? 0).toFixed(2)} (${sign}${(r.pnl_pct ?? 0).toFixed(1)}%) | ${age}${reason} | ${date}`;
+      const date = r.closed_at
+        ? new Date(r.closed_at).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
+        : "?";
+      const reason = cleanCloseReason(r.close_reason);
+      return [
+        `${i + 1}. ${icon} <b>${r.pool_name || "?"}</b>  <b>${pnlStr}</b> <i>(${pctStr})</i>`,
+        `   <i>⏱ ${age} · ${date}${reason ? ` · ${reason}` : ""}</i>`,
+      ].join("\n");
     });
-    const totalSign = (hist.total_pnl_usd ?? 0) >= 0 ? "+" : "";
+
     return [
-      `📜 Closed positions (last ${hist.count}/${hist.hours}h):`,
-      `Total PnL: ${totalSign}${cur}${(hist.total_pnl_usd ?? 0).toFixed(2)}  •  Wins: ${hist.wins ?? 0}/${hist.count}`,
-      "",
-      ...lines,
-    ].join("\n");
+      "📜 <b>Closed positions</b> · last 7 days",
+      "━━━━━━━━━━━━━━━━━━━━━━━",
+      totalLine,
+      wrLine,
+      bestLine,
+      worstLine,
+      "━━━━━━━━━━━━━━━━━━━━━━━",
+      ...rows,
+    ].filter(Boolean).join("\n");
   } catch (e) {
     return `History error: ${e.message}`;
   }
@@ -1363,7 +1430,7 @@ async function applyControlPanelCallback(msg) {
   }
   if (action === "history") {
     await ack();
-    await sendMessage(await buildHistoryMessage(10)).catch(() => {});
+    await sendHTML(await buildHistoryMessage(10)).catch(() => {});
     await showControlPanel({ messageId: msg.messageId });
     return;
   }
@@ -1723,7 +1790,7 @@ async function telegramHandler(msg) {
     return;
   }
   if (text === "/history") {
-    await sendMessage(await buildHistoryMessage(10)).catch(() => {});
+    await sendHTML(await buildHistoryMessage(10)).catch(() => {});
     return;
   }
   if (_managementBusy || _screeningBusy || busy) {
