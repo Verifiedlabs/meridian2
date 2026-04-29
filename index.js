@@ -1338,6 +1338,14 @@ function fmtPnl(usd, cur) {
   return `${sign}${cur}${Math.abs(v).toFixed(2)}`;
 }
 
+function escapeHtml(s) {
+  if (s == null) return "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 async function buildHistoryMessage(limit = 10) {
   const cur = config.management.solMode ? "◎" : "$";
   try {
@@ -1354,24 +1362,25 @@ async function buildHistoryMessage(limit = 10) {
     const best = [...positions].sort((a, b) => (b.pnl_usd ?? 0) - (a.pnl_usd ?? 0))[0];
     const worst = [...positions].sort((a, b) => (a.pnl_usd ?? 0) - (b.pnl_usd ?? 0))[0];
 
-    const totalLine = `Total PnL: <b>${fmtPnl(hist.total_pnl_usd, cur)}</b>`;
+    const totalLine = `Total PnL: <b>${escapeHtml(fmtPnl(hist.total_pnl_usd, cur))}</b>`;
     const wrLine = `Win rate: <b>${winRate}%</b> <i>(${wins}W · ${losses}L${flat ? ` · ${flat}flat` : ""})</i>`;
-    const bestLine = best ? `🏆 Best:  <b>${best.pool_name || "?"}</b> ${fmtPnl(best.pnl_usd, cur)}` : "";
-    const worstLine = worst && worst !== best ? `📉 Worst: <b>${worst.pool_name || "?"}</b> ${fmtPnl(worst.pnl_usd, cur)}` : "";
+    const bestLine = best ? `🏆 Best:  <b>${escapeHtml(best.pool_name || "?")}</b> ${escapeHtml(fmtPnl(best.pnl_usd, cur))}` : "";
+    const worstLine = worst && worst !== best ? `📉 Worst: <b>${escapeHtml(worst.pool_name || "?")}</b> ${escapeHtml(fmtPnl(worst.pnl_usd, cur))}` : "";
 
     const rows = positions.slice(-limit).reverse().map((r, i) => {
       const pnl = r.pnl_usd ?? 0;
       const icon = pnl > 0.005 ? "✅" : pnl < -0.005 ? "❌" : "➖";
-      const pnlStr = fmtPnl(pnl, cur);
-      const pctStr = `${fmtSigned(r.pnl_pct, 1)}%`;
+      const pnlStr = escapeHtml(fmtPnl(pnl, cur));
+      const pctStr = escapeHtml(`${fmtSigned(r.pnl_pct, 1)}%`);
       const age = r.minutes_held != null ? `${r.minutes_held}m` : "?";
       const date = r.closed_at
         ? new Date(r.closed_at).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
         : "?";
-      const reason = cleanCloseReason(r.close_reason);
+      const reason = escapeHtml(cleanCloseReason(r.close_reason));
+      const pair = escapeHtml(r.pool_name || "?");
       return [
-        `${i + 1}. ${icon} <b>${r.pool_name || "?"}</b>  <b>${pnlStr}</b> <i>(${pctStr})</i>`,
-        `   <i>⏱ ${age} · ${date}${reason ? ` · ${reason}` : ""}</i>`,
+        `${i + 1}. ${icon} <b>${pair}</b>  <b>${pnlStr}</b> <i>(${pctStr})</i>`,
+        `   <i>⏱ ${age} · ${escapeHtml(date)}${reason ? ` · ${reason}` : ""}</i>`,
       ].join("\n");
     });
 
@@ -1388,6 +1397,47 @@ async function buildHistoryMessage(limit = 10) {
   } catch (e) {
     return `History error: ${e.message}`;
   }
+}
+
+// Plain-text fallback for /history when HTML parse fails (e.g. weird chars
+// in pool names that escapeHtml didn't anticipate).
+function buildHistoryMessagePlain(limit = 10) {
+  const cur = config.management.solMode ? "◎" : "$";
+  try {
+    const hist = getPerformanceHistory({ hours: 24 * 7, limit });
+    if (!hist.count) return "📜 No closed positions in the last 7 days.";
+    const positions = hist.positions || [];
+    const wins = positions.filter((r) => (r.pnl_usd ?? 0) > 0.005).length;
+    const losses = positions.filter((r) => (r.pnl_usd ?? 0) < -0.005).length;
+    const winRate = positions.length ? Math.round((wins / positions.length) * 100) : 0;
+    const rows = positions.slice(-limit).reverse().map((r, i) => {
+      const pnl = r.pnl_usd ?? 0;
+      const icon = pnl > 0.005 ? "✅" : pnl < -0.005 ? "❌" : "➖";
+      const age = r.minutes_held != null ? `${r.minutes_held}m` : "?";
+      const date = r.closed_at
+        ? new Date(r.closed_at).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
+        : "?";
+      const reason = cleanCloseReason(r.close_reason);
+      return `${i + 1}. ${icon} ${r.pool_name || "?"}  ${fmtPnl(pnl, cur)} (${fmtSigned(r.pnl_pct, 1)}%)\n   ${age} · ${date}${reason ? ` · ${reason}` : ""}`;
+    });
+    return [
+      `📜 Closed positions · last 7 days`,
+      `Total PnL: ${fmtPnl(hist.total_pnl_usd, cur)} · Win rate: ${winRate}% (${wins}W / ${losses}L)`,
+      "",
+      ...rows,
+    ].join("\n");
+  } catch (e) {
+    return `History error: ${e.message}`;
+  }
+}
+
+// Send history with HTML; if Telegram rejects it, retry as plain text.
+async function sendHistoryMessage(limit = 10) {
+  const html = await buildHistoryMessage(limit);
+  const result = await sendHTML(html).catch(() => null);
+  if (result && result.ok !== false) return;
+  // HTML parse failed — fallback to plain text so user always sees something
+  await sendMessage(buildHistoryMessagePlain(limit)).catch(() => {});
 }
 
 async function applyControlPanelCallback(msg) {
@@ -1430,7 +1480,7 @@ async function applyControlPanelCallback(msg) {
   }
   if (action === "history") {
     await ack();
-    await sendHTML(await buildHistoryMessage(10)).catch(() => {});
+    await sendHistoryMessage(10);
     await showControlPanel({ messageId: msg.messageId });
     return;
   }
@@ -1790,7 +1840,7 @@ async function telegramHandler(msg) {
     return;
   }
   if (text === "/history") {
-    await sendHTML(await buildHistoryMessage(10)).catch(() => {});
+    await sendHistoryMessage(10);
     return;
   }
   if (_managementBusy || _screeningBusy || busy) {
