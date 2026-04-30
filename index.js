@@ -31,6 +31,7 @@ import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
+import { getTwitterSentiment } from "./tools/twitter.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
@@ -439,16 +440,18 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const allCandidates = [];
     for (const pool of candidates) {
       const mint = pool.base?.mint;
-      const [smartWallets, narrative, tokenInfo] = await Promise.allSettled([
+      const [smartWallets, narrative, tokenInfo, twitterData] = await Promise.allSettled([
         checkSmartWalletsOnPool({ pool_address: pool.pool }),
         mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
         mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
+        pool.base?.symbol ? getTwitterSentiment({ symbol: pool.base.symbol, mint }) : Promise.resolve(null),
       ]);
       allCandidates.push({
         pool,
         sw: smartWallets.status === "fulfilled" ? smartWallets.value : null,
         n: narrative.status === "fulfilled" ? narrative.value : null,
         ti: tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null,
+        tw: twitterData.status === "fulfilled" ? twitterData.value : null,
         mem: recallForPool(pool.pool),
       });
       await new Promise(r => setTimeout(r, 150)); // avoid 429s
@@ -513,7 +516,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     );
 
     // Build compact candidate blocks
-    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
+    const candidateBlocks = passing.map(({ pool, sw, n, ti, tw, mem }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
@@ -553,6 +556,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
           `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
           activeBin != null ? `  active_bin: ${activeBin}` : null,
           n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
+          tw?.summary ? `  twitter_untrusted: ${sanitizeUntrustedPromptText(tw.summary, 300)}` : `  twitter: no data`,
+          tw?.buzz_level ? `  twitter_buzz: ${tw.buzz_level} (${tw.tweet_count_24h} tweets, ${tw.kol_mentions} KOLs, sentiment=${tw.sentiment})` : null,
           mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
         ].filter(Boolean).join("\n");
       } else {
@@ -572,6 +577,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
           activeBin != null ? `  active_bin: ${activeBin}` : null,
           priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
           n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
+          tw?.summary ? `  twitter_untrusted: ${sanitizeUntrustedPromptText(tw.summary, 300)}` : `  twitter: no data`,
+          tw?.buzz_level ? `  twitter_buzz: ${tw.buzz_level} (${tw.tweet_count_24h} tweets, ${tw.kol_mentions} KOLs, sentiment=${tw.sentiment})` : null,
           mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
         ].filter(Boolean).join("\n");
       }
@@ -587,6 +594,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
           smart_wallets_present: (sw?.in_pool?.length ?? 0) > 0,
           narrative_quality:     n?.narrative ? "present" : "absent",
           volatility:            pool.volatility            ?? null,
+          twitter_sentiment:     tw?.sentiment              ?? null,
         });
       }
 
@@ -950,6 +958,19 @@ function settingValue(key) {
     strategy: config.strategy.strategy,
     minBinsBelow: config.strategy.minBinsBelow,
     maxBinsBelow: config.strategy.maxBinsBelow,
+    // Meteora screening filters
+    minTvl: config.screening.minTvl,
+    maxTvl: config.screening.maxTvl,
+    minVolume: config.screening.minVolume,
+    minOrganic: config.screening.minOrganic,
+    minHolders: config.screening.minHolders,
+    minMcap: config.screening.minMcap,
+    minFeeActiveTvlRatio: config.screening.minFeeActiveTvlRatio,
+    minTokenFeesSol: config.screening.minTokenFeesSol,
+    minBinStep: config.screening.minBinStep,
+    maxBinStep: config.screening.maxBinStep,
+    // Twitter
+    twitterEnabled: config.twitter?.enabled,
     deployAmountSol: config.management.deployAmountSol,
     gasReserve: config.management.gasReserve,
     maxPositions: config.risk.maxPositions,
@@ -1028,184 +1049,193 @@ function inputButton(key, label, { digits = 0 } = {}) {
 }
 
 function renderSettingsMenu(page = "main") {
-  const title = page === "main" ? "Settings menu" : `Settings: ${page}`;
+  const src = String(config.screening?.source || "meteora").toLowerCase();
+  const isGmgn = src === "gmgn";
+
+  // ─── Page titles ───
+  const pageTitles = {
+    main: "⚙️ General",
+    risk: "💰 Risk & Deploy",
+    filter: isGmgn ? "🔍 GMGN Filters" : "🔍 Meteora Filters",
+    indicators: isGmgn ? "📊 GMGN Indicators" : "📊 Chart Indicators",
+    kol: "👥 KOL Settings",
+    notif: "🔔 Notifications",
+  };
+
   const summary = [
-    title,
+    `<b>${pageTitles[page] || "⚙️ Settings"}</b>`,
     "",
-    `Mode: ${config.management.solMode ? "SOL" : "USD"} | Relay: ${config.api.lpAgentRelayEnabled ? "on" : "off"}`,
-    `Screening: ${config.screening.source} | GMGN KOL ${config.gmgn.requireKol ? "required" : "preferred"}`,
-    `Strategy: ${config.strategy.strategy} | deploy ${config.management.deployAmountSol} SOL | max pos ${config.risk.maxPositions}`,
-    `TP/SL: ${config.management.takeProfitPct}% / ${config.management.stopLossPct}% | trailing ${config.management.trailingTakeProfit ? "on" : "off"}`,
-    `Indicators: ${config.indicators.enabled ? "on" : "off"} | entry ${config.indicators.entryPreset} | ${fmtSettingValue(config.indicators.intervals)}`,
-    `Notif: ${formatNotifSummary()} | HiveMind: ${isHiveMindEnabled() ? "on" : "off"}`,
+    `Source: <b>${src.toUpperCase()}</b> | Strategy: <b>${config.strategy.strategy}</b>`,
+    `Deploy: <b>${config.management.deployAmountSol} SOL</b> | Max: <b>${config.risk.maxPositions} pos</b>`,
+    `TP: <b>${config.management.takeProfitPct}%</b> | SL: <b>${config.management.stopLossPct}%</b> | Trail: <b>${config.management.trailingTakeProfit ? "ON" : "OFF"}</b>`,
+    `Twitter: <b>${config.twitter?.enabled ? "ON" : "OFF"}</b> | Indicators: <b>${config.indicators.enabled ? "ON" : "OFF"}</b>`,
   ].join("\n");
 
+  // ─── Nav bar ───
+  const isP = (p) => page === p;
   const nav = [
     [
       settingButton("↩ Panel", "panel:refresh"),
-      settingButton("Main", "cfg:page:main"),
-      settingButton("Risk", "cfg:page:risk"),
-      settingButton("Strategy", "cfg:page:strategy"),
+      settingButton(isP("main") ? "• General" : "General", "cfg:page:main"),
+      settingButton(isP("risk") ? "• Risk" : "Risk", "cfg:page:risk"),
     ],
     [
-      settingButton("Screen", "cfg:page:screen"),
-      settingButton("Indicators", "cfg:page:indicators"),
-      settingButton("GMGN", "cfg:page:gmgn"),
-      settingButton("KOL", "cfg:page:kol"),
-    ],
-    [
-      settingButton("Notif", "cfg:page:notif"),
+      settingButton(isP("filter") ? "• Filters" : "Filters", "cfg:page:filter"),
+      settingButton(isP("indicators") ? "• Indicators" : "Indicators", "cfg:page:indicators"),
+      settingButton(isP("kol") ? "• KOL" : "KOL", "cfg:page:kol"),
+      settingButton(isP("notif") ? "• Notif" : "Notif", "cfg:page:notif"),
     ],
   ];
 
-  const footer = [
-    [
-      settingButton("Refresh", `cfg:page:${page}`),
-      settingButton("Close", "cfg:close"),
-    ],
-  ];
+  const footer = page === "main"
+    ? [[
+        settingButton("🔄 Refresh", `cfg:page:${page}`),
+        settingButton("❌ Close", "cfg:close"),
+      ]]
+    : [[
+        settingButton("↩ Back", "cfg:page:main"),
+        settingButton("🔄 Refresh", `cfg:page:${page}`),
+        settingButton("❌ Close", "cfg:close"),
+      ]];
 
   let rows;
+
   if (page === "risk") {
+    // ─── 💰 Risk & Deploy ───
     rows = [
-      inputButton("deployAmountSol", "Deploy SOL", { digits: 2 }),
-      inputButton("gasReserve", "Gas reserve", { digits: 2 }),
-      inputButton("maxPositions", "Max positions"),
-      inputButton("maxDeployAmount", "Max SOL"),
-      inputButton("takeProfitPct", "TP %"),
-      inputButton("stopLossPct", "SL %"),
-      [toggleButton("trailingTakeProfit", "Trailing TP")],
-      inputButton("trailingTriggerPct", "Trail trigger", { digits: 1 }),
-      inputButton("trailingDropPct", "Trail drop", { digits: 1 }),
-      [toggleButton("repeatDeployCooldownEnabled", "Repeat cooldown")],
-      inputButton("repeatDeployCooldownTriggerCount", "Repeat count"),
-      inputButton("repeatDeployCooldownHours", "Repeat hrs"),
-      inputButton("repeatDeployCooldownMinFeeEarnedPct", "Min fee earned %", { digits: 1 }),
+      [inputButton("deployAmountSol", "💰 Deploy SOL", { digits: 2 })[0]],
+      [inputButton("gasReserve", "⛽ Gas Reserve", { digits: 2 })[0]],
+      [inputButton("maxPositions", "📊 Max Positions")[0]],
+      [inputButton("maxDeployAmount", "🔒 Max SOL per Deploy")[0]],
+      [inputButton("takeProfitPct", "📈 Take Profit %")[0], inputButton("stopLossPct", "📉 Stop Loss %")[0]],
+      [toggleButton("trailingTakeProfit", "🎯 Trailing TP")],
+      [inputButton("trailingTriggerPct", "Trigger %", { digits: 1 })[0], inputButton("trailingDropPct", "Drop %", { digits: 1 })[0]],
+      [inputButton("minBinsBelow", "📏 Min Range Bins")[0], inputButton("maxBinsBelow", "📏 Max Range Bins")[0]],
     ];
-  } else if (page === "screen") {
-    const src = String(config.screening?.source || "meteora").toLowerCase();
+
+  } else if (page === "filter" && isGmgn) {
+    // ─── 🔍 GMGN Filters (from gmgn-config.json) ───
+    const gmgnInt = config.gmgn?.interval || "1h";
     rows = [
       [
-        settingButton(`${src === "meteora" ? "✅ " : "   "}Source: Meteora`, "cfg:set:screeningSource:meteora"),
-        settingButton(`${src === "gmgn" ? "✅ " : "   "}Source: GMGN`, "cfg:set:screeningSource:gmgn"),
+        settingButton(gmgnInt === "5m" ? "✅ 5m" : "5m", "cfg:set:gmgnInterval:5m"),
+        settingButton(gmgnInt === "1h" ? "✅ 1h" : "1h", "cfg:set:gmgnInterval:1h"),
+        settingButton(gmgnInt === "6h" ? "✅ 6h" : "6h", "cfg:set:gmgnInterval:6h"),
+        settingButton(gmgnInt === "24h" ? "✅ 24h" : "24h", "cfg:set:gmgnInterval:24h"),
       ],
-      [toggleButton("gmgnRequireKol", "GMGN require KOL")],
-      [toggleButton("useDiscordSignals", "Discord signals"), toggleButton("blockPvpSymbols", "PVP hard block")],
+      [inputButton("gmgnMinVolume", "Min Volume")[0], inputButton("gmgnMinHolders", "Min Holders")[0]],
+      [inputButton("gmgnMinTokenAgeHours", "Min Age (hrs)")[0], inputButton("gmgnMaxTokenAgeHours", "Max Age (hrs)")[0]],
+      [inputButton("gmgnMaxBundlerRate", "Max Bundler %")[0], inputButton("gmgnMinTotalFeeSol", "Min Fee SOL")[0]],
       [
-        settingButton(`${(config.gmgn?.interval || "1h") === "5m" ? "✅ " : ""}5m`, "cfg:set:gmgnInterval:5m"),
-        settingButton(`${(config.gmgn?.interval || "1h") === "1h" ? "✅ " : ""}1h`, "cfg:set:gmgnInterval:1h"),
-        settingButton(`${(config.gmgn?.interval || "1h") === "6h" ? "✅ " : ""}6h`, "cfg:set:gmgnInterval:6h"),
-        settingButton(`${(config.gmgn?.interval || "1h") === "24h" ? "✅ " : ""}24h`, "cfg:set:gmgnInterval:24h"),
+        settingButton(config.strategy.strategy === "spot" ? "✅ Spot" : "Spot", "cfg:set:strategy:spot"),
+        settingButton(config.strategy.strategy === "bid_ask" ? "✅ Bid/Ask" : "Bid/Ask", "cfg:set:strategy:bid_ask"),
       ],
-      [
-        inputButton("gmgnMinVolume", "Min volume")[0],
-        inputButton("gmgnMinTokenAgeHours", "Min token age (h)")[0],
-      ],
-      [
-        inputButton("gmgnMaxTokenAgeHours", "Max token age (h)")[0],
-        inputButton("gmgnMaxBundlerRate", "Max bundler %")[0],
-      ],
-      [settingButton("KOL settings", "cfg:page:kol")],
-      inputButton("managementIntervalMin", "Manage interval (min)"),
-      inputButton("screeningIntervalMin", "Screen interval (min)"),
+      [toggleButton("blockPvpSymbols", "🛡 Block PVP")],
+      [inputButton("managementIntervalMin", "⏱ Manage (min)")[0], inputButton("screeningIntervalMin", "⏱ Screen (min)")[0]],
     ];
-  } else if (page === "strategy") {
-    const strat = String(config.screening?.strategy || "spot").toLowerCase();
+
+  } else if (page === "filter") {
+    // ─── 🔍 Meteora Filters (from user-config.json) ───
     rows = [
+      [inputButton("minTvl", "Min TVL")[0], inputButton("maxTvl", "Max TVL")[0]],
+      [inputButton("minVolume", "Min Volume")[0], inputButton("minOrganic", "Min Organic %")[0]],
+      [inputButton("minHolders", "Min Holders")[0], inputButton("minMcap", "Min Mcap")[0]],
+      [inputButton("minFeeActiveTvlRatio", "Min Fee/TVL", { digits: 2 })[0], inputButton("minTokenFeesSol", "Min Fee SOL")[0]],
+      [inputButton("minBinStep", "Min Bin Step")[0], inputButton("maxBinStep", "Max Bin Step")[0]],
       [
-        settingButton(`${strat === "spot" ? "✅ " : "   "}spot`, "cfg:set:strategy:spot"),
-        settingButton(`${strat === "bid_ask" ? "✅ " : "   "}bid_ask`, "cfg:set:strategy:bid_ask"),
+        settingButton(config.strategy.strategy === "spot" ? "✅ Spot" : "Spot", "cfg:set:strategy:spot"),
+        settingButton(config.strategy.strategy === "bid_ask" ? "✅ Bid/Ask" : "Bid/Ask", "cfg:set:strategy:bid_ask"),
       ],
-      inputButton("minBinsBelow", "Min bins"),
-      inputButton("maxBinsBelow", "Max bins"),
+      [toggleButton("useDiscordSignals", "📡 Discord Signals"), toggleButton("blockPvpSymbols", "🛡 Block PVP")],
+      [inputButton("managementIntervalMin", "⏱ Manage (min)")[0], inputButton("screeningIntervalMin", "⏱ Screen (min)")[0]],
     ];
-  } else if (page === "gmgn") {
+
+  } else if (page === "indicators" && isGmgn) {
+    // ─── 📊 GMGN Indicators ───
     const gtf = String(config.gmgn?.indicatorInterval || "15_MINUTE");
     rows = [
-      [toggleButton("gmgnIndicatorFilter", "Indicator filter"), toggleButton("gmgnRequireKol", "Require KOL")],
+      [toggleButton("gmgnIndicatorFilter", "🔍 GMGN Indicator Filter")],
       [
-        settingButton(`${gtf === "5_MINUTE" ? "✅ " : ""}TF: 5m`, "cfg:set:gmgnIndicatorInterval:5_MINUTE"),
-        settingButton(`${gtf === "15_MINUTE" ? "✅ " : ""}TF: 15m`, "cfg:set:gmgnIndicatorInterval:15_MINUTE"),
-        settingButton(`${gtf === "1h" ? "✅ " : ""}TF: 1h`, "cfg:set:gmgnIndicatorInterval:1h"),
+        settingButton(gtf === "5_MINUTE" ? "✅ 5min" : "5min", "cfg:set:gmgnIndicatorInterval:5_MINUTE"),
+        settingButton(gtf === "15_MINUTE" ? "✅ 15min" : "15min", "cfg:set:gmgnIndicatorInterval:15_MINUTE"),
+        settingButton(gtf === "1h" ? "✅ 1h" : "1h", "cfg:set:gmgnIndicatorInterval:1h"),
       ],
-      [toggleButton("gmgnRequireBullishSt", "Bullish ST"), toggleButton("gmgnRejectAtBottom", "Reject at bottom"), toggleButton("gmgnRequireAboveSt", "Above ST")],
-      inputButton("gmgnMinRsi", "Min RSI"),
-      inputButton("gmgnMaxRsi", "Max RSI"),
-      inputButton("gmgnMinKolCount", "Min KOL"),
-      inputButton("gmgnMinTotalFeeSol", "Min fee SOL"),
-      inputButton("gmgnMinHolders", "Min holders"),
-      [settingButton("KOL settings", "cfg:page:kol")],
+      [toggleButton("gmgnRequireBullishSt", "📈 Bullish Supertrend")],
+      [toggleButton("gmgnRejectAtBottom", "⛔ Reject at Bottom")],
+      [toggleButton("gmgnRequireAboveSt", "📊 Above Supertrend")],
+      [inputButton("gmgnMinRsi", "Min RSI")[0], inputButton("gmgnMaxRsi", "Max RSI")[0]],
     ];
-  } else if (page === "kol") {
-    rows = [
-      inputButton("gmgnPreferredKolNames", "Preferred KOL (comma-sep)"),
-      inputButton("gmgnPreferredKolMinHoldPct", "Preferred KOL min hold %"),
-      inputButton("gmgnDumpKolNames", "Dump KOL (comma-sep)"),
-      inputButton("gmgnDumpKolMinHoldPct", "Dump KOL min hold %"),
-    ];
+
   } else if (page === "indicators") {
+    // ─── 📊 Meteora Chart Indicators ───
     const intervals = Array.isArray(config.indicators?.intervals) ? config.indicators.intervals : [];
     const tfIs = (v) => intervals.length === 1 && intervals[0] === v;
     const tfBoth = intervals.length >= 2;
     const entry = String(config.indicators?.entryPreset || "");
     const exit = String(config.indicators?.exitPreset || "");
     rows = [
-      [toggleButton("chartIndicatorsEnabled", "Chart indicators"), toggleButton("requireAllIntervals", "Require all TF")],
+      [toggleButton("chartIndicatorsEnabled", "📊 Chart Indicators")],
       [
-        settingButton(`${tfIs("5_MINUTE") ? "✅ " : ""}TF: 5m`, "cfg:set:indicatorIntervals:5_MINUTE"),
-        settingButton(`${tfIs("15_MINUTE") ? "✅ " : ""}TF: 15m`, "cfg:set:indicatorIntervals:15_MINUTE"),
-        settingButton(`${tfBoth ? "✅ " : ""}TF: both`, "cfg:set:indicatorIntervals:both"),
+        settingButton(tfIs("5_MINUTE") ? "✅ 5min" : "5min", "cfg:set:indicatorIntervals:5_MINUTE"),
+        settingButton(tfIs("15_MINUTE") ? "✅ 15min" : "15min", "cfg:set:indicatorIntervals:15_MINUTE"),
+        settingButton(tfBoth ? "✅ Both" : "Both", "cfg:set:indicatorIntervals:both"),
+      ],
+      [toggleButton("requireAllIntervals", "Require All Timeframes")],
+      [
+        settingButton(entry === "supertrend_break" ? "✅ ST" : "ST", "cfg:set:indicatorEntryPreset:supertrend_break"),
+        settingButton(entry === "rsi_reversal" ? "✅ RSI" : "RSI", "cfg:set:indicatorEntryPreset:rsi_reversal"),
+        settingButton(entry === "supertrend_or_rsi" ? "✅ ST+RSI" : "ST+RSI", "cfg:set:indicatorEntryPreset:supertrend_or_rsi"),
       ],
       [
-        settingButton(`${entry === "supertrend_break" ? "✅ " : ""}Entry: ST`, "cfg:set:indicatorEntryPreset:supertrend_break"),
-        settingButton(`${entry === "rsi_reversal" ? "✅ " : ""}Entry: RSI`, "cfg:set:indicatorEntryPreset:rsi_reversal"),
-        settingButton(`${entry === "supertrend_or_rsi" ? "✅ " : ""}Entry: ST/RSI`, "cfg:set:indicatorEntryPreset:supertrend_or_rsi"),
+        settingButton(exit === "supertrend_break" ? "✅ ST" : "ST", "cfg:set:indicatorExitPreset:supertrend_break"),
+        settingButton(exit === "rsi_reversal" ? "✅ RSI" : "RSI", "cfg:set:indicatorExitPreset:rsi_reversal"),
+        settingButton(exit === "bb_plus_rsi" ? "✅ BB+RSI" : "BB+RSI", "cfg:set:indicatorExitPreset:bb_plus_rsi"),
       ],
-      [
-        settingButton(`${exit === "supertrend_break" ? "✅ " : ""}Exit: ST`, "cfg:set:indicatorExitPreset:supertrend_break"),
-        settingButton(`${exit === "rsi_reversal" ? "✅ " : ""}Exit: RSI`, "cfg:set:indicatorExitPreset:rsi_reversal"),
-        settingButton(`${exit === "bb_plus_rsi" ? "✅ " : ""}Exit: BB+RSI`, "cfg:set:indicatorExitPreset:bb_plus_rsi"),
-      ],
-      inputButton("rsiLength", "RSI length"),
+      inputButton("rsiLength", "RSI Length"),
     ];
+
+  } else if (page === "kol") {
+    // ─── 👥 KOL Settings ───
+    rows = [
+      [toggleButton("gmgnRequireKol", "🔒 Require KOL")],
+      [inputButton("gmgnMinKolCount", "Min KOL Count")[0]],
+      [inputButton("gmgnPreferredKolNames", "⭐ Preferred KOLs")[0]],
+      [inputButton("gmgnPreferredKolMinHoldPct", "Preferred Min Hold %")[0]],
+      [inputButton("gmgnDumpKolNames", "🚫 Dump KOLs")[0]],
+      [inputButton("gmgnDumpKolMinHoldPct", "Dump Min Hold %")[0]],
+    ];
+
   } else if (page === "notif") {
+    // ─── 🔔 Notifications ───
     rows = [
-      [toggleButton("telegramMuteAll", "Mute ALL")],
-      [toggleButton("telegramMuteDeploy", "Deploy mute"),  toggleButton("telegramMuteClose", "Close mute")],
-      [toggleButton("telegramMuteSwap",   "Swap mute"),    toggleButton("telegramMuteOor",   "OOR mute")],
-      [toggleButton("telegramMuteCycle",  "Cycle mute"),   toggleButton("telegramMuteClaim", "Claim mute")],
+      [toggleButton("telegramMuteAll", "🔇 Mute Everything")],
+      [toggleButton("telegramMuteDeploy", "🟢 Deploy"), toggleButton("telegramMuteClose", "🔴 Close")],
+      [toggleButton("telegramMuteSwap", "🔄 Swap"), toggleButton("telegramMuteOor", "⚠️ Out of Range")],
+      [toggleButton("telegramMuteCycle", "📊 Cycle Report"), toggleButton("telegramMuteClaim", "💰 Claim")],
     ];
+
   } else {
-    const src = String(config.screening?.source || "meteora").toLowerCase();
+    // ─── ⚙ Main — General Settings ───
     rows = [
       [
-        settingButton(`${src === "meteora" ? "✅ " : "   "}Source: Meteora`, "cfg:set:screeningSource:meteora"),
-        settingButton(`${src === "gmgn" ? "✅ " : "   "}Source: GMGN`, "cfg:set:screeningSource:gmgn"),
+        settingButton(isGmgn ? "Meteora" : "✅ Meteora", "cfg:set:screeningSource:meteora"),
+        settingButton(isGmgn ? "✅ GMGN" : "GMGN", "cfg:set:screeningSource:gmgn"),
       ],
-      [toggleButton("solMode", "SOL mode"), toggleButton("lpAgentRelayEnabled", "LPAgent relay")],
-      [toggleButton("chartIndicatorsEnabled", "Chart indicators"), toggleButton("trailingTakeProfit", "Trailing TP")],
-      [toggleButton("hiveMindEnabled", "HiveMind"), toggleButton("telegramMuteAll", "Mute ALL")],
-      [settingButton("Notif page", "cfg:page:notif")],
-      [
-        settingButton("Risk / deploy", "cfg:page:risk"),
-        settingButton("Screening", "cfg:page:screen"),
-      ],
-      [
-        settingButton("Indicators", "cfg:page:indicators"),
-        settingButton("Show config", "cfg:show"),
-      ],
+      [toggleButton("solMode", "SOL Mode"), toggleButton("lpAgentRelayEnabled", "LP Agent Relay")],
+      [toggleButton("hiveMindEnabled", "🧠 HiveMind"), toggleButton("twitterEnabled", "🐦 Twitter")],
+      [toggleButton("chartIndicatorsEnabled", "📊 Indicators"), toggleButton("trailingTakeProfit", "🎯 Trailing TP")],
+      [settingButton("📄 Show Full Config", "cfg:show")],
     ];
   }
 
   return { text: summary, keyboard: [...nav, ...rows, ...footer] };
 }
-
 async function showSettingsMenu({ messageId = null, page = "main" } = {}) {
   const menu = renderSettingsMenu(page);
   if (messageId) {
-    await editMessageWithButtons(menu.text, messageId, menu.keyboard);
+    await editMessageWithButtons(menu.text, messageId, menu.keyboard, { parseMode: "HTML" });
   } else {
-    await sendMessageWithButtons(menu.text, menu.keyboard);
+    await sendMessageWithButtons(menu.text, menu.keyboard, { parseMode: "HTML" });
   }
 }
 
@@ -1876,11 +1906,11 @@ async function applySettingsMenuCallback(msg) {
     const inputKey = parts[2];
     const currentVal = settingValue(inputKey);
     const inputPage = ["gmgnPreferredKolNames", "gmgnPreferredKolMinHoldPct", "gmgnDumpKolNames", "gmgnDumpKolMinHoldPct"].includes(inputKey) ? "kol"
-      : ["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours"].includes(inputKey) ? "screen"
-      : inputKey.startsWith("gmgn") && inputKey !== "gmgnRequireKol" ? "gmgn"
+      : ["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours", "minBinsBelow", "maxBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(inputKey) ? "filter"
+      : ["useDiscordSignals", "blockPvpSymbols", "screeningSource", "gmgnRequireKol"].includes(inputKey) ? "filter"
       : inputKey.startsWith("indicator") || inputKey === "chartIndicatorsEnabled" || inputKey === "rsiLength" || inputKey === "requireAllIntervals" ? "indicators"
-      : ["minBinsBelow", "maxBinsBelow"].includes(inputKey) ? "strategy"
-      : ["useDiscordSignals", "blockPvpSymbols", "managementIntervalMin", "screeningIntervalMin", "screeningSource", "gmgnRequireKol"].includes(inputKey) ? "screen"
+      : inputKey.startsWith("gmgn") && !["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours"].includes(inputKey) ? "indicators"
+      : ["solMode", "lpAgentRelayEnabled", "hiveMindEnabled", "twitterEnabled"].includes(inputKey) ? "main"
       : "risk";
     await answerCallbackQuery(msg.callbackQueryId);
     const promptText = [
@@ -1918,6 +1948,9 @@ async function applySettingsMenuCallback(msg) {
   }
   if (action === "page") {
     page = parts[2] || "main";
+    // Redirect old page names to new merged pages
+    if (page === "strategy" || page === "screen" || page === "gmgn") page = "filter";
+    if (page === "indicators_old") page = "indicators";
     await answerCallbackQuery(msg.callbackQueryId);
     await showSettingsMenu({ messageId: msg.messageId, page });
     return;
@@ -1957,17 +1990,15 @@ async function applySettingsMenuCallback(msg) {
     return;
   }
   page = key.startsWith("telegramMute") ? "notif"
-    : ["gmgnPreferredKolNames", "gmgnPreferredKolMinHoldPct", "gmgnDumpKolNames", "gmgnDumpKolMinHoldPct"].includes(key) ? "kol"
-    : ["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours"].includes(key) ? "screen"
-    : key.startsWith("gmgn") && key !== "gmgnRequireKol"
-      ? "gmgn"
-      : key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals"
-        ? "indicators"
-        : ["minBinsBelow", "maxBinsBelow"].includes(key)
-          ? "strategy"
-          : ["useDiscordSignals", "blockPvpSymbols", "managementIntervalMin", "screeningIntervalMin", "screeningSource", "gmgnRequireKol"].includes(key)
-            ? "screen"
-            : "risk";
+    : ["gmgnPreferredKolNames", "gmgnPreferredKolMinHoldPct", "gmgnDumpKolNames", "gmgnDumpKolMinHoldPct", "gmgnRequireKol", "gmgnMinKolCount"].includes(key) ? "kol"
+    : ["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours", "gmgnMinTotalFeeSol", "gmgnMinHolders", "gmgnInterval"].includes(key) ? "filter"
+    : ["useDiscordSignals", "blockPvpSymbols", "managementIntervalMin", "screeningIntervalMin", "strategy"].includes(key) ? "filter"
+    : ["minTvl", "maxTvl", "minVolume", "minOrganic", "minHolders", "minMcap", "minFeeActiveTvlRatio", "minTokenFeesSol", "minBinStep", "maxBinStep"].includes(key) ? "filter"
+    : ["gmgnIndicatorFilter", "gmgnIndicatorInterval", "gmgnRequireBullishSt", "gmgnRejectAtBottom", "gmgnRequireAboveSt", "gmgnMinRsi", "gmgnMaxRsi"].includes(key) ? "indicators"
+    : key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals" ? "indicators"
+    : ["solMode", "lpAgentRelayEnabled", "hiveMindEnabled", "twitterEnabled", "screeningSource", "chartIndicatorsEnabled", "trailingTakeProfit"].includes(key) ? "main"
+    : ["minBinsBelow", "maxBinsBelow"].includes(key) ? "risk"
+    : "risk";
   await answerCallbackQuery(msg.callbackQueryId, `Updated ${key}`);
   await showSettingsMenu({ messageId: msg.messageId, page });
 }

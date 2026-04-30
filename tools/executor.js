@@ -20,6 +20,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
+import { getTwitterSentiment } from "./twitter.js";
 import { config, reloadScreeningThresholds } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
@@ -163,7 +164,7 @@ const CONFIG_VALIDATORS = {
   repeatDeployCooldownMinFeeEarnedPct: num(0, 1000),
   minVolumeToRebalance:   num(0, 1e12),
   autoSwapAfterClaim:     bool(),
-  solMode:                oneOf(["always", "auto", "never"]),
+  solMode:                bool(),
   minAgeBeforeYieldCheck: num(0, 100000),
   minFeePerTvl24h:        num(0, 100),
   minBinsBelow:           num(0, 1000, { integer: true }),
@@ -188,6 +189,10 @@ const CONFIG_VALIDATORS = {
   publicApiKey:           str({ allowEmpty: false, maxLen: 4096, allowNull: true }),
   agentMeridianApiUrl:    str({ allowEmpty: false, allowNull: true }),
   lpAgentRelayEnabled:    bool(),
+  // ─── twitter ──────────────────────────────────────────────────
+  twitterEnabled:         bool(),
+  twitterApiKey:          str({ allowEmpty: false, maxLen: 4096, allowNull: true }),
+  twitterTimeoutMs:       num(1000, 60_000, { integer: true }),
   // ─── telegram notification mute toggles ───────────────────────
   telegramMuteAll:    bool(),
   telegramMuteDeploy: bool(),
@@ -218,6 +223,7 @@ const toolMap = {
   get_token_info: getTokenInfo,
   get_token_holders: getTokenHolders,
   get_token_narrative: getTokenNarrative,
+  get_twitter_sentiment: getTwitterSentiment,
   add_smart_wallet: addSmartWallet,
   remove_smart_wallet: removeSmartWallet,
   list_smart_wallets: listSmartWallets,
@@ -395,6 +401,10 @@ const toolMap = {
       publicApiKey: ["api", "publicApiKey"],
       agentMeridianApiUrl: ["api", "url"],
       lpAgentRelayEnabled: ["api", "lpAgentRelayEnabled"],
+      // twitter
+      twitterEnabled: ["twitter", "enabled"],
+      twitterApiKey: ["twitter", "apiKey"],
+      twitterTimeoutMs: ["twitter", "timeoutMs"],
       // telegram notification mute toggles
       telegramMuteAll:    ["telegram", "muteAll"],
       telegramMuteDeploy: ["telegram", "muteDeploy"],

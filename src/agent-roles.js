@@ -27,6 +27,7 @@ export const SCREENER_TOOLS = new Set([
   "check_smart_wallets_on_pool",
   "get_token_holders",
   "get_token_narrative",
+  "get_twitter_sentiment",
   "get_token_info",
   "search_pools",
   "get_pool_memory",
@@ -67,7 +68,7 @@ export const GENERAL_INTENT_ONLY_TOOLS = new Set([
  */
 export const INTENT_TOOLS = {
   decisions:   new Set(["get_recent_decisions"]),
-  deploy:      new Set(["deploy_position", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note"]),
+  deploy:      new Set(["deploy_position", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_twitter_sentiment", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note"]),
   close:       new Set(["close_position", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token"]),
   claim:       new Set(["claim_fees", "get_my_positions", "get_position_pnl", "get_wallet_balance"]),
   swap:        new Set(["swap_token", "get_wallet_balance"]),
@@ -77,7 +78,7 @@ export const INTENT_TOOLS = {
   balance:     new Set(["get_wallet_balance", "get_my_positions", "get_wallet_positions"]),
   positions:   new Set(["get_my_positions", "get_position_pnl", "get_wallet_balance", "set_position_note", "get_wallet_positions"]),
   strategy:    new Set(["list_strategies", "get_strategy", "add_strategy", "update_strategy", "delete_strategy", "remove_strategy", "set_active_strategy"]),
-  screen:      new Set(["get_top_candidates", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "check_smart_wallets_on_pool", "get_pool_detail", "get_my_positions", "discover_pools"]),
+  screen:      new Set(["get_top_candidates", "get_token_holders", "get_token_narrative", "get_twitter_sentiment", "get_token_info", "search_pools", "check_smart_wallets_on_pool", "get_pool_detail", "get_my_positions", "discover_pools"]),
   memory:      new Set(["get_pool_memory", "add_pool_note", "list_blacklist", "add_to_blacklist", "remove_from_blacklist"]),
   smartwallet: new Set(["add_smart_wallet", "remove_smart_wallet", "list_smart_wallets", "check_smart_wallets_on_pool"]),
   study:       new Set(["study_top_lpers", "get_top_lpers", "get_pool_detail", "search_pools", "get_token_info", "discover_pools", "add_smart_wallet", "list_smart_wallets"]),

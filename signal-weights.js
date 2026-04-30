@@ -27,6 +27,7 @@ const SIGNAL_NAMES = [
   "study_win_rate",
   "hive_consensus",
   "volatility",
+  "twitter_sentiment",
 ];
 
 const DEFAULT_WEIGHTS = Object.fromEntries(SIGNAL_NAMES.map((s) => [s, 1.0]));
@@ -45,7 +46,7 @@ const HIGHER_IS_BETTER = new Set([
 const BOOLEAN_SIGNALS = new Set(["smart_wallets_present"]);
 
 // Categorical signals — compared by win rate across categories
-const CATEGORICAL_SIGNALS = new Set(["narrative_quality"]);
+const CATEGORICAL_SIGNALS = new Set(["narrative_quality", "twitter_sentiment"]);
 
 // ─── Persistence ─────────────────────────────────────────────────
 

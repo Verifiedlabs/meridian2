@@ -585,6 +585,43 @@ BAD narrative signals (caution or skip):
   {
     type: "function",
     function: {
+      name: "get_twitter_sentiment",
+      description: `Get Twitter/X sentiment analysis for a token.
+Scrapes recent tweets mentioning the token ticker to assess social buzz, KOL engagement, and overall sentiment.
+
+Returns:
+- tweet_count_24h: number of tweets in last 24 hours
+- engagement_total: total likes + retweets
+- kol_mentions: count of accounts with >10K followers mentioning the token
+- kol_names: names of top KOLs
+- sentiment: "bullish" | "bearish" | "neutral"
+- buzz_level: "HIGH" | "MEDIUM" | "LOW" | "NONE"
+- top_tweets: top 3 tweets by engagement
+- summary: one-line summary for quick assessment
+
+Use during screening to gauge whether a token has real social momentum or is fading.
+High buzz + bullish sentiment from KOLs = stronger conviction signal.
+No buzz or bearish sentiment = caution, narrative may be exhausted.`,
+      parameters: {
+        type: "object",
+        properties: {
+          symbol: {
+            type: "string",
+            description: "Token ticker symbol (e.g. 'WISH', 'SOL', 'BONK')"
+          },
+          mint: {
+            type: "string",
+            description: "Token mint address (optional, for context)"
+          }
+        },
+        required: ["symbol"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "search_pools",
       description: `Search for DLMM pools by token symbol, ticker, or contract address (CA).
 Use this when the user asks to deploy into a specific token or pool by name/CA,

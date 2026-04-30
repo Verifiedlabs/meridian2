@@ -243,6 +243,15 @@ export const config = {
     cacheTtlMs:        u.priorityFeeCacheTtlMs        ?? 15_000,
   },
 
+  // ─── Twitter/X Sentiment ──────────────
+  // GetXAPI.com — $0.001/call (~20 tweets), no rate limit.
+  // Set GETXAPI_KEY env var or twitterApiKey in user-config.json.
+  twitter: {
+    enabled:           u.twitterEnabled !== false && process.env.TWITTER_ENABLED !== "false",
+    apiKey:            nonEmptyString(u.twitterApiKey, process.env.GETXAPI_KEY),
+    timeoutMs:         u.twitterTimeoutMs ?? 15_000,
+  },
+
   // ─── HiveMind ─────────────────────────
   // Opt-in. Set hiveMindEnabled=true (or HIVEMIND_ENABLED=true env) to participate.
   // README documents this as an explicit opt-in feature; do not enable by default.

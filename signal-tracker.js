@@ -19,7 +19,7 @@ const STAGE_TTL_MS = 10 * 60 * 1000; // 10 minutes
  * Stage signals for a pool during screening.
  * Called after candidate data is loaded, before the LLM decides.
  * @param {string} poolAddress
- * @param {object} signals — { organic_score, fee_tvl_ratio, volume, mcap, holder_count, smart_wallets_present, narrative_quality, study_win_rate, hive_consensus, volatility }
+ * @param {object} signals — { organic_score, fee_tvl_ratio, volume, mcap, holder_count, smart_wallets_present, narrative_quality, study_win_rate, hive_consensus, volatility, twitter_sentiment }
  */
 export function stageSignals(poolAddress, signals) {
   _staged.set(poolAddress, {
