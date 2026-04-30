@@ -42,10 +42,37 @@ const NITTER_INSTANCES = [
   "https://nitter.cz",
 ];
 
+// ─── Cache (avoid duplicate API calls for same token) ────────
+
+const _cache = new Map();
+const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+function getCached(symbol) {
+  const key = symbol.toUpperCase();
+  const entry = _cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CACHE_TTL_MS) {
+    _cache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCache(symbol, data) {
+  const key = symbol.toUpperCase();
+  _cache.set(key, { data, ts: Date.now() });
+  // Evict old entries
+  if (_cache.size > 200) {
+    const oldest = [..._cache.entries()].sort((a, b) => a[1].ts - b[1].ts);
+    for (let i = 0; i < 50; i++) _cache.delete(oldest[i][0]);
+  }
+}
+
 // ─── Main Export ─────────────────────────────────────────────────
 
 /**
  * Get Twitter/X sentiment analysis for a token.
+ * Results are cached for 10 minutes to avoid duplicate API calls.
  * @param {object} params
  * @param {string} params.symbol — Token ticker (e.g. "WISH", "SOL")
  * @param {string} [params.mint] — Token mint address (optional, for context)
@@ -54,6 +81,13 @@ const NITTER_INSTANCES = [
 export async function getTwitterSentiment({ symbol, mint }) {
   if (!config.twitter?.enabled) return null;
   if (!symbol) return null;
+
+  // Check cache first
+  const cached = getCached(symbol);
+  if (cached !== null) {
+    log("twitter", `Cache hit for $${symbol} (${cached.sentiment})`);
+    return cached;
+  }
 
   const timeoutMs = config.twitter?.timeoutMs ?? 15_000;
 
@@ -67,6 +101,7 @@ export async function getTwitterSentiment({ symbol, mint }) {
       );
       if (result) {
         log("twitter", `GetXAPI OK for $${symbol}: ${result.tweet_count_24h} tweets, sentiment=${result.sentiment}`);
+        setCache(symbol, result);
         return result;
       }
     }
@@ -78,6 +113,7 @@ export async function getTwitterSentiment({ symbol, mint }) {
     );
     if (nitterResult) {
       log("twitter", `Nitter OK for $${symbol}: ${nitterResult.tweet_count_24h} tweets, sentiment=${nitterResult.sentiment}`);
+      setCache(symbol, nitterResult);
       return nitterResult;
     }
 
