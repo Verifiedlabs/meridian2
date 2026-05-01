@@ -1,13 +1,12 @@
 /**
  * tools/twitter.js — Twitter/X sentiment analysis for token screening.
  *
- * Scrapes Twitter data for a token ticker to assess social buzz, KOL engagement,
- * and overall sentiment. Used as an enrichment step in the screening pipeline.
+ * Two modes:
+ *   "local"  — Playwright Chromium + your Twitter session cookies (FREE, unlimited)
+ *   "api"    — GetXAPI.com REST API ($0.001/call, ~20 tweets per call)
  *
- * Data sources (tried in order):
- *   1. GetXAPI.com — $0.001/call (~20 tweets), no rate limit, pay-per-use
- *   2. Nitter RSS scraping — fallback, no auth needed
- *   3. Graceful null — if all sources fail, screening continues without Twitter data
+ * Auto-fallback: if primary mode fails, tries the other mode.
+ * Results cached for 30 minutes to avoid redundant fetches.
  *
  * The result is injected into the LLM prompt and tracked as a Darwinian signal
  * ("twitter_sentiment") so the system can learn whether Twitter buzz actually
@@ -32,17 +31,15 @@ const BEARISH_KEYWORDS = [
   "avoid", "warning", "careful", "sus", "sketchy", "honeypot",
 ];
 
-const KOL_FOLLOWER_THRESHOLD = 10_000;
-
-// ─── Nitter Instances (fallback) ─────────────────────────────────
-
-const NITTER_INSTANCES = [
-  "https://nitter.privacydev.net",
-  "https://nitter.poast.org",
-  "https://nitter.cz",
+const SPAM_PATTERNS = [
+  "follow @", "his signals", "his recommendations", "helped me earn",
+  "been profitable", "crypto expert", "must-follow", "market reads",
+  "market insights", "dm me for", "join my group", "free signals",
 ];
 
-// ─── Cache (avoid duplicate API calls for same token) ────────
+const KOL_FOLLOWER_THRESHOLD = 10_000;
+
+// ─── Cache ───────────────────────────────────────────────────────
 
 const _cache = new Map();
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
@@ -61,18 +58,75 @@ function getCached(symbol) {
 function setCache(symbol, data) {
   const key = symbol.toUpperCase();
   _cache.set(key, { data, ts: Date.now() });
-  // Evict old entries
   if (_cache.size > 200) {
     const oldest = [..._cache.entries()].sort((a, b) => a[1].ts - b[1].ts);
     for (let i = 0; i < 50; i++) _cache.delete(oldest[i][0]);
   }
 }
 
+// ─── Playwright Browser Pool (reuse across calls) ────────────────
+
+let _browser = null;
+let _context = null;
+let _page = null;
+let _browserLaunchPromise = null;
+
+async function getLocalPage() {
+  if (_page && !_page.isClosed()) return _page;
+
+  // Prevent concurrent launches
+  if (_browserLaunchPromise) return _browserLaunchPromise;
+
+  _browserLaunchPromise = (async () => {
+    try {
+      const { chromium } = await import("playwright");
+
+      if (_browser) {
+        try { await _browser.close(); } catch {}
+      }
+
+      _browser = await chromium.launch({ headless: true });
+      _context = await _browser.newContext({
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+      });
+
+      const authToken = config.twitter?.authToken;
+      const ct0 = config.twitter?.ct0;
+      if (!authToken || !ct0) {
+        throw new Error("Twitter cookies not configured (authToken + ct0 required for local mode)");
+      }
+
+      await _context.addCookies([
+        { name: "auth_token", value: authToken, domain: ".x.com", path: "/", secure: true, httpOnly: true },
+        { name: "ct0", value: ct0, domain: ".x.com", path: "/", secure: true },
+        { name: "dnt", value: "1", domain: ".x.com", path: "/" },
+      ]);
+
+      _page = await _context.newPage();
+
+      // Warm up session
+      await _page.goto("https://x.com/home", { timeout: 20000 });
+      await _page.waitForTimeout(3000);
+
+      log("twitter", "Playwright browser session ready");
+      return _page;
+    } catch (err) {
+      _browser = null;
+      _context = null;
+      _page = null;
+      throw err;
+    } finally {
+      _browserLaunchPromise = null;
+    }
+  })();
+
+  return _browserLaunchPromise;
+}
+
 // ─── Main Export ─────────────────────────────────────────────────
 
 /**
  * Get Twitter/X sentiment analysis for a token.
- * Results are cached for 10 minutes to avoid duplicate API calls.
  * @param {object} params
  * @param {string} params.symbol — Token ticker (e.g. "WISH", "SOL")
  * @param {string} [params.mint] — Token mint address (optional, for context)
@@ -82,56 +136,135 @@ export async function getTwitterSentiment({ symbol, mint }) {
   if (!config.twitter?.enabled) return null;
   if (!symbol) return null;
 
-  // Check cache first
   const cached = getCached(symbol);
   if (cached !== null) {
     log("twitter", `Cache hit for $${symbol} (${cached.sentiment})`);
     return cached;
   }
 
+  const mode = config.twitter?.mode || "local";
   const timeoutMs = config.twitter?.timeoutMs ?? 15_000;
 
+  let result = null;
+
+  // Primary mode
   try {
-    // Try GetXAPI first (primary — $0.001/call, no rate limit)
-    const apiKey = config.twitter?.apiKey;
-    if (apiKey) {
-      const result = await withTimeout(
-        fetchGetXApi(symbol, apiKey),
-        timeoutMs,
-      );
-      if (result) {
-        log("twitter", `GetXAPI OK for $${symbol}: ${result.tweet_count_24h} tweets, sentiment=${result.sentiment}`);
-        setCache(symbol, result);
-        return result;
-      }
+    if (mode === "local") {
+      result = await withTimeout(fetchLocal(symbol), timeoutMs);
+    } else {
+      result = await withTimeout(fetchGetXApi(symbol, config.twitter?.apiKey), timeoutMs);
     }
-
-    // Fallback: Nitter RSS scraping
-    const nitterResult = await withTimeout(
-      fetchNitter(symbol),
-      timeoutMs,
-    );
-    if (nitterResult) {
-      log("twitter", `Nitter OK for $${symbol}: ${nitterResult.tweet_count_24h} tweets, sentiment=${nitterResult.sentiment}`);
-      setCache(symbol, nitterResult);
-      return nitterResult;
-    }
-
-    log("twitter", `No Twitter data available for $${symbol}`);
-    return null;
   } catch (err) {
-    log("twitter", `Error fetching Twitter data for $${symbol}: ${err.message}`);
-    return null;
+    log("twitter", `Primary (${mode}) failed for $${symbol}: ${err.message}`);
   }
+
+  // Fallback to other mode
+  if (!result) {
+    try {
+      if (mode === "local" && config.twitter?.apiKey) {
+        log("twitter", `Fallback to API for $${symbol}`);
+        result = await withTimeout(fetchGetXApi(symbol, config.twitter.apiKey), timeoutMs);
+      } else if (mode === "api" && config.twitter?.authToken && config.twitter?.ct0) {
+        log("twitter", `Fallback to local for $${symbol}`);
+        result = await withTimeout(fetchLocal(symbol), timeoutMs);
+      }
+    } catch (err) {
+      log("twitter", `Fallback failed for $${symbol}: ${err.message}`);
+    }
+  }
+
+  if (result) {
+    log("twitter", `${result.source} OK for $${symbol}: ${result.tweet_count_24h} tweets, sentiment=${result.sentiment}`);
+    setCache(symbol, result);
+    return result;
+  }
+
+  log("twitter", `No Twitter data available for $${symbol}`);
+  return null;
 }
 
-// ─── GetXAPI.com ─────────────────────────────────────────────────
-// Docs: https://docs.getxapi.com
-// Endpoint: GET /twitter/tweet/advanced_search
-// Cost: $0.001/call (~20 tweets), no rate limit
-// Auth: Bearer token
+// ─── Local Mode (Playwright Chromium) ────────────────────────────
+
+async function fetchLocal(symbol) {
+  const page = await getLocalPage();
+
+  const captured = [];
+  const onResponse = (response) => {
+    if (response.url().includes("SearchTimeline") && response.status() === 200) {
+      try { captured.push(response.json()); } catch {}
+    }
+  };
+
+  page.on("response", onResponse);
+
+  try {
+    await page.goto(
+      `https://x.com/search?q=%24${encodeURIComponent(symbol)}&src=typed_query&f=live`,
+      { timeout: 20000 },
+    );
+    await page.waitForTimeout(8000);
+  } finally {
+    page.removeListener("response", onResponse);
+  }
+
+  // Resolve captured promises
+  const responses = await Promise.all(captured.map(p => p.catch(() => null)));
+  const tweets = [];
+  for (const data of responses) {
+    if (data) tweets.push(...parseGraphQLTweets(data));
+  }
+
+  if (!tweets.length) return null;
+
+  const clean = filterSpam(tweets);
+  return buildResult(symbol, clean, "local");
+}
+
+function parseGraphQLTweets(data) {
+  const tweets = [];
+  const instructions = data?.data?.search_by_raw_query?.search_timeline?.timeline?.instructions || [];
+
+  for (const inst of instructions) {
+    for (const entry of inst.entries || []) {
+      let result = entry?.content?.itemContent?.tweet_results?.result;
+      if (!result) continue;
+      if (result.__typename === "TweetWithVisibilityResults") {
+        result = result.tweet || result;
+      }
+
+      const legacy = result.legacy;
+      if (!legacy?.full_text) continue;
+
+      const userResult = result.core?.user_results?.result || {};
+      const userCore = userResult.core || {};
+      const userLegacy = userResult.legacy || {};
+
+      tweets.push({
+        text: legacy.full_text,
+        likes: legacy.favorite_count || 0,
+        retweets: legacy.retweet_count || 0,
+        author_followers: userLegacy.followers_count || 0,
+        author_name: userCore.screen_name || "unknown",
+        author_verified: userResult.is_blue_verified || false,
+        created_at: legacy.created_at || null,
+      });
+    }
+  }
+  return tweets;
+}
+
+function filterSpam(tweets) {
+  return tweets.filter((t) => {
+    const text = t.text.toLowerCase();
+    return !SPAM_PATTERNS.some((pat) => text.includes(pat));
+  });
+}
+
+// ─── API Mode (GetXAPI.com) ──────────────────────────────────────
 
 async function fetchGetXApi(symbol, apiKey) {
+  if (!apiKey) return null;
+
   const query = `$${symbol} OR #${symbol}`;
   const url = `https://api.getxapi.com/twitter/tweet/advanced_search?q=${encodeURIComponent(query)}&product=Latest`;
 
@@ -140,26 +273,15 @@ async function fetchGetXApi(symbol, apiKey) {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
 
-    if (res.status === 401) {
-      log("twitter", "GetXAPI auth failed — check GETXAPI_KEY");
-      return null;
-    }
-    if (res.status === 429) {
-      log("twitter", "GetXAPI rate limited");
-      return null;
-    }
-    if (!res.ok) {
-      log("twitter", `GetXAPI error: ${res.status}`);
-      return null;
-    }
+    if (res.status === 401) { log("twitter", "GetXAPI auth failed"); return null; }
+    if (res.status === 429) { log("twitter", "GetXAPI rate limited"); return null; }
+    if (!res.ok) { log("twitter", `GetXAPI error: ${res.status}`); return null; }
 
     const data = await res.json();
     const tweets = data.tweets || [];
-    if (!tweets.length) {
-      return buildResult(symbol, [], "getxapi");
-    }
+    if (!tweets.length) return buildResult(symbol, [], "api");
 
-    return buildResult(symbol, tweets.map(normalizeGetXApiTweet), "getxapi");
+    return buildResult(symbol, tweets.map(normalizeGetXApiTweet), "api");
   } catch (err) {
     log("twitter", `GetXAPI fetch error: ${err.message}`);
     return null;
@@ -167,92 +289,16 @@ async function fetchGetXApi(symbol, apiKey) {
 }
 
 function normalizeGetXApiTweet(tweet) {
-  // GetXAPI fields: text, likeCount, retweetCount, replyCount, viewCount,
-  // quoteCount, createdAt, author { userName, name, followers, isBlueVerified }
   const author = tweet.author || {};
   return {
     text: tweet.text || "",
     likes: tweet.likeCount ?? 0,
     retweets: tweet.retweetCount ?? 0,
-    replies: tweet.replyCount ?? 0,
-    views: tweet.viewCount ?? 0,
     author_followers: author.followers ?? 0,
     author_name: author.userName ?? "unknown",
     author_verified: author.isBlueVerified ?? false,
     created_at: tweet.createdAt || null,
-    url: tweet.url || null,
   };
-}
-
-// ─── Nitter RSS Fallback ─────────────────────────────────────────
-
-async function fetchNitter(symbol) {
-  const query = encodeURIComponent(`$${symbol}`);
-
-  for (const instance of NITTER_INSTANCES) {
-    try {
-      const url = `${instance}/search/rss?f=tweets&q=${query}`;
-      const res = await fetch(url, {
-        headers: { "User-Agent": "Mozilla/5.0 (compatible; MeridianBot/1.0)" },
-        redirect: "follow",
-      });
-
-      if (!res.ok) continue;
-
-      const xml = await res.text();
-      const tweets = parseNitterRss(xml);
-      if (tweets.length > 0) {
-        return buildResult(symbol, tweets, `nitter:${instance}`);
-      }
-    } catch {
-      continue; // try next instance
-    }
-  }
-
-  return null;
-}
-
-function parseNitterRss(xml) {
-  const items = [];
-  const itemRegex = /<item>([\s\S]*?)<\/item>/g;
-  let match;
-
-  while ((match = itemRegex.exec(xml)) !== null) {
-    const itemXml = match[1];
-    const title = extractTag(itemXml, "title");
-    const description = extractTag(itemXml, "description");
-    const pubDate = extractTag(itemXml, "pubDate");
-    const creator = extractTag(itemXml, "dc:creator");
-
-    items.push({
-      text: cleanHtml(description || title || ""),
-      likes: 0,       // RSS doesn't have engagement data
-      retweets: 0,
-      author_followers: 0,
-      author_name: creator || "unknown",
-      created_at: pubDate || null,
-    });
-  }
-
-  return items;
-}
-
-function extractTag(xml, tag) {
-  const regex = new RegExp(`<${tag}[^>]*>(?:<!\\[CDATA\\[)?(.*?)(?:\\]\\]>)?<\\/${tag}>`, "s");
-  const match = regex.exec(xml);
-  return match ? match[1].trim() : null;
-}
-
-function cleanHtml(html) {
-  return html
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\s+/g, " ")
-    .trim();
 }
 
 // ─── Result Builder ──────────────────────────────────────────────
@@ -261,32 +307,22 @@ function buildResult(symbol, tweets, source) {
   const now = Date.now();
   const oneDayAgo = now - 24 * 60 * 60 * 1000;
 
-  // Filter to last 24h if we have timestamps
   const recent = tweets.filter((t) => {
-    if (!t.created_at) return true; // keep if no timestamp
+    if (!t.created_at) return true;
     const ts = new Date(t.created_at).getTime();
     return ts >= oneDayAgo;
   });
 
   const tweetCount = recent.length;
-
-  // Engagement
   const engagementTotal = recent.reduce(
-    (sum, t) => sum + (t.likes || 0) + (t.retweets || 0),
-    0,
+    (sum, t) => sum + (t.likes || 0) + (t.retweets || 0), 0,
   );
 
-  // KOL detection
   const kols = recent.filter((t) => t.author_followers >= KOL_FOLLOWER_THRESHOLD);
   const kolNames = [...new Set(kols.map((t) => t.author_name))];
-
-  // Sentiment analysis
   const sentiment = analyzeSentiment(recent);
-
-  // Buzz level
   const buzzLevel = computeBuzzLevel(tweetCount, engagementTotal, kols.length);
 
-  // Top tweets by engagement
   const topTweets = [...recent]
     .sort((a, b) => (b.likes + b.retweets) - (a.likes + a.retweets))
     .slice(0, 3)
@@ -295,9 +331,9 @@ function buildResult(symbol, tweets, source) {
       likes: t.likes,
       retweets: t.retweets,
       author_followers: t.author_followers,
+      author_name: t.author_name,
     }));
 
-  // Build summary
   const summary = buildSummary(symbol, tweetCount, engagementTotal, kolNames, sentiment, buzzLevel);
 
   return {
@@ -320,9 +356,7 @@ function analyzeSentiment(tweets) {
 
   for (const tweet of tweets) {
     const text = tweet.text.toLowerCase();
-    // Weight by engagement
     const weight = 1 + Math.log1p((tweet.likes || 0) + (tweet.retweets || 0));
-
     for (const kw of BULLISH_KEYWORDS) {
       if (text.includes(kw)) bullishScore += weight;
     }
@@ -339,12 +373,10 @@ function analyzeSentiment(tweets) {
 }
 
 function computeBuzzLevel(tweetCount, engagement, kolCount) {
-  // Score based on volume + engagement + KOL presence
   let score = 0;
-  score += Math.min(tweetCount / 10, 5);       // max 5 pts from tweet count
-  score += Math.min(engagement / 500, 5);       // max 5 pts from engagement
-  score += Math.min(kolCount * 2, 4);           // max 4 pts from KOLs
-
+  score += Math.min(tweetCount / 10, 5);
+  score += Math.min(engagement / 500, 5);
+  score += Math.min(kolCount * 2, 4);
   if (score >= 8) return "HIGH";
   if (score >= 4) return "MEDIUM";
   if (score >= 1) return "LOW";
@@ -355,14 +387,12 @@ function buildSummary(symbol, tweetCount, engagement, kolNames, sentiment, buzzL
   if (tweetCount === 0) {
     return `$${symbol}: No Twitter activity found in last 24h.`;
   }
-
   const parts = [`$${symbol}: ${tweetCount} tweets in 24h`];
   if (engagement > 0) parts.push(`${engagement} total engagement`);
   if (kolNames.length > 0) {
     parts.push(`${kolNames.length} KOL(s): ${kolNames.slice(0, 3).join(", ")}`);
   }
   parts.push(`sentiment=${sentiment}`, `buzz=${buzzLevel}`);
-
   return parts.join(", ");
 }
 

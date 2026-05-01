@@ -191,6 +191,9 @@ const CONFIG_VALIDATORS = {
   lpAgentRelayEnabled:    bool(),
   // ─── twitter ──────────────────────────────────────────────────
   twitterEnabled:         bool(),
+  twitterMode:            oneOf(["local", "api"]),
+  twitterAuthToken:       str({ allowEmpty: false, maxLen: 4096, allowNull: true }),
+  twitterCt0:             str({ allowEmpty: false, maxLen: 4096, allowNull: true }),
   twitterApiKey:          str({ allowEmpty: false, maxLen: 4096, allowNull: true }),
   twitterTimeoutMs:       num(1000, 60_000, { integer: true }),
   // ─── telegram notification mute toggles ───────────────────────
@@ -403,6 +406,9 @@ const toolMap = {
       lpAgentRelayEnabled: ["api", "lpAgentRelayEnabled"],
       // twitter
       twitterEnabled: ["twitter", "enabled"],
+      twitterMode: ["twitter", "mode"],
+      twitterAuthToken: ["twitter", "authToken"],
+      twitterCt0: ["twitter", "ct0"],
       twitterApiKey: ["twitter", "apiKey"],
       twitterTimeoutMs: ["twitter", "timeoutMs"],
       // telegram notification mute toggles

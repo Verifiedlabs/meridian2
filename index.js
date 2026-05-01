@@ -971,6 +971,7 @@ function settingValue(key) {
     maxBinStep: config.screening.maxBinStep,
     // Twitter
     twitterEnabled: config.twitter?.enabled,
+    twitterMode: config.twitter?.mode,
     deployAmountSol: config.management.deployAmountSol,
     gasReserve: config.management.gasReserve,
     maxPositions: config.risk.maxPositions,
@@ -1068,7 +1069,7 @@ function renderSettingsMenu(page = "main") {
     `Source: <b>${src.toUpperCase()}</b> | Strategy: <b>${config.strategy.strategy}</b>`,
     `Deploy: <b>${config.management.deployAmountSol} SOL</b> | Max: <b>${config.risk.maxPositions} pos</b>`,
     `TP: <b>${config.management.takeProfitPct}%</b> | SL: <b>${config.management.stopLossPct}%</b> | Trail: <b>${config.management.trailingTakeProfit ? "ON" : "OFF"}</b>`,
-    `Twitter: <b>${config.twitter?.enabled ? "ON" : "OFF"}</b> | Indicators: <b>${config.indicators.enabled ? "ON" : "OFF"}</b>`,
+    `Twitter: <b>${config.twitter?.enabled ? "ON" : "OFF"}</b> (${config.twitter?.mode || "local"}) | Indicators: <b>${config.indicators.enabled ? "ON" : "OFF"}</b>`,
   ].join("\n");
 
   // ─── Nav bar ───
@@ -1223,6 +1224,10 @@ function renderSettingsMenu(page = "main") {
       ],
       [toggleButton("solMode", "SOL Mode"), toggleButton("lpAgentRelayEnabled", "LP Agent Relay")],
       [toggleButton("hiveMindEnabled", "🧠 HiveMind"), toggleButton("twitterEnabled", "🐦 Twitter")],
+      [
+        settingButton((config.twitter?.mode || "local") === "local" ? "✅ 🐦 Local" : "🐦 Local", "cfg:set:twitterMode:local"),
+        settingButton((config.twitter?.mode || "local") === "api" ? "✅ 🐦 API" : "🐦 API", "cfg:set:twitterMode:api"),
+      ],
       [toggleButton("chartIndicatorsEnabled", "📊 Indicators"), toggleButton("trailingTakeProfit", "🎯 Trailing TP")],
       [settingButton("📄 Show Full Config", "cfg:show")],
     ];
@@ -1910,7 +1915,7 @@ async function applySettingsMenuCallback(msg) {
       : ["useDiscordSignals", "blockPvpSymbols", "screeningSource", "gmgnRequireKol"].includes(inputKey) ? "filter"
       : inputKey.startsWith("indicator") || inputKey === "chartIndicatorsEnabled" || inputKey === "rsiLength" || inputKey === "requireAllIntervals" ? "indicators"
       : inputKey.startsWith("gmgn") && !["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours"].includes(inputKey) ? "indicators"
-      : ["solMode", "lpAgentRelayEnabled", "hiveMindEnabled", "twitterEnabled"].includes(inputKey) ? "main"
+      : ["solMode", "lpAgentRelayEnabled", "hiveMindEnabled", "twitterEnabled", "twitterMode"].includes(inputKey) ? "main"
       : "risk";
     await answerCallbackQuery(msg.callbackQueryId);
     const promptText = [
@@ -1996,7 +2001,7 @@ async function applySettingsMenuCallback(msg) {
     : ["minTvl", "maxTvl", "minVolume", "minOrganic", "minHolders", "minMcap", "minFeeActiveTvlRatio", "minTokenFeesSol", "minBinStep", "maxBinStep"].includes(key) ? "filter"
     : ["gmgnIndicatorFilter", "gmgnIndicatorInterval", "gmgnRequireBullishSt", "gmgnRejectAtBottom", "gmgnRequireAboveSt", "gmgnMinRsi", "gmgnMaxRsi"].includes(key) ? "indicators"
     : key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals" ? "indicators"
-    : ["solMode", "lpAgentRelayEnabled", "hiveMindEnabled", "twitterEnabled", "screeningSource", "chartIndicatorsEnabled", "trailingTakeProfit"].includes(key) ? "main"
+    : ["solMode", "lpAgentRelayEnabled", "hiveMindEnabled", "twitterEnabled", "twitterMode", "screeningSource", "chartIndicatorsEnabled", "trailingTakeProfit"].includes(key) ? "main"
     : ["minBinsBelow", "maxBinsBelow"].includes(key) ? "risk"
     : "risk";
   await answerCallbackQuery(msg.callbackQueryId, `Updated ${key}`);

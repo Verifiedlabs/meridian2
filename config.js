@@ -244,10 +244,14 @@ export const config = {
   },
 
   // ─── Twitter/X Sentiment ──────────────
-  // GetXAPI.com — $0.001/call (~20 tweets), no rate limit.
-  // Set GETXAPI_KEY env var or twitterApiKey in user-config.json.
+  // mode: "local" (Playwright + your Twitter cookies, FREE) or "api" (GetXAPI, $0.001/call)
+  // Local mode needs authToken + ct0 from your browser cookies.
+  // API mode needs GETXAPI_KEY. Auto-fallback if primary fails.
   twitter: {
     enabled:           u.twitterEnabled !== false && process.env.TWITTER_ENABLED !== "false",
+    mode:              nonEmptyString(u.twitterMode, process.env.TWITTER_MODE) || "local",
+    authToken:         nonEmptyString(u.twitterAuthToken, process.env.TWITTER_AUTH_TOKEN),
+    ct0:               nonEmptyString(u.twitterCt0, process.env.TWITTER_CT0),
     apiKey:            nonEmptyString(u.twitterApiKey, process.env.GETXAPI_KEY),
     timeoutMs:         u.twitterTimeoutMs ?? 15_000,
   },
