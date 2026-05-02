@@ -104,6 +104,25 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   // into the prompt to keep token cost low. The agent can still call
   // get_postmortem_suggestions for the full list if it wants more detail.
   const postmortem = getPostMortemSuggestions({ mgmtConfig: config.management });
+  // Debug log so operators can confirm postmortem is being injected into the
+  // LLM prompt without having to dump full prompt content. Only logs when
+  // there are actually flagged (high/medium) items, mirroring the prompt
+  // renderer's filter — keeps log output meaningful.
+  if (postmortem?.suggestions?.length) {
+    const flagged = postmortem.suggestions.filter(
+      (s) => s.severity === "high" || s.severity === "medium"
+    );
+    if (flagged.length > 0) {
+      const headlines = flagged
+        .slice(0, 3)
+        .map((s) => `[${(s.severity || "?").toUpperCase()}] ${s.summary}`)
+        .join(" | ");
+      log(
+        "postmortem",
+        `${flagged.length} flag(s) injected into ${agentType} prompt (sample=${postmortem.sample_size}): ${headlines}`
+      );
+    }
+  }
   const decisionSummary = getDecisionSummary();
   let weightsSummary = null;
   if (agentType === "SCREENER") {
