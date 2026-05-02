@@ -148,6 +148,8 @@ export function formatHelpText() {
     "/dashboard — alias for /panel",
     "/history — last 7d of closed positions with PnL",
     "/lessons — auto-derived lessons + close-reason breakdown",
+    "/perf — performance summary (close-reason histogram, win rate, PnL)",
+    "/postmortem — diagnostic suggestions (high/medium severity flags)",
     "/status — wallet + positions snapshot",
     "/wallet — wallet, deploy amount, HiveMind status",
     "/positions — list open positions",
