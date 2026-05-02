@@ -35,7 +35,7 @@ import { getTwitterSentiment } from "./tools/twitter.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
-import { appendDecision } from "./decision-log.js";
+import { appendDecision, getDecisionsByPosition } from "./decision-log.js";
 import {
   stripThink,
   sanitizeUntrustedPromptText,
@@ -224,7 +224,10 @@ export async function runManagementCycle({ silent = false } = {}) {
       const exit = updatePnlAndCheckExits(p.position, p, config.management);
       if (exit) {
         if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
-          if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
+          // Use the position-specific (potentially adaptive) drop threshold
+          // surfaced by updatePnlAndCheckExits; falls back to base config.
+          const dropPctForQueue = exit.effective_drop_pct ?? config.management.trailingDropPct;
+          if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, dropPctForQueue)) {
             scheduleTrailingDropConfirmation(p.position);
           }
           continue;
@@ -760,7 +763,8 @@ Summarize the current portfolio health, total fees earned, and performance of al
         const exit = updatePnlAndCheckExits(p.position, p, config.management);
         if (exit) {
           if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
-            if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
+            const dropPctForQueue = exit.effective_drop_pct ?? config.management.trailingDropPct;
+            if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, dropPctForQueue)) {
               scheduleTrailingDropConfirmation(p.position);
             }
             continue;
@@ -1326,6 +1330,9 @@ async function renderControlPanel() {
       { text: "🩺 Postmortem",  callback_data: "panel:postmortem" },
     ],
     [
+      { text: "⚠️ Risk",        callback_data: "panel:risk" },
+    ],
+    [
       { text: "💼 Wallet",     callback_data: "panel:wallet" },
       { text: "☀️ Briefing",   callback_data: "panel:briefing" },
     ],
@@ -1679,6 +1686,170 @@ function buildPostmortemMessage() {
   }
 }
 
+// ─── Risk snapshot ──────────────────────────────────────────────
+// Aggregates current open positions into a worst-case risk view: total
+// deployed, exposure per token, and what would happen if every position
+// hit its stop-loss simultaneously. Helps the operator understand
+// downside before adding more deploys.
+function buildRiskMessage(walletInfo, posResult) {
+  try {
+    const cur = config.management.solMode ? "◎" : "$";
+    const positions = posResult?.positions || [];
+    const sections = [];
+    sections.push("⚠️ <b>Risk Snapshot</b>");
+    sections.push("━━━━━━━━━━━━━━━━━━━━━━━");
+    if (positions.length === 0) {
+      sections.push("<i>No open positions — zero portfolio risk.</i>");
+      if (walletInfo?.sol != null) {
+        sections.push(`Wallet: <b>${walletInfo.sol.toFixed(3)}</b> SOL idle.`);
+      }
+      return sections.join("\n");
+    }
+
+    // Aggregate values from live positions + fall back to tracked deploy
+    // amount when current value is unavailable (avoids zeroed totals on
+    // freshly deployed positions before first PnL update).
+    let totalValueUsd = 0;
+    let totalDeployedSol = 0;
+    let totalUnclaimedFees = 0;
+    const tokenExposure = new Map(); // base_mint → { value, count, names: [] }
+    for (const p of positions) {
+      const value = Number(p.total_value_usd) || 0;
+      totalValueUsd += value;
+      const tracked = getTrackedPosition(p.position);
+      const deployedSol = Number(tracked?.amount_sol) || 0;
+      totalDeployedSol += deployedSol;
+      totalUnclaimedFees += Number(p.unclaimed_fees_usd) || 0;
+      const key = p.base_mint || p.pair || "unknown";
+      const slot = tokenExposure.get(key) || { value: 0, count: 0, name: p.pair || "?", deployed_sol: 0 };
+      slot.value += value;
+      slot.count += 1;
+      slot.deployed_sol += deployedSol;
+      tokenExposure.set(key, slot);
+    }
+
+    const stopLossPct = Math.abs(Number(config.management.stopLossPct) || 0);
+    // Worst-case loss: every position hits stop-loss at the configured %.
+    // Computed against current value (not deployed cost) since SL is
+    // pnl_pct based on initial deploy value — close enough for the
+    // operator-facing summary.
+    const worstCaseLossUsd = (totalValueUsd * stopLossPct) / 100;
+    const walletSol = walletInfo?.sol;
+
+    sections.push(`Open positions: <b>${positions.length}</b> / max ${config.risk?.maxPositions ?? "?"}`);
+    if (totalDeployedSol > 0) {
+      sections.push(`Deployed:        <b>◎${totalDeployedSol.toFixed(3)}</b> SOL across positions`);
+    }
+    sections.push(`Current value:   <b>${cur}${totalValueUsd.toFixed(2)}</b>`);
+    sections.push(`Unclaimed fees:  <b>${cur}${totalUnclaimedFees.toFixed(2)}</b>`);
+    if (walletSol != null) {
+      const walletUsd = walletSol; // SOL units when solMode; we report SOL anyway
+      sections.push(`Wallet idle:     <b>◎${walletSol.toFixed(3)}</b>`);
+    }
+    sections.push("");
+    sections.push(`Stop loss: <b>-${stopLossPct.toFixed(1)}%</b>  ·  if ALL positions hit SL:`);
+    sections.push(`  💀 Worst-case loss: <b>-${cur}${worstCaseLossUsd.toFixed(2)}</b>`);
+
+    if (tokenExposure.size > 0) {
+      sections.push("");
+      sections.push("<b>Per-token exposure</b>");
+      const sorted = [...tokenExposure.entries()].sort((a, b) => b[1].value - a[1].value);
+      for (const [, slot] of sorted) {
+        const pctOfPort = totalValueUsd > 0 ? Math.round((slot.value / totalValueUsd) * 100) : 0;
+        const concern = pctOfPort >= 70 ? "  ⚠️ heavy concentration" : "";
+        sections.push(
+          `  • <b>${escapeHtml(slot.name)}</b>  ·  ` +
+          `${cur}${slot.value.toFixed(2)} <i>(${pctOfPort}%)</i>  ·  ` +
+          `${slot.count} pos${concern}`
+        );
+      }
+    }
+
+    sections.push("");
+    sections.push("<i>Worst-case assumes simultaneous SL hit at exact SL%; actual losses can vary with slippage and gas.</i>");
+    return sections.join("\n");
+  } catch (e) {
+    return `⚠️ Risk error: ${e.message}`;
+  }
+}
+
+// ─── Why <n> — explain a deploy decision ────────────────────────
+// Surfaces the structured deploy decision recorded by appendDecision()
+// at deploy time, plus any subsequent decisions on the same position.
+// Goal: let the operator audit "why did the bot pick this pool?".
+async function buildWhyMessage(idx) {
+  try {
+    const cur = config.management.solMode ? "◎" : "$";
+    const { positions, total_positions } = await getMyPositions({ force: true });
+    if (!total_positions) return "No open positions.";
+    if (idx < 0 || idx >= positions.length) return `Invalid number. Use /positions first (1..${total_positions}).`;
+
+    const p = positions[idx];
+    const tracked = getTrackedPosition(p.position);
+    const decisions = getDecisionsByPosition(p.position);
+    const deploy = decisions.find((d) => d.type === "deploy") || null;
+
+    const sections = [];
+    sections.push(`🤔 <b>Why ${escapeHtml(p.pair)}?</b>`);
+    sections.push("━━━━━━━━━━━━━━━━━━━━━━━");
+    const ageMin = p.age_minutes != null ? `${p.age_minutes}m` : "?";
+    const pnl = (p.pnl_usd ?? 0) >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
+    const oor = !p.in_range ? " ⚠️OOR" : "";
+    sections.push(`Position #${idx + 1}  ·  age ${ageMin}  ·  PnL ${pnl}${oor}`);
+
+    if (tracked) {
+      const bits = [];
+      if (tracked.strategy)        bits.push(`strategy <b>${escapeHtml(tracked.strategy)}</b>`);
+      if (tracked.amount_sol != null) bits.push(`deploy <b>◎${Number(tracked.amount_sol).toFixed(3)}</b>`);
+      if (tracked.bin_step)        bits.push(`binstep <b>${tracked.bin_step}</b>`);
+      if (tracked.volatility != null) bits.push(`vol <b>${tracked.volatility}</b>`);
+      if (tracked.fee_tvl_ratio != null) bits.push(`fee/TVL <b>${tracked.fee_tvl_ratio}%</b>`);
+      if (tracked.organic_score != null) bits.push(`organic <b>${tracked.organic_score}</b>`);
+      if (bits.length) sections.push(bits.join(" · "));
+    }
+    sections.push("");
+
+    if (!deploy) {
+      sections.push("<i>No structured deploy decision recorded. This usually means the position was deployed before the decision-log was wired up, or via a manual deploy outside the SCREENER agent.</i>");
+      if (decisions.length === 0) return sections.join("\n");
+    }
+
+    if (deploy) {
+      sections.push("<b>📥 Deploy decision</b>");
+      if (deploy.summary) sections.push(`  • <i>summary:</i> ${escapeHtml(deploy.summary)}`);
+      if (deploy.reason)  sections.push(`  • <i>reason:</i> ${escapeHtml(deploy.reason)}`);
+      if (Array.isArray(deploy.risks) && deploy.risks.length) {
+        sections.push(`  • <i>risks flagged:</i> ${deploy.risks.map(escapeHtml).join(", ")}`);
+      }
+      if (Array.isArray(deploy.rejected) && deploy.rejected.length) {
+        sections.push(`  • <i>rejected alternatives:</i>`);
+        for (const r of deploy.rejected.slice(0, 5)) {
+          sections.push(`     – ${escapeHtml(r)}`);
+        }
+      }
+      if (deploy.metrics && Object.keys(deploy.metrics).length) {
+        const metricBits = Object.entries(deploy.metrics)
+          .map(([k, v]) => `${escapeHtml(k)}=${escapeHtml(String(v))}`)
+          .join(", ");
+        sections.push(`  • <i>metrics:</i> <code>${metricBits}</code>`);
+      }
+    }
+
+    const subsequent = decisions.filter((d) => d.type !== "deploy");
+    if (subsequent.length > 0) {
+      sections.push("");
+      sections.push(`<b>📜 Subsequent decisions</b> <i>(${subsequent.length})</i>`);
+      for (const d of subsequent.slice(0, 5)) {
+        const when = (d.ts || "").slice(0, 16).replace("T", " ");
+        sections.push(`  • <i>[${escapeHtml(when)}] ${escapeHtml(d.type || "?")}</i>: ${escapeHtml(d.summary || d.reason || "(no detail)")}`);
+      }
+    }
+    return sections.join("\n");
+  } catch (e) {
+    return `🤔 Why error: ${e.message}`;
+  }
+}
+
 // Plain-text fallback for /history when HTML parse fails (e.g. weird chars
 // in pool names that escapeHtml didn't anticipate).
 function buildHistoryMessagePlain(limit = 10) {
@@ -1846,6 +2017,29 @@ async function applyControlPanelCallback(msg) {
   if (action === "postmortem") {
     await ack();
     const body = buildPostmortemMessage();
+    await editMessageWithButtons(body, messageId,
+      [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      { parseMode: "HTML" },
+    ).catch(async () => {
+      const plain = body.replace(/<[^>]+>/g, "");
+      await editMessageWithButtons(plain, messageId,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ).catch(() => sendMessageWithButtons(plain,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ));
+    });
+    return;
+  }
+  if (action === "risk") {
+    await ack();
+    let body;
+    try {
+      const [wallet, posResult] = await Promise.all([
+        getWalletBalances().catch(() => null),
+        getMyPositions({ force: true }).catch(() => null),
+      ]);
+      body = buildRiskMessage(wallet, posResult);
+    } catch (e) { body = `Error: ${escapeHtml(e.message)}`; }
     await editMessageWithButtons(body, messageId,
       [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
       { parseMode: "HTML" },
@@ -2288,6 +2482,34 @@ async function telegramHandler(msg) {
     const body = buildPostmortemMessage();
     const ok = await sendHTML(body).catch(() => null);
     if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch(() => {});
+    return;
+  }
+
+  if (text === "/risk") {
+    try {
+      const [wallet, posResult] = await Promise.all([
+        getWalletBalances().catch(() => null),
+        getMyPositions({ force: true }).catch(() => null),
+      ]);
+      const body = buildRiskMessage(wallet, posResult);
+      const ok = await sendHTML(body).catch(() => null);
+      if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  const whyMatch = text.match(/^\/why\s+(\d+)$/i);
+  if (whyMatch) {
+    try {
+      const idx = parseInt(whyMatch[1]) - 1;
+      const body = await buildWhyMessage(idx);
+      const ok = await sendHTML(body).catch(() => null);
+      if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
     return;
   }
 

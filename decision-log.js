@@ -50,6 +50,26 @@ export function getRecentDecisions(limit = 10) {
   return (data.decisions || []).slice(0, limit);
 }
 
+/**
+ * Return decisions tied to a specific position address. Most useful for
+ * audit / explainability: given a position, what did the bot decide and
+ * why? Caller usually wants the deploy decision (oldest first).
+ *
+ * @param {string} position_address
+ * @param {Object} [opts]
+ * @param {string} [opts.type] — filter by decision type (e.g. "deploy", "close")
+ * @returns {Array} decisions in chronological order (oldest → newest)
+ */
+export function getDecisionsByPosition(position_address, opts = {}) {
+  if (!position_address) return [];
+  const { type = null } = opts;
+  const data = load();
+  return (data.decisions || [])
+    .filter((d) => d.position === position_address)
+    .filter((d) => (type ? d.type === type : true))
+    .sort((a, b) => (a.ts || "").localeCompare(b.ts || ""));
+}
+
 export function getDecisionSummary(limit = 6) {
   const decisions = getRecentDecisions(limit);
   if (!decisions.length) return "No recent structured decisions yet.";

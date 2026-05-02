@@ -150,6 +150,8 @@ export function formatHelpText() {
     "/lessons — auto-derived lessons + close-reason breakdown",
     "/perf — performance summary (close-reason histogram, win rate, PnL)",
     "/postmortem — diagnostic suggestions (high/medium severity flags)",
+    "/risk — exposure snapshot + worst-case loss if all SLs fire",
+    "/why <n> — explain why a specific position was deployed",
     "/status — wallet + positions snapshot",
     "/wallet — wallet, deploy amount, HiveMind status",
     "/positions — list open positions",

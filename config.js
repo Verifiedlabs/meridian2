@@ -192,6 +192,20 @@ export const config = {
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
+    // ── Adaptive trailing (volatility-scaled) ─────────────────────
+    // Scale trailingTriggerPct / trailingDropPct with each pool's
+    // volatility so high-vol pools get a wider trailing band (less likely
+    // to false-exit on noise) and low-vol pools get a tighter one (locks
+    // gains faster). The base values above are the centre point at
+    // volatility = trailingVolPivot (default 2.5). Multiplier 0 disables
+    // scaling and restores legacy fixed-band behaviour.
+    trailingVolMultiplier: u.trailingVolMultiplier ?? 0.5, // 0 = off (legacy); 0.5 = mild, 1.0 = aggressive
+    trailingVolPivot:      u.trailingVolPivot      ?? 2.5, // volatility centre point (no scaling here)
+    trailingVolMaxScale:   u.trailingVolMaxScale   ?? 5.0, // volatility upper anchor (full +scale at this point)
+    trailingMinTriggerPct: u.trailingMinTriggerPct ?? 1.5, // floor for scaled trigger
+    trailingMaxTriggerPct: u.trailingMaxTriggerPct ?? 6.0, // ceiling for scaled trigger
+    trailingMinDropPct:    u.trailingMinDropPct    ?? 0.75,// floor for scaled drop
+    trailingMaxDropPct:    u.trailingMaxDropPct    ?? 3.0, // ceiling for scaled drop
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,

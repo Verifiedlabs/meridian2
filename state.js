@@ -10,6 +10,7 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { getEffectiveTrailingParams } from "./src/adaptive-trailing.js";
 
 const STATE_FILE = "./state.json";
 
@@ -293,6 +294,10 @@ export function queueTrailingDropConfirmation(position_address, peakPnlPct, curr
   pos.pending_trailing_peak_pnl_pct = peakPnlPct;
   pos.pending_trailing_current_pnl_pct = currentPnlPct;
   pos.pending_trailing_drop_pct = dropFromPeak;
+  // Snapshot the effective drop threshold used at queue-time so the
+  // recheck (resolvePendingTrailingDrop) compares against the same scaled
+  // value, even if config or volatility changes between checks.
+  pos.pending_trailing_drop_threshold = trailingDropPct;
   pos.pending_trailing_started_at = new Date().toISOString();
   save(state);
   log("state", `Position ${position_address} trailing drop candidate queued: peak ${peakPnlPct.toFixed(2)}% -> current ${currentPnlPct.toFixed(2)}%`);
@@ -309,17 +314,21 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   const pendingCurrent = pos.pending_trailing_current_pnl_pct;
   const pendingPeak = pos.pending_trailing_peak_pnl_pct;
   const pendingDrop = pos.pending_trailing_drop_pct ?? (pendingPeak - pendingCurrent);
+  // Prefer the threshold snapshot taken at queue-time (so adaptive scaling
+  // stays consistent across the recheck) and fall back to the passed value.
+  const effectiveDropPct = pos.pending_trailing_drop_threshold ?? trailingDropPct;
 
   pos.pending_trailing_current_pnl_pct = null;
   pos.pending_trailing_peak_pnl_pct = null;
   pos.pending_trailing_drop_pct = null;
+  pos.pending_trailing_drop_threshold = null;
   pos.pending_trailing_started_at = null;
 
   const stillNearCrash = currentPnlPct != null && currentPnlPct <= pendingCurrent + tolerancePct;
-  const stillDroppedEnough = currentPnlPct != null && (pendingPeak - currentPnlPct) >= trailingDropPct;
+  const stillDroppedEnough = currentPnlPct != null && (pendingPeak - currentPnlPct) >= effectiveDropPct;
 
   if (stillNearCrash && stillDroppedEnough) {
-    const reason = `Trailing TP: peak ${pendingPeak.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${(pendingPeak - currentPnlPct).toFixed(2)}% >= ${trailingDropPct}%)`;
+    const reason = `Trailing TP: peak ${pendingPeak.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${(pendingPeak - currentPnlPct).toFixed(2)}% >= ${effectiveDropPct.toFixed(2)}%)`;
     pos.confirmed_trailing_exit_reason = reason;
     pos.confirmed_trailing_exit_until = new Date(Date.now() + 30_000).toISOString();
     save(state);
@@ -408,11 +417,19 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   let changed = false;
 
-  // Activate trailing TP once trigger threshold is reached
-  if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && (pos.peak_pnl_pct ?? 0) >= mgmtConfig.trailingTriggerPct) {
+  // Resolve adaptive trailing band for this position. Falls back to the
+  // configured base values when scaling is disabled or volatility is
+  // unknown — see src/adaptive-trailing.js for the math.
+  const trailing = getEffectiveTrailingParams(pos, mgmtConfig);
+
+  // Activate trailing TP once the (scaled) trigger threshold is reached
+  if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && (pos.peak_pnl_pct ?? 0) >= trailing.triggerPct) {
     pos.trailing_active = true;
     changed = true;
-    log("state", `Position ${position_address} trailing TP activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
+    const scaleNote = trailing.scaled
+      ? ` [adaptive: vol=${trailing.volatility}, trigger=${trailing.triggerPct.toFixed(2)}%, drop=${trailing.dropPct.toFixed(2)}%]`
+      : "";
+    log("state", `Position ${position_address} trailing TP activated (confirmed peak: ${pos.peak_pnl_pct}%)${scaleNote}`);
   }
 
   // Update OOR state
@@ -439,14 +456,19 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Trailing TP ────────────────────────────────────────────────
   if (!pnl_pct_suspicious && pos.trailing_active) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
-    if (dropFromPeak >= mgmtConfig.trailingDropPct) {
+    if (dropFromPeak >= trailing.dropPct) {
       return {
         action: "TRAILING_TP",
-        reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${mgmtConfig.trailingDropPct}%)`,
+        reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${trailing.dropPct.toFixed(2)}%)`,
         needs_confirmation: true,
         peak_pnl_pct: pos.peak_pnl_pct,
         current_pnl_pct: currentPnlPct,
         drop_from_peak_pct: dropFromPeak,
+        // Effective drop threshold actually used for the decision — caller
+        // can pass this to queueTrailingDropConfirmation so the recheck
+        // uses the same scaled value (instead of the raw config value).
+        effective_drop_pct: trailing.dropPct,
+        adaptive_scaled: trailing.scaled,
       };
     }
   }
