@@ -8,7 +8,7 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { formatGmgnCandidateForPrompt } from "./tools/gmgn.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
-import { evolveThresholds, getPerformanceSummary, getPerformanceHistory, listLessons } from "./lessons.js";
+import { evolveThresholds, getPerformanceSummary, getPerformanceHistory, listLessons, getPostMortemSuggestions } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
   startPolling,
@@ -1322,6 +1322,10 @@ async function renderControlPanel() {
       { text: "🔍 Screen Now", callback_data: "panel:screen" },
     ],
     [
+      { text: "📈 Performance", callback_data: "panel:perf" },
+      { text: "🩺 Postmortem",  callback_data: "panel:postmortem" },
+    ],
+    [
       { text: "💼 Wallet",     callback_data: "panel:wallet" },
       { text: "☀️ Briefing",   callback_data: "panel:briefing" },
     ],
@@ -1595,6 +1599,86 @@ function buildLessonsMessage(limit = 8) {
   }
 }
 
+// ─── Performance + Postmortem (Telegram-friendly formatters) ────
+function buildPerformanceMessage({ windowDays = null } = {}) {
+  try {
+    const cur = config.management.solMode ? "◎" : "$";
+    const summary = getPerformanceSummary({ windowDays });
+    const sections = [];
+    sections.push(`📈 <b>Performance</b>${windowDays ? ` · last ${windowDays}d` : ""}`);
+    sections.push("━━━━━━━━━━━━━━━━━━━━━━━");
+    if (!summary) {
+      sections.push("<i>No closed positions yet.</i>");
+      sections.push("<i>Bot will accumulate stats after first /close.</i>");
+      return sections.join("\n");
+    }
+    const tp = summary.total_pnl_usd ?? 0;
+    const totalPnl = `${tp >= 0 ? "+" : "-"}${cur}${Math.abs(tp).toFixed(2)}`;
+    sections.push(`Closed: <b>${summary.total_positions_closed}</b>  ·  WR: <b>${summary.win_rate_pct}%</b>  ·  Total PnL: <b>${totalPnl}</b>`);
+    sections.push(`Avg PnL: <b>${(summary.avg_pnl_pct ?? 0).toFixed(2)}%</b>  ·  Avg winner: <b>${(summary.avg_winner_pnl_pct ?? 0).toFixed(2)}%</b>  ·  Avg loser: <b>${(summary.avg_loser_pnl_pct ?? 0).toFixed(2)}%</b>`);
+    sections.push(`Range eff: <b>${summary.avg_range_efficiency_pct ?? 0}%</b>  ·  W/L/Flat: <b>${summary.winners}/${summary.losers}/${summary.flat}</b>`);
+    sections.push("");
+
+    const byReason = summary.by_close_reason || {};
+    const reasonEntries = Object.entries(byReason)
+      .sort((a, b) => Math.abs(b[1].sum_pnl_pct) - Math.abs(a[1].sum_pnl_pct));
+    if (reasonEntries.length) {
+      sections.push("<b>By close reason</b>");
+      for (const [reason, e] of reasonEntries) {
+        const pnlSign = e.sum_pnl_pct >= 0 ? "+" : "-";
+        const feeSign = e.sum_fees_usd >= 0 ? "+" : "-";
+        sections.push(
+          `  • <b>${escapeHtml(reason)}</b> ×${e.count}  ·  ` +
+          `sum <b>${pnlSign}${Math.abs(e.sum_pnl_pct).toFixed(2)}%</b>  ·  ` +
+          `avg ${e.avg_pnl_pct >= 0 ? "+" : "-"}${Math.abs(e.avg_pnl_pct).toFixed(2)}%  ·  ` +
+          `fees ${feeSign}${cur}${Math.abs(e.sum_fees_usd).toFixed(2)}`
+        );
+      }
+    }
+    return sections.join("\n");
+  } catch (e) {
+    return `📈 Performance error: ${e.message}`;
+  }
+}
+
+function buildPostmortemMessage() {
+  try {
+    const pm = getPostMortemSuggestions({ mgmtConfig: config.management });
+    const sections = [];
+    sections.push("🩺 <b>Postmortem</b> · diagnostic suggestions");
+    sections.push("━━━━━━━━━━━━━━━━━━━━━━━");
+    if (!pm) {
+      sections.push("<i>Need at least 5 closed positions to generate suggestions.</i>");
+      const summary = getPerformanceSummary();
+      if (summary) {
+        sections.push(`<i>Currently: ${summary.total_positions_closed} closed.</i>`);
+      }
+      return sections.join("\n");
+    }
+    sections.push(`Sample: <b>${pm.sample_size}</b>${pm.window_days ? ` · last ${pm.window_days}d` : ""}`);
+    if (pm.summary) {
+      const tp = pm.summary.total_pnl_pct ?? 0;
+      sections.push(`Total: <b>${tp >= 0 ? "+" : "-"}${Math.abs(tp).toFixed(2)}%</b>  ·  WR: <b>${pm.summary.win_rate_pct}%</b>`);
+    }
+    sections.push("");
+    if (!pm.suggestions || pm.suggestions.length === 0) {
+      sections.push("✅ <i>No issues flagged. Strategy looks balanced for this sample.</i>");
+      return sections.join("\n");
+    }
+    const sevIcon = (s) => s === "high" ? "🔴" : s === "medium" ? "🟡" : "🟢";
+    for (const s of pm.suggestions) {
+      sections.push(`${sevIcon(s.severity)} <b>[${(s.severity || "low").toUpperCase()}]</b> ${escapeHtml(s.summary || "")}`);
+      if (s.detail)      sections.push(`   <i>${escapeHtml(s.detail)}</i>`);
+      if (s.action_hint) sections.push(`   💡 ${escapeHtml(s.action_hint)}`);
+      sections.push("");
+    }
+    sections.push("<i>Diagnostic only — bot does NOT auto-apply these.</i>");
+    return sections.join("\n");
+  } catch (e) {
+    return `🩺 Postmortem error: ${e.message}`;
+  }
+}
+
 // Plain-text fallback for /history when HTML parse fails (e.g. weird chars
 // in pool names that escapeHtml didn't anticipate).
 function buildHistoryMessagePlain(limit = 10) {
@@ -1740,6 +1824,38 @@ async function applyControlPanelCallback(msg) {
       title: "📋 <b>Latest Candidates</b>",
       body: escapeHtml(body),
       parseMode: "HTML",
+    });
+    return;
+  }
+  if (action === "perf") {
+    await ack();
+    const body = buildPerformanceMessage();
+    await editMessageWithButtons(body, messageId,
+      [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      { parseMode: "HTML" },
+    ).catch(async () => {
+      const plain = body.replace(/<[^>]+>/g, "");
+      await editMessageWithButtons(plain, messageId,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ).catch(() => sendMessageWithButtons(plain,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ));
+    });
+    return;
+  }
+  if (action === "postmortem") {
+    await ack();
+    const body = buildPostmortemMessage();
+    await editMessageWithButtons(body, messageId,
+      [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      { parseMode: "HTML" },
+    ).catch(async () => {
+      const plain = body.replace(/<[^>]+>/g, "");
+      await editMessageWithButtons(plain, messageId,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ).catch(() => sendMessageWithButtons(plain,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ));
     });
     return;
   }
@@ -2158,6 +2274,20 @@ async function telegramHandler(msg) {
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
     }
+    return;
+  }
+
+  if (text === "/perf" || text === "/performance") {
+    const body = buildPerformanceMessage();
+    const ok = await sendHTML(body).catch(() => null);
+    if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch(() => {});
+    return;
+  }
+
+  if (text === "/postmortem" || text === "/pm") {
+    const body = buildPostmortemMessage();
+    const ok = await sendHTML(body).catch(() => null);
+    if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch(() => {});
     return;
   }
 

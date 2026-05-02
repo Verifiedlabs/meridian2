@@ -119,8 +119,16 @@ export async function recordPerformance(perf) {
 
   data.performance.push(entry);
 
-  // Derive and store a lesson
-  const lesson = derivLesson(entry);
+  // Derive and store a lesson — pass live management config so the
+  // outcome categorizer respects the user's actual TP/SL thresholds
+  // instead of the legacy hardcoded ±5%.
+  let mgmtConfig = null;
+  try {
+    const { config } = await import("./config.js");
+    mgmtConfig = config?.management || null;
+  } catch { /* ignore — derivLesson falls back to hardcoded thresholds */ }
+
+  const lesson = derivLesson(entry, mgmtConfig);
   if (lesson) {
     data.lessons.push(lesson);
     log("lessons", `New lesson: ${lesson.rule}`);
@@ -183,18 +191,39 @@ export async function recordPerformance(perf) {
 /**
  * Derive a lesson from a closed position's performance.
  * Only generates a lesson if the outcome was clearly good or bad.
+ *
+ * @param {Object} perf — performance record
+ * @param {Object} [mgmtConfig] — optional live management config. When provided,
+ *   the outcome categorizer aligns with the user's actual takeProfitPct /
+ *   stopLossPct so a +4% TP exit is correctly tagged "good" even when the
+ *   legacy hardcoded threshold (5%) wouldn't catch it.
  */
-function derivLesson(perf) {
+function derivLesson(perf, mgmtConfig = null) {
   const tags = [];
   const feeYieldPct = perf.initial_value_usd > 0
     ? ((perf.fees_earned_usd || 0) / perf.initial_value_usd) * 100
     : 0;
 
-  // Categorize outcome
-  const outcome = perf.pnl_pct >= 5 ? "good"
+  // Threshold-aware outcome categorization. We treat anything that
+  // reaches at least 80% of the user's TP target as a clear win, and
+  // anything past the user's stop loss as a clear loss. Fee-positive
+  // small wins (>= 2% of capital earned in fees) still count as "good".
+  const tpPct = Number.isFinite(mgmtConfig?.takeProfitPct) && mgmtConfig.takeProfitPct > 0
+    ? mgmtConfig.takeProfitPct
+    : 5;
+  const slPct = Number.isFinite(mgmtConfig?.stopLossPct) && mgmtConfig.stopLossPct < 0
+    ? mgmtConfig.stopLossPct
+    : -5;
+  const goodCutoff = Math.min(5, tpPct * 0.8);
+  // "bad" cutoff: at-or-below stop loss, with a small grace so positions
+  // that exit exactly at SL still register as bad. Cap at -5% so we
+  // never accidentally raise the bar above the legacy default.
+  const badCutoff = Math.min(-5, slPct + 1);
+
+  const outcome = perf.pnl_pct >= goodCutoff ? "good"
     : (perf.pnl_pct >= 0 && feeYieldPct >= 2) ? "good"
     : perf.pnl_pct >= 0 ? "neutral"
-    : perf.pnl_pct >= -5 ? "poor"
+    : perf.pnl_pct > badCutoff ? "poor"
     : "bad";
 
   if (outcome === "neutral") return null; // nothing interesting to learn
@@ -286,8 +315,18 @@ function derivLesson(perf) {
 export function evolveThresholds(perfData, config) {
   if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
 
+  // Loser cutoff: respect the user's actual stop-loss threshold so we
+  // count true SL events (and worse) as losers. Falls back to -5% for
+  // legacy configs without management.stopLossPct. We add a small +1
+  // grace so positions exiting just inside the SL band are still
+  // counted (e.g. SL=-6, cutoff=-5 captures pnl_pct in (-6, -5]).
+  const slPct = Number.isFinite(config?.management?.stopLossPct) && config.management.stopLossPct < 0
+    ? config.management.stopLossPct
+    : -5;
+  const loserCutoff = Math.min(-5, slPct + 1);
+
   const winners = perfData.filter((p) => p.pnl_pct > 0);
-  const losers  = perfData.filter((p) => p.pnl_pct < -5);
+  const losers  = perfData.filter((p) => p.pnl_pct < loserCutoff);
 
   // Need at least some signal in both directions before adjusting
   const hasSignal = winners.length >= 2 || losers.length >= 2;
@@ -727,25 +766,237 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
 }
 
 /**
- * Get performance stats summary.
+ * Categorize a close_reason string into a short category label so summaries
+ * can attribute PnL to the actual exit driver. Centralised so callers
+ * (briefing, MANAGER prompt, performance tools) all use identical buckets.
  */
-export function getPerformanceSummary() {
+export function categorizeCloseReason(closeReason) {
+  const r = String(closeReason || "").toLowerCase();
+  if (!r) return "unknown";
+  if (r.includes("stop loss")) return "stop_loss";
+  if (r.includes("trailing") && r.includes("low yield")) return "trailing_lowyield";
+  if (r.includes("trailing")) return "trailing_drop";
+  if (r.includes("take profit")) return "take_profit";
+  if (r.includes("oor") || r.includes("pumped") || r.includes("out of range") || r.includes("range")) return "oor";
+  if (r.includes("low yield")) return "low_yield";
+  if (r.includes("realtime")) return "oor";
+  if (r.includes("emergency")) return "stop_loss";
+  return "other";
+}
+
+/** Numeric value with NaN/null guard. */
+function num(x, fallback = 0) {
+  return Number.isFinite(x) ? x : fallback;
+}
+
+/**
+ * Get performance stats summary.
+ *
+ * @param {Object} [opts]
+ * @param {number} [opts.windowDays] — only include records from the last N days. Omit for all-time.
+ * @param {number} [opts.maxRecords] — only include the most recent N records. Omit for all.
+ */
+export function getPerformanceSummary(opts = {}) {
+  const { windowDays = null, maxRecords = null } = opts;
   const data = load();
-  const p = data.performance;
+  let p = data.performance;
+
+  if (windowDays != null && Number.isFinite(windowDays) && windowDays > 0) {
+    const cutoff = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
+    p = p.filter((r) => (r.recorded_at || "") >= cutoff);
+  }
+  if (maxRecords != null && Number.isFinite(maxRecords) && maxRecords > 0) {
+    p = p.slice(-maxRecords);
+  }
 
   if (p.length === 0) return null;
 
-  const totalPnl = p.reduce((s, x) => s + x.pnl_usd, 0);
-  const avgPnlPct = p.reduce((s, x) => s + x.pnl_pct, 0) / p.length;
-  const avgRangeEfficiency = p.reduce((s, x) => s + x.range_efficiency, 0) / p.length;
-  const wins = p.filter((x) => x.pnl_usd > 0).length;
+  // NaN-safe aggregates — guard each numeric field so a single null
+  // performance record can't pollute the whole summary.
+  const totalPnlUsd = p.reduce((s, x) => s + num(x.pnl_usd), 0);
+  const totalPnlPct = p.reduce((s, x) => s + num(x.pnl_pct), 0);
+  const avgPnlPct   = totalPnlPct / p.length;
+  const avgRangeEff = p.reduce((s, x) => s + num(x.range_efficiency), 0) / p.length;
+
+  const winners = p.filter((x) => num(x.pnl_pct) > 0);
+  const losers  = p.filter((x) => num(x.pnl_pct) < 0);
+  const flat    = p.filter((x) => num(x.pnl_pct) === 0);
+
+  const avgWinnerPnl = winners.length > 0
+    ? winners.reduce((s, x) => s + num(x.pnl_pct), 0) / winners.length
+    : 0;
+  const avgLoserPnl = losers.length > 0
+    ? losers.reduce((s, x) => s + num(x.pnl_pct), 0) / losers.length
+    : 0;
+
+  // Per close-reason breakdown — shows which exit drivers contribute the
+  // most aggregate PnL (positive or negative). High-leverage signal for
+  // the agent: it can see e.g. "stop_loss is bleeding -16% across 4 pos"
+  // and weight subsequent decisions accordingly.
+  const byReason = new Map();
+  for (const x of p) {
+    const cat = categorizeCloseReason(x.close_reason);
+    const e = byReason.get(cat) || { count: 0, sum_pnl_pct: 0, sum_fees_usd: 0 };
+    e.count += 1;
+    e.sum_pnl_pct += num(x.pnl_pct);
+    e.sum_fees_usd += num(x.fees_earned_usd);
+    byReason.set(cat, e);
+  }
+  const by_close_reason = {};
+  for (const [cat, e] of byReason) {
+    by_close_reason[cat] = {
+      count: e.count,
+      sum_pnl_pct: Math.round(e.sum_pnl_pct * 100) / 100,
+      avg_pnl_pct: Math.round((e.sum_pnl_pct / e.count) * 100) / 100,
+      sum_fees_usd: Math.round(e.sum_fees_usd * 100) / 100,
+    };
+  }
 
   return {
     total_positions_closed: p.length,
-    total_pnl_usd: Math.round(totalPnl * 100) / 100,
+    total_pnl_usd: Math.round(totalPnlUsd * 100) / 100,
+    total_pnl_pct: Math.round(totalPnlPct * 100) / 100,
     avg_pnl_pct: Math.round(avgPnlPct * 100) / 100,
-    avg_range_efficiency_pct: Math.round(avgRangeEfficiency * 10) / 10,
-    win_rate_pct: Math.round((wins / p.length) * 100),
+    avg_range_efficiency_pct: Math.round(avgRangeEff * 10) / 10,
+    win_rate_pct: Math.round((winners.length / p.length) * 100),
+    winners: winners.length,
+    losers: losers.length,
+    flat: flat.length,
+    avg_winner_pnl_pct: Math.round(avgWinnerPnl * 100) / 100,
+    avg_loser_pnl_pct: Math.round(avgLoserPnl * 100) / 100,
+    by_close_reason,
+    window_days: windowDays ?? null,
     total_lessons: data.lessons.length,
+  };
+}
+
+/**
+ * Generate concrete post-mortem suggestions from closed-position data.
+ * These are diagnostic hints — NOT auto-applied — meant to surface in
+ * agent prompts and operator-facing reports so a human can act on them.
+ *
+ * Each suggestion is shaped as:
+ *   { severity: "high" | "medium" | "low",
+ *     area: <stop_loss | oor | take_profit | low_yield | strategy | screening>,
+ *     summary: <short headline>,
+ *     detail: <longer explanation grounded in actual numbers>,
+ *     action_hint: <suggested next step the operator can take> }
+ *
+ * Returns null when there is not enough data (< 5 closed positions) since
+ * suggestions on tiny samples are noise. Caller should null-check.
+ *
+ * @param {Object} [opts]
+ * @param {number} [opts.windowDays] — only consider records from the last N days
+ * @param {Object} [opts.mgmtConfig] — live management config (for TP/SL refs)
+ */
+export function getPostMortemSuggestions(opts = {}) {
+  const { windowDays = null, mgmtConfig = null } = opts;
+  const summary = getPerformanceSummary({ windowDays });
+  if (!summary || summary.total_positions_closed < 5) return null;
+
+  const suggestions = [];
+  const byReason = summary.by_close_reason || {};
+
+  // ── 1. Stop loss bleeding ─────────────────────────────────────
+  const sl = byReason.stop_loss;
+  if (sl && sl.count >= 2 && sl.sum_pnl_pct < 0) {
+    const tpSum = byReason.take_profit?.sum_pnl_pct || 0;
+    const wipesTp = tpSum > 0 && Math.abs(sl.sum_pnl_pct) >= tpSum * 0.7;
+    suggestions.push({
+      severity: wipesTp ? "high" : "medium",
+      area: "stop_loss",
+      summary: `Stop loss bleeding ${sl.sum_pnl_pct.toFixed(2)}% across ${sl.count} positions (avg ${sl.avg_pnl_pct.toFixed(2)}%)`,
+      detail: wipesTp
+        ? `Take-profit gains (+${tpSum.toFixed(2)}%) are nearly cancelled by stop-loss losses. The asymmetric R/R (TP=${mgmtConfig?.takeProfitPct ?? "?"}, SL=${mgmtConfig?.stopLossPct ?? "?"}) requires a high win-rate to net profit; current win rate is ${summary.win_rate_pct}%.`
+        : `${sl.count} stop-loss exits are dragging on aggregate PnL. Look for common patterns (high volatility, low organic, specific strategies) in the losers.`,
+      action_hint: wipesTp
+        ? "Tighten screening filters (lower maxVolatility, raise minOrganic) OR adjust R/R toward symmetric (e.g. TP=5/SL=-5). Review losers via get_performance_history."
+        : "Review stop_loss positions in get_performance_history and look for shared traits (volatility, bin_step, strategy).",
+    });
+  }
+
+  // ── 2. OOR fast exits with low fee yield ──────────────────────
+  const oor = byReason.oor;
+  if (oor && oor.count >= summary.total_positions_closed * 0.3) {
+    const oorPct = Math.round((oor.count / summary.total_positions_closed) * 100);
+    const avgFeeYield = oor.count > 0
+      ? Math.round((oor.sum_fees_usd / oor.count) * 100) / 100
+      : 0;
+    suggestions.push({
+      severity: oor.avg_pnl_pct < 0.5 ? "medium" : "low",
+      area: "oor",
+      summary: `${oorPct}% of closes are OOR-driven (${oor.count}/${summary.total_positions_closed}, avg PnL ${oor.avg_pnl_pct.toFixed(2)}%, avg fees $${avgFeeYield})`,
+      detail: `OOR exits dominate the close-reason distribution and average near-zero PnL — positions are leaving range before fees can accumulate. Likely deploys are landing into pools that are already pumping.`,
+      action_hint: "Tighten screening: add minTokenAgeHours, raise minHolders, lower maxVolatility. Consider widening bins_below for high-volatility setups so positions stay in range longer.",
+    });
+  }
+
+  // ── 3. Take profit working but few hits ───────────────────────
+  const tp = byReason.take_profit;
+  if (tp && tp.count >= 1 && tp.avg_pnl_pct > 0 && tp.count < summary.total_positions_closed * 0.15) {
+    suggestions.push({
+      severity: "low",
+      area: "take_profit",
+      summary: `Take-profit hits only ${tp.count}/${summary.total_positions_closed} positions (${Math.round((tp.count / summary.total_positions_closed) * 100)}%) — your only consistent profit driver`,
+      detail: `When TP fires it averages +${tp.avg_pnl_pct.toFixed(2)}%, but it only fires on a small fraction of positions. Most positions exit via OOR or trailing before reaching TP.`,
+      action_hint: `Consider lowering takeProfitPct slightly (e.g. ${mgmtConfig?.takeProfitPct != null ? Math.max(2, mgmtConfig.takeProfitPct - 1) : 3}) so more positions clear the TP bar, or tighten trailing TP (lower trailingTriggerPct) to lock in mid-range gains.`,
+    });
+  }
+
+  // ── 4. Trailing TP rarely fires ───────────────────────────────
+  const trail = (byReason.trailing_drop?.count || 0) + (byReason.trailing_lowyield?.count || 0);
+  if (trail === 0 && summary.total_positions_closed >= 10) {
+    suggestions.push({
+      severity: "low",
+      area: "strategy",
+      summary: "Trailing take-profit never fired in the dataset",
+      detail: "Either the trailingTriggerPct is too high for actual position trajectories, or trailing TP is disabled. With current data the bot relies almost entirely on TP/SL/OOR for exits.",
+      action_hint: "Consider lowering trailingTriggerPct to capture mid-range winners that don't reach full TP.",
+    });
+  }
+
+  // ── 5. Low yield exits — positions going stale ────────────────
+  const ly = byReason.low_yield;
+  if (ly && ly.count >= 3 && ly.avg_pnl_pct < 1) {
+    suggestions.push({
+      severity: "low",
+      area: "low_yield",
+      summary: `${ly.count} low-yield exits averaging ${ly.avg_pnl_pct.toFixed(2)}%`,
+      detail: "Bot held positions long enough to hit the low-yield exit, suggesting pool fees collapsed or never accumulated.",
+      action_hint: "Tighten minFeeActiveTvlRatio or raise minFeePerTvl24h so the screener filters out pools that don't sustain fees.",
+    });
+  }
+
+  // ── 6. Win rate sanity check ──────────────────────────────────
+  if (summary.win_rate_pct < 50 && summary.total_positions_closed >= 10) {
+    const expectedWinRateForBreakeven = mgmtConfig?.takeProfitPct && mgmtConfig?.stopLossPct
+      ? Math.round((Math.abs(mgmtConfig.stopLossPct) / (mgmtConfig.takeProfitPct + Math.abs(mgmtConfig.stopLossPct))) * 100)
+      : null;
+    suggestions.push({
+      severity: "medium",
+      area: "screening",
+      summary: `Win rate ${summary.win_rate_pct}% — losers outnumber winners (${summary.losers} vs ${summary.winners})`,
+      detail: expectedWinRateForBreakeven != null
+        ? `With TP=${mgmtConfig.takeProfitPct} and SL=${mgmtConfig.stopLossPct}, breakeven needs ~${expectedWinRateForBreakeven}% win rate. Current ${summary.win_rate_pct}% is below that.`
+        : "Sub-50% win rate across the sample. Screening signals may need tightening.",
+      action_hint: "Raise minOrganic / minHolders / minVolume in screening; review evolveThresholds output for already-suggested adjustments.",
+    });
+  }
+
+  if (suggestions.length === 0) return null;
+
+  return {
+    generated_at: new Date().toISOString(),
+    window_days: windowDays ?? null,
+    sample_size: summary.total_positions_closed,
+    summary: {
+      total_pnl_pct: summary.total_pnl_pct,
+      win_rate_pct: summary.win_rate_pct,
+      by_close_reason: summary.by_close_reason,
+    },
+    suggestions: suggestions.sort((a, b) => {
+      const order = { high: 0, medium: 1, low: 2 };
+      return (order[a.severity] ?? 9) - (order[b.severity] ?? 9);
+    }),
   };
 }

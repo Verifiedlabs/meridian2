@@ -386,7 +386,7 @@ Changes persist to user-config.json and take effect immediately — no restart n
 VALID KEYS (use EXACTLY these key names, nothing else):
 Screening: screeningSource, minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minQuoteOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, excludeHighSupplyConcentration, allowedLaunchpads, blockedLaunchpads
 GMGN (persisted to gmgn-config.json): gmgnApiKey, gmgnBaseUrl, gmgnInterval, gmgnOrderBy, gmgnDirection, gmgnLimit, gmgnEnrichLimit, gmgnRequestDelayMs, gmgnMaxRetries, gmgnFilters, gmgnPlatforms, gmgnMinMcap, gmgnMaxMcap, gmgnMinVolume, gmgnMinHolders, gmgnMinTokenAgeHours, gmgnMaxTokenAgeHours, gmgnAthFilterPct, gmgnMaxBundlerRate, gmgnMaxFreshWalletRate, gmgnMaxDevTeamHoldRate, gmgnPreferredKolNames, gmgnPreferredKolMinHoldPct, gmgnRequireKol, gmgnMinKolCount, gmgnMinSmartDegenCount, gmgnMinTotalFeeSol
-Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, oorCooldownTriggerCount, oorCooldownHours, repeatDeployCooldownEnabled, repeatDeployCooldownTriggerCount, repeatDeployCooldownHours, repeatDeployCooldownScope, repeatDeployCooldownMinFeeEarnedPct, minVolumeToRebalance, stopLossPct, takeProfitPct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
+Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minAgeBeforeOORExit, minOORFastExitFeesUsd, oorCooldownTriggerCount, oorCooldownHours, repeatDeployCooldownEnabled, repeatDeployCooldownTriggerCount, repeatDeployCooldownHours, repeatDeployCooldownScope, repeatDeployCooldownMinFeeEarnedPct, minVolumeToRebalance, stopLossPct, takeProfitPct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
 Risk: maxPositions, maxDeployAmount
 Schedule: managementIntervalMin, screeningIntervalMin
 Models: managementModel, screeningModel, generalModel
@@ -992,6 +992,44 @@ Returns individual closed positions with PnL, fees, strategy, hold time, and clo
           limit: {
             type: "number",
             description: "Max records to return (default 50)"
+          }
+        }
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "get_performance_summary",
+      description: `Get aggregate performance stats: win rate, avg PnL, and a per-close-reason histogram (stop_loss / take_profit / oor / trailing_drop / low_yield / etc) showing count, sum_pnl_pct, and sum_fees_usd for each bucket. Use when you need a quick read on what's been working vs bleeding capital.`,
+      parameters: {
+        type: "object",
+        properties: {
+          window_days: {
+            type: "number",
+            description: "Only include records from the last N days. Omit for all-time."
+          },
+          max_records: {
+            type: "number",
+            description: "Cap to the most recent N records. Omit for no cap."
+          }
+        }
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "get_postmortem_suggestions",
+      description: `Get concrete diagnostic suggestions derived from closed-position data — e.g. "stop_loss bleeding -16% across 4 positions, consider tightening R/R" or "47% of closes are OOR-driven, raise minTokenAgeHours". Returns a sorted list (high → low severity) of {area, summary, detail, action_hint}. NOT auto-applied — surface to operator for manual review. Returns empty when sample size < 5.`,
+      parameters: {
+        type: "object",
+        properties: {
+          window_days: {
+            type: "number",
+            description: "Only consider records from the last N days. Omit for all-time."
           }
         }
       }

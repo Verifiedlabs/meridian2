@@ -1,6 +1,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
-import { getPerformanceSummary } from "./lessons.js";
+import { getPerformanceSummary, categorizeCloseReason, getPostMortemSuggestions } from "./lessons.js";
+import { config } from "./config.js";
 
 const STATE_FILE = "./state.json";
 const LESSONS_FILE = "./lessons.json";
@@ -35,9 +36,11 @@ export async function generateBriefing() {
     .slice(0, 2);
 
   // 4. Top close reasons over the last 24h — actually useful for daily review.
+  // Uses the centralised categorizeCloseReason helper so buckets match the
+  // ones surfaced in agent prompts and get_performance_summary.
   const reasonBuckets = new Map();
   for (const p of perfLast24h) {
-    const key = (p.close_reason || "unknown").split(/[,\(]/)[0].trim().slice(0, 36);
+    const key = categorizeCloseReason(p.close_reason);
     const b = reasonBuckets.get(key) || { count: 0, wins: 0, pnl: 0 };
     b.count++;
     if ((p.pnl_usd || 0) > 0.005) b.wins++;
@@ -93,6 +96,22 @@ export async function generateBriefing() {
     const pnlAll = perfSummary.total_pnl_usd ?? 0;
     lines.push(`📊 All-time: $${pnlAll.toFixed(2)} · ${perfSummary.win_rate_pct}% win · ${perfSummary.total_positions_closed} closed`);
   }
+
+  // 7. Postmortem call-outs — only surface high/medium severity findings so
+  //    the briefing stays scannable. Operator can run get_postmortem_suggestions
+  //    directly for the full list.
+  const postmortem = getPostMortemSuggestions({ mgmtConfig: config?.management });
+  const flagged = (postmortem?.suggestions || []).filter((s) => s.severity === "high" || s.severity === "medium");
+  if (flagged.length > 0) {
+    lines.push("");
+    lines.push(`<b>⚠️ Postmortem flags:</b>`);
+    for (const s of flagged.slice(0, 3)) {
+      const icon = s.severity === "high" ? "🔴" : "🟡";
+      lines.push(`  ${icon} ${s.summary.slice(0, 110)}`);
+    }
+    lines.push(`<i>(Run get_postmortem_suggestions for full detail + action hints.)</i>`);
+  }
+
   lines.push("────────────────");
 
   return lines.join("\n");

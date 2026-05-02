@@ -11,7 +11,7 @@ import {
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
-import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
+import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, getPerformanceSummary, getPostMortemSuggestions, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
@@ -153,6 +153,8 @@ const CONFIG_VALIDATORS = {
   // ─── management toggles & limits ──────────────────────────────
   outOfRangeBinsToClose:  num(0, 10000, { integer: true }),
   outOfRangeWaitMinutes:  num(0, 100000),
+  minAgeBeforeOORExit:    num(0, 100000),
+  minOORFastExitFeesUsd:  num(0, 1e6),
   realtimeMonitoring:        bool(),
   realtimeOorThrottleSec:    num(5, 3600),
   realtimeRefetchDebounceMs: num(500, 60000, { integer: true }),
@@ -264,6 +266,25 @@ const toolMap = {
     }
   },
   get_performance_history: getPerformanceHistory,
+  get_performance_summary: ({ window_days, max_records } = {}) => {
+    const summary = getPerformanceSummary({
+      windowDays: window_days,
+      maxRecords: max_records,
+    });
+    return summary || { empty: true, message: "No closed positions yet" };
+  },
+  get_postmortem_suggestions: async ({ window_days } = {}) => {
+    let mgmtConfig = null;
+    try {
+      const { config } = await import("../config.js");
+      mgmtConfig = config?.management || null;
+    } catch { /* fall back to no mgmt config */ }
+    const result = getPostMortemSuggestions({
+      windowDays: window_days,
+      mgmtConfig,
+    });
+    return result || { empty: true, message: "Not enough closed positions yet (need >= 5) for meaningful suggestions" };
+  },
   get_recent_decisions: ({ limit } = {}) => ({ decisions: getRecentDecisions(limit || 6) }),
   add_strategy:        addStrategy,
   list_strategies:     listStrategies,
@@ -344,6 +365,8 @@ const toolMap = {
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
+      minAgeBeforeOORExit:   ["management", "minAgeBeforeOORExit"],
+      minOORFastExitFeesUsd: ["management", "minOORFastExitFeesUsd"],
       realtimeMonitoring: ["management", "realtimeMonitoring"],
       realtimeOorThrottleSec: ["management", "realtimeOorThrottleSec"],
       realtimeRefetchDebounceMs: ["management", "realtimeRefetchDebounceMs"],
