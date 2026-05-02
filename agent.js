@@ -32,7 +32,7 @@ import { getMyPositions } from "./tools/dlmm.js";
 import { log } from "./logger.js";
 import { config } from "./config.js";
 import { getStateSummary } from "./state.js";
-import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
+import { getLessonsForPrompt, getPerformanceSummary, getPostMortemSuggestions } from "./lessons.js";
 import { getDecisionSummary } from "./decision-log.js";
 
 // Supports OpenRouter (default) or any OpenAI-compatible local server (e.g. LM Studio)
@@ -100,6 +100,10 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   const stateSummary = getStateSummary();
   const lessons = getLessonsForPrompt({ agentType });
   const perfSummary = getPerformanceSummary();
+  // Postmortem suggestions are diagnostic — only inject HIGH severity items
+  // into the prompt to keep token cost low. The agent can still call
+  // get_postmortem_suggestions for the full list if it wants more detail.
+  const postmortem = getPostMortemSuggestions({ mgmtConfig: config.management });
   const decisionSummary = getDecisionSummary();
   let weightsSummary = null;
   if (agentType === "SCREENER") {
@@ -109,7 +113,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       if (config.darwin?.enabled) weightsSummary = getWeightsSummary();
     } catch { /* signal-weights not critical */ }
   }
-  const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, weightsSummary, decisionSummary);
+  const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, weightsSummary, decisionSummary, postmortem);
 
   let providerMode = "system";
   let messages = buildMessages(systemPrompt, sessionHistory, goal, providerMode);

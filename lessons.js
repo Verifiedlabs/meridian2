@@ -869,3 +869,134 @@ export function getPerformanceSummary(opts = {}) {
     total_lessons: data.lessons.length,
   };
 }
+
+/**
+ * Generate concrete post-mortem suggestions from closed-position data.
+ * These are diagnostic hints — NOT auto-applied — meant to surface in
+ * agent prompts and operator-facing reports so a human can act on them.
+ *
+ * Each suggestion is shaped as:
+ *   { severity: "high" | "medium" | "low",
+ *     area: <stop_loss | oor | take_profit | low_yield | strategy | screening>,
+ *     summary: <short headline>,
+ *     detail: <longer explanation grounded in actual numbers>,
+ *     action_hint: <suggested next step the operator can take> }
+ *
+ * Returns null when there is not enough data (< 5 closed positions) since
+ * suggestions on tiny samples are noise. Caller should null-check.
+ *
+ * @param {Object} [opts]
+ * @param {number} [opts.windowDays] — only consider records from the last N days
+ * @param {Object} [opts.mgmtConfig] — live management config (for TP/SL refs)
+ */
+export function getPostMortemSuggestions(opts = {}) {
+  const { windowDays = null, mgmtConfig = null } = opts;
+  const summary = getPerformanceSummary({ windowDays });
+  if (!summary || summary.total_positions_closed < 5) return null;
+
+  const suggestions = [];
+  const byReason = summary.by_close_reason || {};
+
+  // ── 1. Stop loss bleeding ─────────────────────────────────────
+  const sl = byReason.stop_loss;
+  if (sl && sl.count >= 2 && sl.sum_pnl_pct < 0) {
+    const tpSum = byReason.take_profit?.sum_pnl_pct || 0;
+    const wipesTp = tpSum > 0 && Math.abs(sl.sum_pnl_pct) >= tpSum * 0.7;
+    suggestions.push({
+      severity: wipesTp ? "high" : "medium",
+      area: "stop_loss",
+      summary: `Stop loss bleeding ${sl.sum_pnl_pct.toFixed(2)}% across ${sl.count} positions (avg ${sl.avg_pnl_pct.toFixed(2)}%)`,
+      detail: wipesTp
+        ? `Take-profit gains (+${tpSum.toFixed(2)}%) are nearly cancelled by stop-loss losses. The asymmetric R/R (TP=${mgmtConfig?.takeProfitPct ?? "?"}, SL=${mgmtConfig?.stopLossPct ?? "?"}) requires a high win-rate to net profit; current win rate is ${summary.win_rate_pct}%.`
+        : `${sl.count} stop-loss exits are dragging on aggregate PnL. Look for common patterns (high volatility, low organic, specific strategies) in the losers.`,
+      action_hint: wipesTp
+        ? "Tighten screening filters (lower maxVolatility, raise minOrganic) OR adjust R/R toward symmetric (e.g. TP=5/SL=-5). Review losers via get_performance_history."
+        : "Review stop_loss positions in get_performance_history and look for shared traits (volatility, bin_step, strategy).",
+    });
+  }
+
+  // ── 2. OOR fast exits with low fee yield ──────────────────────
+  const oor = byReason.oor;
+  if (oor && oor.count >= summary.total_positions_closed * 0.3) {
+    const oorPct = Math.round((oor.count / summary.total_positions_closed) * 100);
+    const avgFeeYield = oor.count > 0
+      ? Math.round((oor.sum_fees_usd / oor.count) * 100) / 100
+      : 0;
+    suggestions.push({
+      severity: oor.avg_pnl_pct < 0.5 ? "medium" : "low",
+      area: "oor",
+      summary: `${oorPct}% of closes are OOR-driven (${oor.count}/${summary.total_positions_closed}, avg PnL ${oor.avg_pnl_pct.toFixed(2)}%, avg fees $${avgFeeYield})`,
+      detail: `OOR exits dominate the close-reason distribution and average near-zero PnL — positions are leaving range before fees can accumulate. Likely deploys are landing into pools that are already pumping.`,
+      action_hint: "Tighten screening: add minTokenAgeHours, raise minHolders, lower maxVolatility. Consider widening bins_below for high-volatility setups so positions stay in range longer.",
+    });
+  }
+
+  // ── 3. Take profit working but few hits ───────────────────────
+  const tp = byReason.take_profit;
+  if (tp && tp.count >= 1 && tp.avg_pnl_pct > 0 && tp.count < summary.total_positions_closed * 0.15) {
+    suggestions.push({
+      severity: "low",
+      area: "take_profit",
+      summary: `Take-profit hits only ${tp.count}/${summary.total_positions_closed} positions (${Math.round((tp.count / summary.total_positions_closed) * 100)}%) — your only consistent profit driver`,
+      detail: `When TP fires it averages +${tp.avg_pnl_pct.toFixed(2)}%, but it only fires on a small fraction of positions. Most positions exit via OOR or trailing before reaching TP.`,
+      action_hint: `Consider lowering takeProfitPct slightly (e.g. ${mgmtConfig?.takeProfitPct != null ? Math.max(2, mgmtConfig.takeProfitPct - 1) : 3}) so more positions clear the TP bar, or tighten trailing TP (lower trailingTriggerPct) to lock in mid-range gains.`,
+    });
+  }
+
+  // ── 4. Trailing TP rarely fires ───────────────────────────────
+  const trail = (byReason.trailing_drop?.count || 0) + (byReason.trailing_lowyield?.count || 0);
+  if (trail === 0 && summary.total_positions_closed >= 10) {
+    suggestions.push({
+      severity: "low",
+      area: "strategy",
+      summary: "Trailing take-profit never fired in the dataset",
+      detail: "Either the trailingTriggerPct is too high for actual position trajectories, or trailing TP is disabled. With current data the bot relies almost entirely on TP/SL/OOR for exits.",
+      action_hint: "Consider lowering trailingTriggerPct to capture mid-range winners that don't reach full TP.",
+    });
+  }
+
+  // ── 5. Low yield exits — positions going stale ────────────────
+  const ly = byReason.low_yield;
+  if (ly && ly.count >= 3 && ly.avg_pnl_pct < 1) {
+    suggestions.push({
+      severity: "low",
+      area: "low_yield",
+      summary: `${ly.count} low-yield exits averaging ${ly.avg_pnl_pct.toFixed(2)}%`,
+      detail: "Bot held positions long enough to hit the low-yield exit, suggesting pool fees collapsed or never accumulated.",
+      action_hint: "Tighten minFeeActiveTvlRatio or raise minFeePerTvl24h so the screener filters out pools that don't sustain fees.",
+    });
+  }
+
+  // ── 6. Win rate sanity check ──────────────────────────────────
+  if (summary.win_rate_pct < 50 && summary.total_positions_closed >= 10) {
+    const expectedWinRateForBreakeven = mgmtConfig?.takeProfitPct && mgmtConfig?.stopLossPct
+      ? Math.round((Math.abs(mgmtConfig.stopLossPct) / (mgmtConfig.takeProfitPct + Math.abs(mgmtConfig.stopLossPct))) * 100)
+      : null;
+    suggestions.push({
+      severity: "medium",
+      area: "screening",
+      summary: `Win rate ${summary.win_rate_pct}% — losers outnumber winners (${summary.losers} vs ${summary.winners})`,
+      detail: expectedWinRateForBreakeven != null
+        ? `With TP=${mgmtConfig.takeProfitPct} and SL=${mgmtConfig.stopLossPct}, breakeven needs ~${expectedWinRateForBreakeven}% win rate. Current ${summary.win_rate_pct}% is below that.`
+        : "Sub-50% win rate across the sample. Screening signals may need tightening.",
+      action_hint: "Raise minOrganic / minHolders / minVolume in screening; review evolveThresholds output for already-suggested adjustments.",
+    });
+  }
+
+  if (suggestions.length === 0) return null;
+
+  return {
+    generated_at: new Date().toISOString(),
+    window_days: windowDays ?? null,
+    sample_size: summary.total_positions_closed,
+    summary: {
+      total_pnl_pct: summary.total_pnl_pct,
+      win_rate_pct: summary.win_rate_pct,
+      by_close_reason: summary.by_close_reason,
+    },
+    suggestions: suggestions.sort((a, b) => {
+      const order = { high: 0, medium: 1, low: 2 };
+      return (order[a.severity] ?? 9) - (order[b.severity] ?? 9);
+    }),
+  };
+}

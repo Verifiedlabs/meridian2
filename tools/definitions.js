@@ -1019,6 +1019,23 @@ Returns individual closed positions with PnL, fees, strategy, hold time, and clo
     }
   },
 
+  {
+    type: "function",
+    function: {
+      name: "get_postmortem_suggestions",
+      description: `Get concrete diagnostic suggestions derived from closed-position data — e.g. "stop_loss bleeding -16% across 4 positions, consider tightening R/R" or "47% of closes are OOR-driven, raise minTokenAgeHours". Returns a sorted list (high → low severity) of {area, summary, detail, action_hint}. NOT auto-applied — surface to operator for manual review. Returns empty when sample size < 5.`,
+      parameters: {
+        type: "object",
+        properties: {
+          window_days: {
+            type: "number",
+            description: "Only consider records from the last N days. Omit for all-time."
+          }
+        }
+      }
+    }
+  },
+
   // ─── Pool Memory ────────────────────────────────────────────────
 
   {

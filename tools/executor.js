@@ -11,7 +11,7 @@ import {
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
-import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, getPerformanceSummary, pinLesson, unpinLesson, listLessons } from "../lessons.js";
+import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, getPerformanceSummary, getPostMortemSuggestions, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
@@ -270,6 +270,18 @@ const toolMap = {
       maxRecords: max_records,
     });
     return summary || { empty: true, message: "No closed positions yet" };
+  },
+  get_postmortem_suggestions: async ({ window_days } = {}) => {
+    let mgmtConfig = null;
+    try {
+      const { config } = await import("../config.js");
+      mgmtConfig = config?.management || null;
+    } catch { /* fall back to no mgmt config */ }
+    const result = getPostMortemSuggestions({
+      windowDays: window_days,
+      mgmtConfig,
+    });
+    return result || { empty: true, message: "Not enough closed positions yet (need >= 5) for meaningful suggestions" };
   },
   get_recent_decisions: ({ limit } = {}) => ({ decisions: getRecentDecisions(limit || 6) }),
   add_strategy:        addStrategy,
