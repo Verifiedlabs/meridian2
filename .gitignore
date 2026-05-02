@@ -13,7 +13,6 @@ gmgn-config.json
 
 # Runtime state (position tracking, lessons — user-specific)
 state.json
-lessons.json
 smart-wallets.json
 pool-memory.json
 token-blacklist.json
