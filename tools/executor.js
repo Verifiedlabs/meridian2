@@ -153,6 +153,8 @@ const CONFIG_VALIDATORS = {
   // ─── management toggles & limits ──────────────────────────────
   outOfRangeBinsToClose:  num(0, 10000, { integer: true }),
   outOfRangeWaitMinutes:  num(0, 100000),
+  minAgeBeforeOORExit:    num(0, 100000),
+  minOORFastExitFeesUsd:  num(0, 1e6),
   realtimeMonitoring:        bool(),
   realtimeOorThrottleSec:    num(5, 3600),
   realtimeRefetchDebounceMs: num(500, 60000, { integer: true }),
@@ -363,6 +365,8 @@ const toolMap = {
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
+      minAgeBeforeOORExit:   ["management", "minAgeBeforeOORExit"],
+      minOORFastExitFeesUsd: ["management", "minOORFastExitFeesUsd"],
       realtimeMonitoring: ["management", "realtimeMonitoring"],
       realtimeOorThrottleSec: ["management", "realtimeOorThrottleSec"],
       realtimeRefetchDebounceMs: ["management", "realtimeRefetchDebounceMs"],

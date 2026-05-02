@@ -157,6 +157,18 @@ export const config = {
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
+    // Minimum age (minutes) before the "pumped far above range" fast-exit
+    // (rule 3) is allowed to fire. Default 5 — gives positions a chance to
+    // accumulate fees before being aborted on a fast pump. Set to 0 to
+    // restore the legacy always-on behaviour. The slower OOR-timeout
+    // exit (rule 4) is unaffected and still gates on outOfRangeWaitMinutes.
+    minAgeBeforeOORExit:   u.minAgeBeforeOORExit   ?? 5,
+    // Minimum unclaimed-fees USD that lets rule 3 fire even for young
+    // positions. If the position has already earned this much in fees
+    // the fast-exit is justified (lock the gains). 0 disables this
+    // override entirely (= age guard alone). Set to e.g. 0.05 if you
+    // want pumped-and-already-earned positions to fast-exit.
+    minOORFastExitFeesUsd: u.minOORFastExitFeesUsd ?? 0,
     realtimeMonitoring:        u.realtimeMonitoring        ?? false,
     realtimeOorThrottleSec:    u.realtimeOorThrottleSec    ?? 60,
     realtimeRefetchDebounceMs: u.realtimeRefetchDebounceMs  ?? 3000,

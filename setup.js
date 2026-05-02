@@ -328,6 +328,8 @@ const FIELD_SECTIONS = [
       { key: "autoSwapAfterClaim", label: "Auto swap after claim? (true/false)", type: "boolean" },
       { key: "outOfRangeBinsToClose", label: "Bins above range to force close", type: "number", min: 0 },
       { key: "outOfRangeWaitMinutes", label: "Minutes OOR before close", type: "number", min: 1 },
+      { key: "minAgeBeforeOORExit", label: "Min position age (min) before fast-OOR fires", type: "number", min: 0 },
+      { key: "minOORFastExitFeesUsd", label: "Min unclaimed fees USD that lets fast-OOR fire even for young positions (0 = disable)", type: "number", min: 0 },
       { key: "oorCooldownTriggerCount", label: "OOR cooldown trigger count", type: "number", min: 1 },
       { key: "oorCooldownHours", label: "OOR cooldown hours", type: "number", min: 1 },
       { key: "repeatDeployCooldownEnabled", label: "Repeat deploy cooldown? (true/false)", type: "boolean" },

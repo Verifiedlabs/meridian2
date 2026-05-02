@@ -51,7 +51,7 @@ EXIT RULE REFERENCE (deterministic engine handles these — only override on ins
 - STOP_LOSS  : pnl_pct <= ${config.management.stopLossPct}%
 - TAKE_PROFIT: pnl_pct >= ${config.management.takeProfitPct}%
 - TRAILING_TP: peak ${config.management.trailingTriggerPct}%+ then drop ${config.management.trailingDropPct}%+ (trailing=${config.management.trailingTakeProfit ? "ON" : "OFF"})
-- OOR        : active_bin > upper_bin + ${config.management.outOfRangeBinsToClose} bins, OR oor for ${config.management.outOfRangeWaitMinutes}+ min
+- OOR        : active_bin > upper_bin + ${config.management.outOfRangeBinsToClose} bins (only after age >= ${config.management.minAgeBeforeOORExit ?? 5}min OR fees >= $${config.management.minOORFastExitFeesUsd ?? 0}), OR oor for ${config.management.outOfRangeWaitMinutes}+ min
 - LOW_YIELD  : fee/TVL 24h < ${config.management.minFeePerTvl24h}% after ${config.management.minAgeBeforeYieldCheck ?? 60}min
 
 BEHAVIORAL CORE:
