@@ -112,8 +112,64 @@ export async function generateBriefing() {
     lines.push(`<i>(Run get_postmortem_suggestions for full detail + action hints.)</i>`);
   }
 
+  // 8. Compact 7-day PnL chart — purely cosmetic but useful for spotting
+  //    streaks at a glance. Skipped when there's no closed-position data.
+  const chart = buildPnlChart7d(lessonsData.performance || []);
+  if (chart) {
+    lines.push("");
+    lines.push(`<b>📊 7-day PnL</b>`);
+    lines.push(`<pre>${chart}</pre>`);
+  }
+
   lines.push("────────────────");
 
+  return lines.join("\n");
+}
+
+/**
+ * Render a compact 7-day daily-PnL bar chart using ASCII blocks. Returns
+ * null when there's no signal (zero closed positions or all-zero PnL).
+ * Bars are right-anchored for negative days and left-anchored for
+ * positive days, so the centre line lives on the same column.
+ *
+ * Exported for unit testing.
+ */
+export function buildPnlChart7d(performance, opts = {}) {
+  const { days = 7, barWidth = 16, now = new Date() } = opts;
+  if (!Array.isArray(performance)) return null;
+  const today = new Date(now);
+  today.setUTCHours(0, 0, 0, 0);
+  const buckets = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const dayStart = new Date(today.getTime() - i * 24 * 60 * 60 * 1000);
+    const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+    const dayPerf = performance.filter((p) => {
+      const t = new Date(p.recorded_at || p.closed_at || 0).getTime();
+      return t >= dayStart.getTime() && t < dayEnd.getTime();
+    });
+    const pnl = dayPerf.reduce((s, p) => s + (Number(p.pnl_usd) || 0), 0);
+    buckets.push({
+      label: dayStart.toISOString().slice(5, 10), // MM-DD (UTC)
+      pnl,
+      count: dayPerf.length,
+    });
+  }
+
+  const maxAbs = buckets.reduce((m, b) => Math.max(m, Math.abs(b.pnl)), 0);
+  if (maxAbs === 0) return null;
+
+  const lines = [];
+  for (const b of buckets) {
+    const blocks = Math.min(barWidth, Math.round((Math.abs(b.pnl) / maxAbs) * barWidth));
+    const bar = b.pnl >= 0
+      ? "█".repeat(blocks).padEnd(barWidth, " ")
+      : " ".repeat(barWidth - blocks) + "█".repeat(blocks);
+    const sign = b.pnl >= 0 ? "+" : "-";
+    const pnlStr = `${sign}$${Math.abs(b.pnl).toFixed(2)}`;
+    const dot = b.pnl > 0.005 ? "🟢" : b.pnl < -0.005 ? "🔴" : "⚪";
+    const countStr = b.count > 0 ? `${b.count}×` : "—";
+    lines.push(`${b.label}  ${dot} ${bar}  ${pnlStr.padStart(8, " ")}  ${countStr}`);
+  }
   return lines.join("\n");
 }
 
