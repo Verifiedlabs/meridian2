@@ -998,6 +998,27 @@ Returns individual closed positions with PnL, fees, strategy, hold time, and clo
     }
   },
 
+  {
+    type: "function",
+    function: {
+      name: "get_performance_summary",
+      description: `Get aggregate performance stats: win rate, avg PnL, and a per-close-reason histogram (stop_loss / take_profit / oor / trailing_drop / low_yield / etc) showing count, sum_pnl_pct, and sum_fees_usd for each bucket. Use when you need a quick read on what's been working vs bleeding capital.`,
+      parameters: {
+        type: "object",
+        properties: {
+          window_days: {
+            type: "number",
+            description: "Only include records from the last N days. Omit for all-time."
+          },
+          max_records: {
+            type: "number",
+            description: "Cap to the most recent N records. Omit for no cap."
+          }
+        }
+      }
+    }
+  },
+
   // ─── Pool Memory ────────────────────────────────────────────────
 
   {

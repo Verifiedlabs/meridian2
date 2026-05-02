@@ -119,8 +119,16 @@ export async function recordPerformance(perf) {
 
   data.performance.push(entry);
 
-  // Derive and store a lesson
-  const lesson = derivLesson(entry);
+  // Derive and store a lesson — pass live management config so the
+  // outcome categorizer respects the user's actual TP/SL thresholds
+  // instead of the legacy hardcoded ±5%.
+  let mgmtConfig = null;
+  try {
+    const { config } = await import("./config.js");
+    mgmtConfig = config?.management || null;
+  } catch { /* ignore — derivLesson falls back to hardcoded thresholds */ }
+
+  const lesson = derivLesson(entry, mgmtConfig);
   if (lesson) {
     data.lessons.push(lesson);
     log("lessons", `New lesson: ${lesson.rule}`);
@@ -183,18 +191,39 @@ export async function recordPerformance(perf) {
 /**
  * Derive a lesson from a closed position's performance.
  * Only generates a lesson if the outcome was clearly good or bad.
+ *
+ * @param {Object} perf — performance record
+ * @param {Object} [mgmtConfig] — optional live management config. When provided,
+ *   the outcome categorizer aligns with the user's actual takeProfitPct /
+ *   stopLossPct so a +4% TP exit is correctly tagged "good" even when the
+ *   legacy hardcoded threshold (5%) wouldn't catch it.
  */
-function derivLesson(perf) {
+function derivLesson(perf, mgmtConfig = null) {
   const tags = [];
   const feeYieldPct = perf.initial_value_usd > 0
     ? ((perf.fees_earned_usd || 0) / perf.initial_value_usd) * 100
     : 0;
 
-  // Categorize outcome
-  const outcome = perf.pnl_pct >= 5 ? "good"
+  // Threshold-aware outcome categorization. We treat anything that
+  // reaches at least 80% of the user's TP target as a clear win, and
+  // anything past the user's stop loss as a clear loss. Fee-positive
+  // small wins (>= 2% of capital earned in fees) still count as "good".
+  const tpPct = Number.isFinite(mgmtConfig?.takeProfitPct) && mgmtConfig.takeProfitPct > 0
+    ? mgmtConfig.takeProfitPct
+    : 5;
+  const slPct = Number.isFinite(mgmtConfig?.stopLossPct) && mgmtConfig.stopLossPct < 0
+    ? mgmtConfig.stopLossPct
+    : -5;
+  const goodCutoff = Math.min(5, tpPct * 0.8);
+  // "bad" cutoff: at-or-below stop loss, with a small grace so positions
+  // that exit exactly at SL still register as bad. Cap at -5% so we
+  // never accidentally raise the bar above the legacy default.
+  const badCutoff = Math.min(-5, slPct + 1);
+
+  const outcome = perf.pnl_pct >= goodCutoff ? "good"
     : (perf.pnl_pct >= 0 && feeYieldPct >= 2) ? "good"
     : perf.pnl_pct >= 0 ? "neutral"
-    : perf.pnl_pct >= -5 ? "poor"
+    : perf.pnl_pct > badCutoff ? "poor"
     : "bad";
 
   if (outcome === "neutral") return null; // nothing interesting to learn
@@ -286,8 +315,18 @@ function derivLesson(perf) {
 export function evolveThresholds(perfData, config) {
   if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
 
+  // Loser cutoff: respect the user's actual stop-loss threshold so we
+  // count true SL events (and worse) as losers. Falls back to -5% for
+  // legacy configs without management.stopLossPct. We add a small +1
+  // grace so positions exiting just inside the SL band are still
+  // counted (e.g. SL=-6, cutoff=-5 captures pnl_pct in (-6, -5]).
+  const slPct = Number.isFinite(config?.management?.stopLossPct) && config.management.stopLossPct < 0
+    ? config.management.stopLossPct
+    : -5;
+  const loserCutoff = Math.min(-5, slPct + 1);
+
   const winners = perfData.filter((p) => p.pnl_pct > 0);
-  const losers  = perfData.filter((p) => p.pnl_pct < -5);
+  const losers  = perfData.filter((p) => p.pnl_pct < loserCutoff);
 
   // Need at least some signal in both directions before adjusting
   const hasSignal = winners.length >= 2 || losers.length >= 2;
@@ -727,25 +766,106 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
 }
 
 /**
- * Get performance stats summary.
+ * Categorize a close_reason string into a short category label so summaries
+ * can attribute PnL to the actual exit driver. Centralised so callers
+ * (briefing, MANAGER prompt, performance tools) all use identical buckets.
  */
-export function getPerformanceSummary() {
+export function categorizeCloseReason(closeReason) {
+  const r = String(closeReason || "").toLowerCase();
+  if (!r) return "unknown";
+  if (r.includes("stop loss")) return "stop_loss";
+  if (r.includes("trailing") && r.includes("low yield")) return "trailing_lowyield";
+  if (r.includes("trailing")) return "trailing_drop";
+  if (r.includes("take profit")) return "take_profit";
+  if (r.includes("oor") || r.includes("pumped") || r.includes("out of range") || r.includes("range")) return "oor";
+  if (r.includes("low yield")) return "low_yield";
+  if (r.includes("realtime")) return "oor";
+  if (r.includes("emergency")) return "stop_loss";
+  return "other";
+}
+
+/** Numeric value with NaN/null guard. */
+function num(x, fallback = 0) {
+  return Number.isFinite(x) ? x : fallback;
+}
+
+/**
+ * Get performance stats summary.
+ *
+ * @param {Object} [opts]
+ * @param {number} [opts.windowDays] — only include records from the last N days. Omit for all-time.
+ * @param {number} [opts.maxRecords] — only include the most recent N records. Omit for all.
+ */
+export function getPerformanceSummary(opts = {}) {
+  const { windowDays = null, maxRecords = null } = opts;
   const data = load();
-  const p = data.performance;
+  let p = data.performance;
+
+  if (windowDays != null && Number.isFinite(windowDays) && windowDays > 0) {
+    const cutoff = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
+    p = p.filter((r) => (r.recorded_at || "") >= cutoff);
+  }
+  if (maxRecords != null && Number.isFinite(maxRecords) && maxRecords > 0) {
+    p = p.slice(-maxRecords);
+  }
 
   if (p.length === 0) return null;
 
-  const totalPnl = p.reduce((s, x) => s + x.pnl_usd, 0);
-  const avgPnlPct = p.reduce((s, x) => s + x.pnl_pct, 0) / p.length;
-  const avgRangeEfficiency = p.reduce((s, x) => s + x.range_efficiency, 0) / p.length;
-  const wins = p.filter((x) => x.pnl_usd > 0).length;
+  // NaN-safe aggregates — guard each numeric field so a single null
+  // performance record can't pollute the whole summary.
+  const totalPnlUsd = p.reduce((s, x) => s + num(x.pnl_usd), 0);
+  const totalPnlPct = p.reduce((s, x) => s + num(x.pnl_pct), 0);
+  const avgPnlPct   = totalPnlPct / p.length;
+  const avgRangeEff = p.reduce((s, x) => s + num(x.range_efficiency), 0) / p.length;
+
+  const winners = p.filter((x) => num(x.pnl_pct) > 0);
+  const losers  = p.filter((x) => num(x.pnl_pct) < 0);
+  const flat    = p.filter((x) => num(x.pnl_pct) === 0);
+
+  const avgWinnerPnl = winners.length > 0
+    ? winners.reduce((s, x) => s + num(x.pnl_pct), 0) / winners.length
+    : 0;
+  const avgLoserPnl = losers.length > 0
+    ? losers.reduce((s, x) => s + num(x.pnl_pct), 0) / losers.length
+    : 0;
+
+  // Per close-reason breakdown — shows which exit drivers contribute the
+  // most aggregate PnL (positive or negative). High-leverage signal for
+  // the agent: it can see e.g. "stop_loss is bleeding -16% across 4 pos"
+  // and weight subsequent decisions accordingly.
+  const byReason = new Map();
+  for (const x of p) {
+    const cat = categorizeCloseReason(x.close_reason);
+    const e = byReason.get(cat) || { count: 0, sum_pnl_pct: 0, sum_fees_usd: 0 };
+    e.count += 1;
+    e.sum_pnl_pct += num(x.pnl_pct);
+    e.sum_fees_usd += num(x.fees_earned_usd);
+    byReason.set(cat, e);
+  }
+  const by_close_reason = {};
+  for (const [cat, e] of byReason) {
+    by_close_reason[cat] = {
+      count: e.count,
+      sum_pnl_pct: Math.round(e.sum_pnl_pct * 100) / 100,
+      avg_pnl_pct: Math.round((e.sum_pnl_pct / e.count) * 100) / 100,
+      sum_fees_usd: Math.round(e.sum_fees_usd * 100) / 100,
+    };
+  }
 
   return {
     total_positions_closed: p.length,
-    total_pnl_usd: Math.round(totalPnl * 100) / 100,
+    total_pnl_usd: Math.round(totalPnlUsd * 100) / 100,
+    total_pnl_pct: Math.round(totalPnlPct * 100) / 100,
     avg_pnl_pct: Math.round(avgPnlPct * 100) / 100,
-    avg_range_efficiency_pct: Math.round(avgRangeEfficiency * 10) / 10,
-    win_rate_pct: Math.round((wins / p.length) * 100),
+    avg_range_efficiency_pct: Math.round(avgRangeEff * 10) / 10,
+    win_rate_pct: Math.round((winners.length / p.length) * 100),
+    winners: winners.length,
+    losers: losers.length,
+    flat: flat.length,
+    avg_winner_pnl_pct: Math.round(avgWinnerPnl * 100) / 100,
+    avg_loser_pnl_pct: Math.round(avgLoserPnl * 100) / 100,
+    by_close_reason,
+    window_days: windowDays ?? null,
     total_lessons: data.lessons.length,
   };
 }
