@@ -21,6 +21,7 @@ import {
   deleteMessage,
   answerCallbackQuery,
   notifyOutOfRange,
+  notifyClose,
   isEnabled as telegramEnabled,
   isMuted as telegramMuted,
   createLiveMessage,
@@ -875,7 +876,20 @@ async function handleRealtimeOor({ positionAddress, poolAddress, activeBin, lowe
     `Fast-close ${positionAddress.slice(0, 8)} pool=${poolAddress.slice(0, 8)} reason=${rule.reason} active=${activeBin} range=[${lower},${upper}]`,
   );
   try {
-    await closePosition({ position_address: positionAddress, reason: `realtime: ${rule.reason}` });
+    const result = await closePosition({ position_address: positionAddress, reason: `realtime: ${rule.reason}` });
+    // Fast-close bypasses the executor, so notifyClose was never called for
+    // this path — that's why profit closes triggered by price pumping above
+    // range never showed up in Telegram. Emit the same notification the
+    // executor would have fired for an LLM-initiated close.
+    if (result?.success) {
+      notifyClose({
+        pair: result.pool_name || positionAddress.slice(0, 8),
+        pnlUsd: result.pnl_usd ?? 0,
+        pnlPct: result.pnl_pct ?? 0,
+      }).catch((err) => log("notify_warn", err.message));
+    } else if (result?.error) {
+      log("realtime_warn", `Fast-close returned failure for ${positionAddress.slice(0, 8)}: ${result.error}`);
+    }
   } catch (err) {
     const msg = String(err?.message || err);
     // Error 3007 (AccountOwnedByWrongProgram / 0xbbf) = position already closed by another flow.
