@@ -887,6 +887,10 @@ async function handleRealtimeOor({ positionAddress, poolAddress, activeBin, lowe
         pnlUsd: result.pnl_usd ?? 0,
         pnlPct: result.pnl_pct ?? 0,
       }).catch((err) => log("notify_warn", err.message));
+    } else if (result?.skipped) {
+      // Another caller (management cron or /close) already holds the close
+      // mutex for this position — expected dedupe, not a failure.
+      log("realtime", `Fast-close deduped for ${positionAddress.slice(0, 8)} — another attempt in flight`);
     } else if (result?.error) {
       log("realtime_warn", `Fast-close returned failure for ${positionAddress.slice(0, 8)}: ${result.error}`);
     }
@@ -921,20 +925,43 @@ async function shutdown(signal) {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-// Fatal error handlers — ensure crashes get logged before the process dies.
-// Node 20+ crashes by default on unhandled rejection; without a handler the
-// process just exits and pm2 restarts it with no breadcrumb of what went wrong.
+// Fatal error handlers — ensure crashes get logged AND Telegram-alerted
+// before the process dies. Node 20+ crashes by default on unhandled rejection;
+// without a handler the process just exits and pm2 restarts it with no
+// breadcrumb of what went wrong.
+let _fatalExitInProgress = false;
+
+async function emitFatalAlert(kind, err) {
+  const brief = err instanceof Error ? err.message : String(err);
+  const stack = err instanceof Error ? err.stack : "";
+  const full = stack ? `${brief}\n${stack}` : brief;
+  log(`fatal_${kind}`, full);
+  // Don't re-enter if a second fatal fires while we're already exiting.
+  if (_fatalExitInProgress) return;
+  _fatalExitInProgress = true;
+  // Best-effort Telegram alert, bounded so a broken endpoint cannot block
+  // the process from exiting and letting pm2 restart it.
+  const alertText =
+    `🚨 FATAL (${kind}): Bot crashed and is restarting\n\n` +
+    brief.slice(0, 600) +
+    `\n\nCheck pm2 logs for the full stack.`;
+  try {
+    await Promise.race([
+      sendMessage(alertText).catch((e) => log("silent_warn", `Fatal alert send failed: ${e.message}`)),
+      new Promise((resolve) => setTimeout(resolve, 2000)),
+    ]);
+  } catch (e) {
+    log("silent_warn", `Fatal alert race failed: ${e.message}`);
+  }
+  process.exit(1);
+}
+
 process.on("unhandledRejection", (reason) => {
-  const msg = reason instanceof Error ? `${reason.message}\n${reason.stack}` : String(reason);
-  log("fatal_rejection", `Unhandled promise rejection: ${msg}`);
-  // Give the logger a moment to flush before exiting.
-  setTimeout(() => process.exit(1), 250);
+  emitFatalAlert("rejection", reason);
 });
 
 process.on("uncaughtException", (err) => {
-  const msg = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
-  log("fatal_exception", `Uncaught exception: ${msg}`);
-  setTimeout(() => process.exit(1), 250);
+  emitFatalAlert("exception", err);
 });
 
 // ═══════════════════════════════════════════

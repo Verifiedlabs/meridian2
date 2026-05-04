@@ -394,6 +394,36 @@ function getDlmmProgramId() {
   return new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
 }
 
+// Tracks which positions currently have a close attempt in flight. Prevents
+// concurrent callers (realtime watcher + management cron + /close command)
+// from each submitting a separate close tx for the same position, which
+// manifests as a flurry of "Transaction simulation failed" errors once the
+// first close lands and rent-reclaims the position account.
+const _closeInFlight = new Set();
+
+/**
+ * Returns true when the given position account no longer exists or is no
+ * longer owned by the DLMM program — i.e. the close tx has landed and the
+ * account was rent-reclaimed back to the System Program. Returns false when
+ * the position is still open. Returns null when the RPC lookup itself fails
+ * (caller should retry or fall back to a different verification).
+ *
+ * Using on-chain ownership as the source of truth is ~10x faster than
+ * polling the Meteora /positions API, which routinely lags several seconds
+ * behind finality. It also avoids false "still appears open" returns that
+ * caused closes to return success:false even when the tx had already landed.
+ */
+async function isPositionClosedOnChain(positionAddress) {
+  try {
+    const accInfo = await getConnection().getAccountInfo(new PublicKey(positionAddress), "confirmed");
+    if (!accInfo) return true; // account does not exist — closed
+    return accInfo.owner.toString() !== getDlmmProgramId().toString();
+  } catch (err) {
+    log("close_warn", `On-chain close check failed for ${positionAddress.slice(0, 8)}: ${err.message}`);
+    return null;
+  }
+}
+
 function formatSolFee(value) {
   const number = Number(value ?? 0);
   return Number.isFinite(number) ? number.toFixed(8).replace(/0+$/, "").replace(/\.$/, "") : "unknown";
@@ -1516,6 +1546,20 @@ export async function closePosition({ position_address, reason }) {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
   }
 
+  // Serialize concurrent callers. Only the first attempt does actual on-chain
+  // work; duplicates return immediately with skipped:true so side effects
+  // (notifyClose, recordClose, pool-memory writes) only fire once per close.
+  if (_closeInFlight.has(position_address)) {
+    log("close", `Close already in flight for ${position_address.slice(0, 8)} — skipping duplicate call`);
+    return {
+      success: false,
+      skipped: true,
+      error: "close already in progress for this position",
+      position: position_address,
+    };
+  }
+  _closeInFlight.add(position_address);
+
   const tracked = getTrackedPosition(position_address);
 
   try {
@@ -1596,26 +1640,26 @@ export async function closePosition({ position_address, reason }) {
         await new Promise((resolve) => setTimeout(resolve, 5000));
         _positionsCacheAt = 0;
 
+        // Verify via on-chain account ownership — survives Meteora API lag
+        // (which can run 10s+ behind finality and used to produce false
+        // "still appears open" returns even after the close tx landed).
         let closedConfirmed = false;
-        for (let attempt = 0; attempt < 4; attempt++) {
-          try {
-            const refreshed = await getMyPositions({ force: true, silent: true });
-            const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
-            if (!stillOpen) {
-              closedConfirmed = true;
-              break;
-            }
-            log("close_warn", `Relay close still appears open after submit (attempt ${attempt + 1}/4)`);
-          } catch (e) {
-            log("close_warn", `Relay close verification failed (attempt ${attempt + 1}/4): ${e.message}`);
+        for (let attempt = 0; attempt < 6; attempt++) {
+          const onChainClosed = await isPositionClosedOnChain(position_address);
+          if (onChainClosed === true) {
+            closedConfirmed = true;
+            break;
           }
-          if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 3000));
+          if (onChainClosed === false) {
+            log("close_warn", `Relay close still open on-chain (attempt ${attempt + 1}/6)`);
+          }
+          if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, 1500));
         }
 
         if (!closedConfirmed) {
           return {
             success: false,
-            error: "Close submit succeeded but position still appears open after verification window",
+            error: "Close submit succeeded but position is still owned by the DLMM program on-chain",
             position: position_address,
             pool: poolAddress,
             close_txs: closeTxHashes,
@@ -1840,26 +1884,27 @@ export async function closePosition({ position_address, reason }) {
     await new Promise(r => setTimeout(r, 5000));
     _positionsCacheAt = 0;
 
+    // Verify via on-chain account ownership — same rationale as the relay
+    // branch above: Meteora's /positions API frequently lags 10s+ behind
+    // finality, so trusting its "still open" signal led to false success:false
+    // returns even when the close tx had already landed.
     let closedConfirmed = false;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      try {
-        const refreshed = await getMyPositions({ force: true, silent: true });
-        const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
-        if (!stillOpen) {
-          closedConfirmed = true;
-          break;
-        }
-        log("close_warn", `Position ${position_address} still appears open after close txs (attempt ${attempt + 1}/4)`);
-      } catch (e) {
-        log("close_warn", `Close verification failed (attempt ${attempt + 1}/4): ${e.message}`);
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const onChainClosed = await isPositionClosedOnChain(position_address);
+      if (onChainClosed === true) {
+        closedConfirmed = true;
+        break;
       }
-      if (attempt < 3) await new Promise((r) => setTimeout(r, 3000));
+      if (onChainClosed === false) {
+        log("close_warn", `Position ${position_address.slice(0, 8)} still open on-chain (attempt ${attempt + 1}/6)`);
+      }
+      if (attempt < 5) await new Promise((r) => setTimeout(r, 1500));
     }
 
     if (!closedConfirmed) {
       return {
         success: false,
-        error: "Close transactions sent but position still appears open after verification window",
+        error: "Close transactions sent but position is still owned by the DLMM program on-chain",
         position: position_address,
         pool: poolAddress,
         claim_txs: claimTxHashes,
@@ -2029,6 +2074,8 @@ export async function closePosition({ position_address, reason }) {
   } catch (error) {
     log("close_error", error.message);
     return { success: false, error: error.message };
+  } finally {
+    _closeInFlight.delete(position_address);
   }
 }
 
