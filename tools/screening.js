@@ -85,7 +85,7 @@ async function enrichPvpRisk(pools) {
       const rivalFees = Number(rival?.fees || 0);
       if (rivalHolders < PVP_MIN_HOLDERS || rivalFees < PVP_MIN_GLOBAL_FEES_SOL) continue;
 
-      const rivalPool = await findRivalPool(rival.id).catch(() => null);
+      const rivalPool = await findRivalPool(rival.id).catch((err) => { log("screening_warn", `findRivalPool failed: ${err.message}`); return null; });
       if (!rivalPool) continue;
 
       pool.is_pvp = true;

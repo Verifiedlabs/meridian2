@@ -57,6 +57,12 @@ import {
   getWatcherStats,
 } from "./src/realtime-watcher.js";
 import { getConnection } from "./rpc.js";
+import { PublicKey } from "@solana/web3.js";
+
+// Meteora DLMM program id — used for on-chain ownership checks to guard
+// against racing closePosition calls after a position has already been
+// closed (which leaves the account owned by the System Program).
+const DLMM_PROGRAM_ID = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -106,7 +112,7 @@ function schedulePeakConfirmation(positionAddress) {
   const timer = setTimeout(async () => {
     _peakConfirmTimers.delete(positionAddress);
     try {
-      const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
+      const result = await getMyPositions({ force: true, silent: true }).catch((err) => { log("silent_warn", err.message); return null; });
       const position = result?.positions?.find((p) => p.position === positionAddress);
       resolvePendingPeak(positionAddress, position?.pnl_pct ?? null, TRAILING_PEAK_CONFIRM_TOLERANCE);
     } catch (error) {
@@ -123,7 +129,7 @@ function scheduleTrailingDropConfirmation(positionAddress) {
   const timer = setTimeout(async () => {
     _trailingDropConfirmTimers.delete(positionAddress);
     try {
-      const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
+      const result = await getMyPositions({ force: true, silent: true }).catch((err) => { log("silent_warn", err.message); return null; });
       const position = result?.positions?.find((p) => p.position === positionAddress);
       const resolved = resolvePendingTrailingDrop(
         positionAddress,
@@ -195,7 +201,7 @@ export async function runManagementCycle({ silent = false } = {}) {
     if (!silent && telegramEnabled() && !telegramMuted("cycle")) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }
-    const livePositions = await getMyPositions({ force: true }).catch(() => null);
+    const livePositions = await getMyPositions({ force: true }).catch((err) => { log("silent_warn", err.message); return null; });
     positions = livePositions?.positions || [];
 
     if (positions.length === 0) {
@@ -338,7 +344,7 @@ After executing, write a brief one-line result per position.
     }
 
     // Trigger screening after management
-    const afterPositions = await getMyPositions({ force: true }).catch(() => null);
+    const afterPositions = await getMyPositions({ force: true }).catch((err) => { log("silent_warn", err.message); return null; });
     const afterCount = afterPositions?.positions?.length ?? 0;
     if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
       log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
@@ -351,14 +357,14 @@ After executing, write a brief one-line result per position.
     _managementBusy = false;
     if (!silent && telegramEnabled()) {
       if (mgmtReport && !telegramMuted("cycle")) {
-        if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
-        else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
+        if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch((err) => log("silent_warn", err.message));
+        else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch((err) => log("silent_warn", err.message));
       } else if (mgmtReport) {
         log("telegram_mute", `Suppressed cycle report — management: ${stripThink(mgmtReport).slice(0, 120)}…`);
       }
       for (const p of positions) {
         if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
+          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch((err) => log("silent_warn", err.message));
         }
       }
     }
@@ -696,8 +702,8 @@ IMPORTANT:
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {
       if (screenReport && !telegramMuted("cycle")) {
-        if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
-        else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
+        if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch((err) => log("silent_warn", err.message));
+        else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch((err) => log("silent_warn", err.message));
       } else if (screenReport) {
         log("telegram_mute", `Suppressed cycle report — screening: ${stripThink(screenReport).slice(0, 120)}…`);
       }
@@ -750,7 +756,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
     if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
     _pnlPollBusy = true;
     try {
-      const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
+      const result = await getMyPositions({ force: true, silent: true }).catch((err) => { log("silent_warn", err.message); return null; });
       if (!result?.positions?.length) return;
       for (const p of result.positions) {
         if (
@@ -837,7 +843,7 @@ async function handleRealtimeOor({ positionAddress, poolAddress, activeBin, lowe
   if (Date.now() - last < 90_000) return;
 
   // Re-fetch positions to get fresh PnL/fee data for deterministic rule eval.
-  const fresh = await getMyPositions({ force: true, silent: true }).catch(() => null);
+  const fresh = await getMyPositions({ force: true, silent: true }).catch((err) => { log("silent_warn", err.message); return null; });
   const pos = fresh?.positions?.find((p) => p.position === positionAddress);
   if (!pos) return; // Already closed by another path.
 
@@ -848,6 +854,21 @@ async function handleRealtimeOor({ positionAddress, poolAddress, activeBin, lowe
     return;
   }
 
+  // Guard against race with management cron: a parallel close may have already
+  // closed this position on-chain. In that case the account gets rent-reclaimed
+  // and becomes owned by the System Program — any further closePosition call
+  // will fail tx simulation with AnchorError 3007 (AccountOwnedByWrongProgram).
+  try {
+    const accInfo = await getConnection().getAccountInfo(new PublicKey(positionAddress), "confirmed");
+    if (!accInfo || accInfo.owner.toString() !== DLMM_PROGRAM_ID) {
+      log("realtime", `Position ${positionAddress.slice(0, 8)} already closed on-chain — skipping`);
+      return;
+    }
+  } catch (err) {
+    // Non-fatal: if ownership check fails, proceed and rely on the safety catch below.
+    log("realtime_warn", `Ownership check failed for ${positionAddress.slice(0, 8)}: ${err.message}`);
+  }
+
   _realtimeCloseAttempts.set(positionAddress, Date.now());
   log(
     "realtime",
@@ -856,7 +877,15 @@ async function handleRealtimeOor({ positionAddress, poolAddress, activeBin, lowe
   try {
     await closePosition({ position_address: positionAddress, reason: `realtime: ${rule.reason}` });
   } catch (err) {
-    log("realtime_error", `closePosition failed for ${positionAddress.slice(0, 8)}: ${err.message}`);
+    const msg = String(err?.message || err);
+    // Error 3007 (AccountOwnedByWrongProgram / 0xbbf) = position already closed by another flow.
+    // Treat as a no-op instead of a crash — stale realtime events are expected when a manager
+    // cron or manual /close beats the WS watcher to the punch.
+    if (/AccountOwnedByWrongProgram|"Custom":\s*3007|0xbbf/.test(msg)) {
+      log("realtime", `Position ${positionAddress.slice(0, 8)} was already closed (safety catch) — no-op`);
+    } else {
+      log("realtime_error", `closePosition failed for ${positionAddress.slice(0, 8)}: ${msg}`);
+    }
   } finally {
     // Don't clear the throttle until next minute — protects against retry storm.
     setTimeout(() => _realtimeCloseAttempts.delete(positionAddress), 90_000);
@@ -869,7 +898,7 @@ async function handleRealtimeOor({ positionAddress, poolAddress, activeBin, lowe
 async function shutdown(signal) {
   log("shutdown", `Received ${signal}. Shutting down...`);
   stopPolling();
-  await shutdownRealtimeWatcher().catch(() => {});
+  await shutdownRealtimeWatcher().catch((err) => log("silent_warn", err.message));
   const positions = await getMyPositions();
   log("shutdown", `Open positions at shutdown: ${positions.total_positions}`);
   process.exit(0);
@@ -877,6 +906,22 @@ async function shutdown(signal) {
 
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+// Fatal error handlers — ensure crashes get logged before the process dies.
+// Node 20+ crashes by default on unhandled rejection; without a handler the
+// process just exits and pm2 restarts it with no breadcrumb of what went wrong.
+process.on("unhandledRejection", (reason) => {
+  const msg = reason instanceof Error ? `${reason.message}\n${reason.stack}` : String(reason);
+  log("fatal_rejection", `Unhandled promise rejection: ${msg}`);
+  // Give the logger a moment to flush before exiting.
+  setTimeout(() => process.exit(1), 250);
+});
+
+process.on("uncaughtException", (err) => {
+  const msg = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
+  log("fatal_exception", `Uncaught exception: ${msg}`);
+  setTimeout(() => process.exit(1), 250);
+});
 
 // ═══════════════════════════════════════════
 //  INTERACTIVE REPL
@@ -1260,8 +1305,8 @@ async function renderControlPanel() {
   let totalPnl = null;
   try {
     const [wallet, posResult] = await Promise.all([
-      getWalletBalances().catch(() => null),
-      getMyPositions({ force: false, silent: true }).catch(() => null),
+      getWalletBalances().catch((err) => { log("silent_warn", err.message); return null; }),
+      getMyPositions({ force: false, silent: true }).catch((err) => { log("silent_warn", err.message); return null; }),
     ]);
     if (wallet) walletSol = wallet.sol ?? 0;
     if (posResult) {
@@ -1885,10 +1930,10 @@ function buildHistoryMessagePlain(limit = 10) {
 // Send history with HTML; if Telegram rejects it, retry as plain text.
 async function sendHistoryMessage(limit = 10) {
   const html = await buildHistoryMessage(limit);
-  const result = await sendHTML(html).catch(() => null);
+  const result = await sendHTML(html).catch((err) => { log("silent_warn", err.message); return null; });
   if (result && result.ok !== false) return;
   // HTML parse failed — fallback to plain text so user always sees something
-  await sendMessage(buildHistoryMessagePlain(limit)).catch(() => {});
+  await sendMessage(buildHistoryMessagePlain(limit)).catch((err) => log("silent_warn", err.message));
 }
 
 // Render a sub-view (Positions / History / Wallet / etc.) in place of the
@@ -1913,7 +1958,7 @@ async function applyControlPanelCallback(msg) {
   const messageId = msg.messageId;
 
   // ack first so Telegram doesn't show the spinner forever
-  const ack = (note) => answerCallbackQuery(msg.callbackQueryId, note).catch(() => {});
+  const ack = (note) => answerCallbackQuery(msg.callbackQueryId, note).catch((err) => log("silent_warn", err.message));
 
   if (action === "refresh" || action === "dashboard") {
     await ack();
@@ -2035,8 +2080,8 @@ async function applyControlPanelCallback(msg) {
     let body;
     try {
       const [wallet, posResult] = await Promise.all([
-        getWalletBalances().catch(() => null),
-        getMyPositions({ force: true }).catch(() => null),
+        getWalletBalances().catch((err) => { log("silent_warn", err.message); return null; }),
+        getMyPositions({ force: true }).catch((err) => { log("silent_warn", err.message); return null; }),
       ]);
       body = buildRiskMessage(wallet, posResult);
     } catch (e) { body = `Error: ${escapeHtml(e.message)}`; }
@@ -2056,7 +2101,7 @@ async function applyControlPanelCallback(msg) {
   if (action === "screen") {
     await ack("Running screening cycle…");
     // show "running" placeholder so user sees something while screening runs
-    await editMessageWithButtons("🔍 <b>Running screening cycle…</b>\n<i>This may take 10–30 seconds.</i>", messageId, [], { parseMode: "HTML" }).catch(() => {});
+    await editMessageWithButtons("🔍 <b>Running screening cycle…</b>\n<i>This may take 10–30 seconds.</i>", messageId, [], { parseMode: "HTML" }).catch((err) => log("silent_warn", err.message));
     let body;
     try { body = await runDeterministicScreen(5); }
     catch (e) { body = `Error: ${e.message}`; }
@@ -2091,7 +2136,7 @@ async function applyControlPanelCallback(msg) {
   }
   if (action === "briefing") {
     await ack("Generating briefing…");
-    await editMessageWithButtons("☀️ <b>Generating briefing…</b>", messageId, [], { parseMode: "HTML" }).catch(() => {});
+    await editMessageWithButtons("☀️ <b>Generating briefing…</b>", messageId, [], { parseMode: "HTML" }).catch((err) => log("silent_warn", err.message));
     let html;
     try { html = await generateBriefing(); }
     catch (e) { html = `Error: ${e.message}`; }
@@ -2103,7 +2148,7 @@ async function applyControlPanelCallback(msg) {
       // fallback if HTML rejected
       await editMessageWithButtons(html.replace(/<[^>]+>/g, ""), messageId,
         [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
-      ).catch(() => {});
+      ).catch((err) => log("silent_warn", err.message));
     });
     return;
   }
@@ -2169,7 +2214,7 @@ async function applyControlPanelCallback(msg) {
         await editMessageWithButtons(
           `🔒 <b>Closing ${positions.length} position(s)…</b>\n<i>Please wait, do not click anything.</i>`,
           messageId, [], { parseMode: "HTML" },
-        ).catch(() => {});
+        ).catch((err) => log("silent_warn", err.message));
         const results = [];
         for (const pos of positions) {
           try {
@@ -2247,8 +2292,8 @@ async function applySettingsMenuCallback(msg) {
     const restorePage = _pendingInput?.page ?? "main";
     _pendingInput = null;
     await answerCallbackQuery(msg.callbackQueryId, "Cancelled");
-    if (promptMsgId) await deleteMessage(promptMsgId).catch(() => {});
-    if (menuMsgId) await showSettingsMenu({ messageId: menuMsgId, page: restorePage }).catch(() => {});
+    if (promptMsgId) await deleteMessage(promptMsgId).catch((err) => log("silent_warn", err.message));
+    if (menuMsgId) await showSettingsMenu({ messageId: menuMsgId, page: restorePage }).catch((err) => log("silent_warn", err.message));
     return;
   }
   if (action === "close") {
@@ -2409,7 +2454,7 @@ async function telegramHandler(msg) {
       }
     }
     const result = await executeTool("update_config", { changes: { [key]: value }, reason: "Telegram input field" });
-    if (promptMsgId) await deleteMessage(promptMsgId).catch(() => {});
+    if (promptMsgId) await deleteMessage(promptMsgId).catch((err) => log("silent_warn", err.message));
     if (!result?.success) {
       await sendMessage(`Failed to update ${key}.`);
       return;
@@ -2421,7 +2466,7 @@ async function telegramHandler(msg) {
     try {
       await applySettingsMenuCallback(msg);
     } catch (e) {
-      await answerCallbackQuery(msg.callbackQueryId, e.message).catch(() => {});
+      await answerCallbackQuery(msg.callbackQueryId, e.message).catch((err) => log("silent_warn", err.message));
     }
     return;
   }
@@ -2429,7 +2474,7 @@ async function telegramHandler(msg) {
     try {
       await applyControlPanelCallback(msg);
     } catch (e) {
-      await answerCallbackQuery(msg.callbackQueryId, e.message).catch(() => {});
+      await answerCallbackQuery(msg.callbackQueryId, e.message).catch((err) => log("silent_warn", err.message));
     }
     return;
   }
@@ -2447,16 +2492,16 @@ async function telegramHandler(msg) {
   }
   if (text === "/lessons") {
     const html = buildLessonsMessage(8);
-    const ok = await sendHTML(html).catch(() => null);
-    if (!ok) await sendMessage(html.replace(/<[^>]+>/g, "")).catch(() => {});
+    const ok = await sendHTML(html).catch((err) => { log("silent_warn", err.message); return null; });
+    if (!ok) await sendMessage(html.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
     return;
   }
   if (_managementBusy || _screeningBusy || busy) {
     if (_telegramQueue.length < 5) {
       _telegramQueue.push(msg);
-      sendMessage(`⏳ Queued (${_telegramQueue.length} in queue): "${text.slice(0, 60)}"`).catch(() => {});
+      sendMessage(`⏳ Queued (${_telegramQueue.length} in queue): "${text.slice(0, 60)}"`).catch((err) => log("silent_warn", err.message));
     } else {
-      sendMessage("Queue is full (5 messages). Wait for the agent to finish.").catch(() => {});
+      sendMessage("Queue is full (5 messages). Wait for the agent to finish.").catch((err) => log("silent_warn", err.message));
     }
     return;
   }
@@ -2466,36 +2511,36 @@ async function telegramHandler(msg) {
       const briefing = await generateBriefing();
       await sendHTML(briefing);
     } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => {});
+      await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
     }
     return;
   }
 
   if (text === "/perf" || text === "/performance") {
     const body = buildPerformanceMessage();
-    const ok = await sendHTML(body).catch(() => null);
-    if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch(() => {});
+    const ok = await sendHTML(body).catch((err) => { log("silent_warn", err.message); return null; });
+    if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
     return;
   }
 
   if (text === "/postmortem" || text === "/pm") {
     const body = buildPostmortemMessage();
-    const ok = await sendHTML(body).catch(() => null);
-    if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch(() => {});
+    const ok = await sendHTML(body).catch((err) => { log("silent_warn", err.message); return null; });
+    if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
     return;
   }
 
   if (text === "/risk") {
     try {
       const [wallet, posResult] = await Promise.all([
-        getWalletBalances().catch(() => null),
-        getMyPositions({ force: true }).catch(() => null),
+        getWalletBalances().catch((err) => { log("silent_warn", err.message); return null; }),
+        getMyPositions({ force: true }).catch((err) => { log("silent_warn", err.message); return null; }),
       ]);
       const body = buildRiskMessage(wallet, posResult);
-      const ok = await sendHTML(body).catch(() => null);
-      if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch(() => {});
+      const ok = await sendHTML(body).catch((err) => { log("silent_warn", err.message); return null; });
+      if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
     } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => {});
+      await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
     }
     return;
   }
@@ -2505,16 +2550,16 @@ async function telegramHandler(msg) {
     try {
       const idx = parseInt(whyMatch[1]) - 1;
       const body = await buildWhyMessage(idx);
-      const ok = await sendHTML(body).catch(() => null);
-      if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch(() => {});
+      const ok = await sendHTML(body).catch((err) => { log("silent_warn", err.message); return null; });
+      if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
     } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => {});
+      await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
     }
     return;
   }
 
   if (text === "/help") {
-    await sendMessage(formatHelpText()).catch(() => {});
+    await sendMessage(formatHelpText()).catch((err) => log("silent_warn", err.message));
     return;
   }
 
@@ -2524,15 +2569,15 @@ async function telegramHandler(msg) {
       const suffix = text === "/status" && positions.total_positions
         ? `\n\nUse /positions for the numbered list.`
         : "";
-      await sendMessage(`${formatWalletStatus(wallet, positions)}${suffix}`).catch(() => {});
+      await sendMessage(`${formatWalletStatus(wallet, positions)}${suffix}`).catch((err) => log("silent_warn", err.message));
     } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => {});
+      await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
     }
     return;
   }
 
   if (text === "/config") {
-    await sendMessage(formatConfigSnapshot()).catch(() => {});
+    await sendMessage(formatConfigSnapshot()).catch((err) => log("silent_warn", err.message));
     return;
   }
 
@@ -2548,7 +2593,7 @@ async function telegramHandler(msg) {
         return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
       });
       await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
-    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message)); }
     return;
   }
 
@@ -2570,7 +2615,7 @@ async function telegramHandler(msg) {
         pos.instruction ? `Note: ${pos.instruction}` : null,
       ].filter(Boolean).join("\n"));
     } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => {});
+      await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
     }
     return;
   }
@@ -2591,7 +2636,7 @@ async function telegramHandler(msg) {
       } else {
         await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
       }
-    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message)); }
     return;
   }
 
@@ -2609,9 +2654,9 @@ async function telegramHandler(msg) {
           results.push(`${pos.pair}: failed (${error.message})`);
         }
       }
-      await sendMessage(`Close-all finished.\n\n${results.join("\n")}`).catch(() => {});
+      await sendMessage(`Close-all finished.\n\n${results.join("\n")}`).catch((err) => log("silent_warn", err.message));
     } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => {});
+      await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
     }
     return;
   }
@@ -2626,7 +2671,7 @@ async function telegramHandler(msg) {
       const pos = positions[idx];
       setPositionInstruction(pos.position, note);
       await sendMessage(`✅ Note set for ${pos.pair}:\n"${note}"`);
-    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message)); }
     return;
   }
 
@@ -2640,27 +2685,27 @@ async function telegramHandler(msg) {
         reason: "Telegram slash command /setcfg",
       });
       if (!result?.success) {
-        await sendMessage(`Config update failed.\nUnknown: ${(result?.unknown || []).join(", ") || "none"}`).catch(() => {});
+        await sendMessage(`Config update failed.\nUnknown: ${(result?.unknown || []).join(", ") || "none"}`).catch((err) => log("silent_warn", err.message));
         return;
       }
-      await sendMessage(`✅ Updated ${key} = ${JSON.stringify(value)}`).catch(() => {});
+      await sendMessage(`✅ Updated ${key} = ${JSON.stringify(value)}`).catch((err) => log("silent_warn", err.message));
     } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => {});
+      await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
     }
     return;
   }
 
   if (text === "/screen") {
     try {
-      await sendMessage(await runDeterministicScreen(5)).catch(() => {});
+      await sendMessage(await runDeterministicScreen(5)).catch((err) => log("silent_warn", err.message));
     } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => {});
+      await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
     }
     return;
   }
 
   if (text === "/candidates") {
-    await sendMessage(describeLatestCandidates(5)).catch(() => {});
+    await sendMessage(describeLatestCandidates(5)).catch((err) => log("silent_warn", err.message));
     return;
   }
 
@@ -2679,9 +2724,9 @@ async function telegramHandler(msg) {
         coverage,
         `Position: ${result.position || "n/a"}`,
         result.txs?.length ? `Tx: ${result.txs[0]}` : null,
-      ].filter(Boolean).join("\n")).catch(() => {});
+      ].filter(Boolean).join("\n")).catch((err) => log("silent_warn", err.message));
     } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => {});
+      await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
     }
     return;
   }
@@ -2689,7 +2734,7 @@ async function telegramHandler(msg) {
   if (text === "/pause") {
     stopCronJobs();
     cronStarted = false;
-    await sendMessage("⏸ Paused autonomous cycles. Telegram control still works. Use /resume to start again.").catch(() => {});
+    await sendMessage("⏸ Paused autonomous cycles. Telegram control still works. Use /resume to start again.").catch((err) => log("silent_warn", err.message));
     return;
   }
 
@@ -2699,9 +2744,9 @@ async function telegramHandler(msg) {
       timers.managementLastRun = Date.now();
       timers.screeningLastRun = Date.now();
       startCronJobs();
-      await sendMessage("▶️ Autonomous cycles resumed.").catch(() => {});
+      await sendMessage("▶️ Autonomous cycles resumed.").catch((err) => log("silent_warn", err.message));
     } else {
-      await sendMessage("Autonomous cycles are already running.").catch(() => {});
+      await sendMessage("Autonomous cycles are already running.").catch((err) => log("silent_warn", err.message));
     }
     return;
   }
@@ -2711,7 +2756,7 @@ async function telegramHandler(msg) {
       const enabled = isHiveMindEnabled();
       const agentId = ensureAgentId();
       if (!enabled) {
-        await sendMessage(`HiveMind: disabled\nAgent ID: ${agentId}\nSet hiveMindApiKey to connect.`).catch(() => {});
+        await sendMessage(`HiveMind: disabled\nAgent ID: ${agentId}\nSet hiveMindApiKey to connect.`).catch((err) => log("silent_warn", err.message));
         return;
       }
       const isManualPull = text === "/hive pull";
@@ -2730,9 +2775,9 @@ async function telegramHandler(msg) {
         `Shared lessons: ${Array.isArray(lessons) ? lessons.length : (pullMode === "manual" ? "manual" : 0)}`,
         `Presets: ${Array.isArray(presets) ? presets.length : (pullMode === "manual" ? "manual" : 0)}`,
         isManualPull ? "Manual pull: completed" : null,
-      ].join("\n")).catch(() => {});
+      ].join("\n")).catch((err) => log("silent_warn", err.message));
     } catch (e) {
-      await sendMessage(`HiveMind error: ${e.message}`).catch(() => {});
+      await sendMessage(`HiveMind error: ${e.message}`).catch((err) => log("silent_warn", err.message));
     }
     return;
   }
@@ -2755,12 +2800,12 @@ async function telegramHandler(msg) {
     if (liveMessage) await liveMessage.finalize(stripThink(content));
     else await sendMessage(stripThink(content));
   } catch (e) {
-    if (liveMessage) await liveMessage.fail(e.message).catch(() => {});
-    else await sendMessage(`Error: ${e.message}`).catch(() => {});
+    if (liveMessage) await liveMessage.fail(e.message).catch((err) => log("silent_warn", err.message));
+    else await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
   } finally {
     busy = false;
     refreshPrompt();
-    drainTelegramQueue().catch(() => {});
+    drainTelegramQueue().catch((err) => log("silent_warn", err.message));
   }
 }
 
@@ -2846,7 +2891,7 @@ if (isTTY) {
 
   // Always start autonomous cycles on launch
   launchCron();
-  maybeRunMissedBriefing().catch(() => { });
+  maybeRunMissedBriefing().catch((err) => log("silent_warn", err.message));
 
   startPolling(telegramHandler);
 
@@ -3060,10 +3105,16 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
   rl.on("close", () => shutdown("stdin closed"));
 
 } else {
-  // Non-TTY: start immediately
+  // Non-TTY: start immediately. Must mirror launchCron() in TTY mode, i.e.
+  // set the cronStarted flag and seed timers — otherwise Telegram control
+  // panel reports the bot as paused (showing "▶️ Resume") and the
+  // update_config restarter callback becomes a no-op until manual /resume.
   log("startup", "Non-TTY mode — starting cron cycles immediately.");
+  cronStarted = true;
+  timers.managementLastRun = Date.now();
+  timers.screeningLastRun = Date.now();
   startCronJobs();
-  maybeRunMissedBriefing().catch(() => { });
+  maybeRunMissedBriefing().catch((err) => log("silent_warn", err.message));
   startPolling(telegramHandler);
   (async () => {
     try {

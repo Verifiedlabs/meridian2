@@ -20,9 +20,12 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-evolve-test-"));
 const originalCwd = process.cwd();
 process.chdir(tmpDir);
 
-// Mock fs.writeFileSync globally so evolveThresholds doesn't clobber the
-// real user-config.json or lessons.json. Read paths still go to disk.
+// Mock fs writes globally so evolveThresholds doesn't clobber the real
+// user-config.json or lessons.json. Read paths still go to disk.
+// We mock both writeFileSync and renameSync because writeJsonAtomicSync
+// (fs-utils.js) uses a write-to-tmp + rename pattern.
 const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {});
+const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation(() => {});
 const existsSpy = vi.spyOn(fs, "existsSync").mockImplementation(() => false);
 
 const { evolveThresholds } = await import("../lessons.js");
@@ -146,5 +149,6 @@ afterAll(() => {
   process.chdir(originalCwd);
   fs.rmSync(tmpDir, { recursive: true, force: true });
   writeSpy.mockRestore();
+  renameSpy.mockRestore();
   existsSpy.mockRestore();
 });

@@ -1,3 +1,5 @@
+import { log } from "../logger.js";
+
 const DATAPI_BASE = "https://datapi.jup.ag/v1";
 
 /**
@@ -62,7 +64,7 @@ export async function getTokenInfo({ query }) {
   if (results[0]?.mint) {
     const { getAdvancedInfo, getClusterList } = await import("./okx.js");
     const [adv, clusters] = await Promise.all([
-      getAdvancedInfo(results[0].mint).catch(() => null),
+      getAdvancedInfo(results[0].mint).catch((err) => { log("token_warn", `getAdvancedInfo failed: ${err.message}`); return null; }),
       getClusterList(results[0].mint).catch(() => []),
     ]);
     if (adv) {
@@ -127,7 +129,7 @@ export async function getTokenHolders({ mint, limit = 20 }) {
   // ─── Bundle / Cluster Analysis (OKX) ─────────────────────────
   const { getAdvancedInfo, getClusterList } = await import("./okx.js");
   const [advancedData, clusterList] = await Promise.all([
-    getAdvancedInfo(mint).catch(() => null),
+    getAdvancedInfo(mint).catch((err) => { log("token_warn", `getAdvancedInfo(${mint.slice(0,8)}) failed: ${err.message}`); return null; }),
     getClusterList(mint).catch(() => []),
   ]);
 
@@ -141,7 +143,7 @@ export async function getTokenHolders({ mint, limit = 20 }) {
     const addresses = smartWallets.map((w) => w.address).join(",");
     const kwRes = await fetch(
       `${DATAPI_BASE}/holders/${mint}?addresses=${addresses}`
-    ).catch(() => null);
+    ).catch((err) => { log("token_warn", `holders fetch failed: ${err.message}`); return null; });
     const kwData = kwRes?.ok ? await kwRes.json() : null;
     const kwHolders = Array.isArray(kwData) ? kwData : (kwData?.holders || kwData?.data || []);
 

@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import { writeJsonAtomicSync } from "./fs-utils.js";
 import { log } from "./logger.js";
 import { config } from "./config.js";
 
@@ -23,7 +24,7 @@ function readJson(filePath, fallback) {
 }
 
 function writeJson(filePath, value) {
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
+  writeJsonAtomicSync(filePath, value);
 }
 
 function sanitizeText(text, maxLen = 400) {

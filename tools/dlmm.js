@@ -753,7 +753,7 @@ export async function deployPosition({
 
       await new Promise((resolve) => setTimeout(resolve, 5000));
       _positionsCacheAt = 0;
-      const refreshed = await getMyPositions({ force: true, silent: true }).catch(() => null);
+      const refreshed = await getMyPositions({ force: true, silent: true }).catch((err) => { log("dlmm_warn", `positions refresh failed: ${err.message}`); return null; });
       const matching = refreshed?.positions?.find(
         (position) => position.pool === pool_address && position.lower_bin === minBinId && position.upper_bin === maxBinId,
       ) || refreshed?.positions?.find((position) => position.pool === pool_address);

@@ -1,4 +1,5 @@
 import fs from "fs";
+import { writeJsonAtomicSync } from "./fs-utils.js";
 
 const DECISION_LOG_FILE = "./decision-log.json";
 const MAX_DECISIONS = 100;
@@ -15,7 +16,7 @@ function load() {
 }
 
 function save(data) {
-  fs.writeFileSync(DECISION_LOG_FILE, JSON.stringify(data, null, 2));
+  writeJsonAtomicSync(DECISION_LOG_FILE, data);
 }
 
 function sanitize(value, maxLen = 280) {

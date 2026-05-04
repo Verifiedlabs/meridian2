@@ -6,6 +6,7 @@
  */
 
 import fs from "fs";
+import { writeJsonAtomicSync } from "./fs-utils.js";
 import { log } from "./logger.js";
 import { config } from "./config.js";
 
@@ -33,7 +34,7 @@ function load() {
 }
 
 function save(data) {
-  fs.writeFileSync(POOL_MEMORY_FILE, JSON.stringify(data, null, 2));
+  writeJsonAtomicSync(POOL_MEMORY_FILE, data);
 }
 
 function isOorCloseReason(reason) {

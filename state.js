@@ -9,6 +9,7 @@
  */
 
 import fs from "fs";
+import { writeJsonAtomicSync } from "./fs-utils.js";
 import { log } from "./logger.js";
 import { getEffectiveTrailingParams } from "./src/adaptive-trailing.js";
 
@@ -43,7 +44,7 @@ function load() {
 function save(state) {
   try {
     state.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    writeJsonAtomicSync(STATE_FILE, state);
   } catch (err) {
     log("state_error", `Failed to write state.json: ${err.message}`);
   }

@@ -6,6 +6,7 @@
  */
 
 import fs from "fs";
+import { writeJsonAtomicSync } from "./fs-utils.js";
 import { log } from "./logger.js";
 
 const BLACKLIST_FILE = "./token-blacklist.json";
@@ -20,7 +21,7 @@ function load() {
 }
 
 function save(data) {
-  fs.writeFileSync(BLACKLIST_FILE, JSON.stringify(data, null, 2));
+  writeJsonAtomicSync(BLACKLIST_FILE, data);
 }
 
 // ─── Check ─────────────────────────────────────────────────────

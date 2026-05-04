@@ -208,7 +208,7 @@ async function fetchLocal(symbol) {
   }
 
   // Resolve captured promises
-  const responses = await Promise.all(captured.map(p => p.catch(() => null)));
+  const responses = await Promise.all(captured.map(p => p.catch((err) => { log("twitter_warn", `tweet fetch failed: ${err.message}`); return null; })));
   const tweets = [];
   for (const data of responses) {
     if (data) tweets.push(...parseGraphQLTweets(data));

@@ -337,7 +337,7 @@ async function fetchPoolDetailDirect(poolAddress) {
 async function pickBestPool(pools) {
   const details = await Promise.all(
     pools.map((pool) =>
-      fetchPoolDetailDirect(pool.address || pool.pool_address).catch(() => null)
+      fetchPoolDetailDirect(pool.address || pool.pool_address).catch((err) => { log("gmgn_warn", `fetchPoolDetailDirect failed: ${err.message}`); return null; })
     )
   );
   if (pools.length <= 1) return { pool: pools[0] ?? null, detail: details[0] ?? null };

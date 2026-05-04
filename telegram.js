@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { writeJsonAtomicSync } from "./fs-utils.js";
 import { log } from "./logger.js";
 import { config } from "./config.js";
 
@@ -39,7 +40,7 @@ function saveChatId(id) {
       ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
       : {};
     cfg.telegramChatId = id;
-    fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    writeJsonAtomicSync(USER_CONFIG_PATH, cfg);
   } catch (e) {
     log("telegram_error", `Failed to persist chatId: ${e.message}`);
   }

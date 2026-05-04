@@ -9,6 +9,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { writeJsonAtomicSync } from "./fs-utils.js";
 import { log } from "./logger.js";
 import { getSharedLessonsForPrompt, pushHiveLesson, pushHivePerformanceEvent } from "./hivemind.js";
 
@@ -43,7 +44,7 @@ function load() {
 }
 
 function save(data) {
-  fs.writeFileSync(LESSONS_FILE, JSON.stringify(data, null, 2));
+  writeJsonAtomicSync(LESSONS_FILE, data);
 }
 
 // ─── Record Position Performance ──────────────────────────────
@@ -447,7 +448,7 @@ export function evolveThresholds(perfData, config) {
   userConfig._lastEvolved = new Date().toISOString();
   userConfig._positionsAtEvolution = perfData.length;
 
-  fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+  writeJsonAtomicSync(USER_CONFIG_PATH, userConfig);
 
   // Apply to live config object immediately
   const s = config.screening;

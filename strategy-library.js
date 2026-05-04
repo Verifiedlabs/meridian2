@@ -7,6 +7,7 @@
  */
 
 import fs from "fs";
+import { writeJsonAtomicSync } from "./fs-utils.js";
 import { log } from "./logger.js";
 
 const STRATEGY_FILE = "./strategy-library.json";
@@ -21,7 +22,7 @@ function load() {
 }
 
 function save(data) {
-  fs.writeFileSync(STRATEGY_FILE, JSON.stringify(data, null, 2));
+  writeJsonAtomicSync(STRATEGY_FILE, data);
 }
 
 // ─── Tool Handlers ─────────────────────────────────────────────
