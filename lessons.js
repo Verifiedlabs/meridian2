@@ -110,8 +110,24 @@ export async function recordPerformance(perf) {
     return;
   }
 
+  // Carry the exploration flag from the tracked position state if the
+  // caller didn't pass it explicitly. This lets recordPerformance be
+  // invoked from any close-path (executor, realtime watcher, manual)
+  // without each call site having to thread the flag through.
+  let explorationFlag = perf.exploration;
+  if (explorationFlag == null && perf.position) {
+    try {
+      const { getTrackedPosition } = await import("./state.js");
+      const tracked = getTrackedPosition(perf.position);
+      if (tracked && typeof tracked.exploration === "boolean") {
+        explorationFlag = tracked.exploration;
+      }
+    } catch { /* state lookup is non-critical */ }
+  }
+
   const entry = {
     ...perf,
+    exploration: !!explorationFlag,
     pnl_usd: Math.round(pnl_usd * 100) / 100,
     pnl_pct: Math.round(pnl_pct * 100) / 100,
     range_efficiency: Math.round(range_efficiency * 10) / 10,
@@ -176,6 +192,8 @@ export async function recordPerformance(perf) {
       const wResult = recalculateWeights(data.performance, config);
       if (wResult.changes.length > 0) {
         log("evolve", `Darwin: adjusted ${wResult.changes.length} signal weight(s)`);
+      } else if (wResult.validation && !wResult.validation.commit) {
+        log("evolve", `Darwin: skipped recalc — ${wResult.validation.reason}`);
       }
     }
   }
@@ -187,6 +205,40 @@ export async function recordPerformance(perf) {
     eventId: `close:${perf.position}:${entry.recorded_at}`,
   });
 
+  // Feed the drawdown circuit breaker. Approximate SOL PnL from pnl_pct ×
+  // amount_sol — accurate enough for breaker thresholds (a 5% loss on a
+  // 0.5 SOL deploy is ~0.025 SOL regardless of SOL/USD).
+  try {
+    const { recordClose, getStatus } = await import("./src/circuit-breaker.js");
+    const amountSol = Number.isFinite(perf.amount_sol) ? perf.amount_sol : 0;
+    const pnlSol = (entry.pnl_pct / 100) * amountSol;
+    const trip = recordClose({
+      pnl_sol: pnlSol,
+      pnl_pct: entry.pnl_pct,
+      position: perf.position,
+      pool_name: perf.pool_name,
+    });
+    if (trip.justTripped) {
+      const status = getStatus();
+      const resumeIn = status.willResumeAt
+        ? `Auto-resume at ${status.willResumeAt}`
+        : `Auto-resume after cooldown`;
+      const text =
+        `🛑 Drawdown breaker tripped: ${trip.reason}\n\n` +
+        `Recent: ${status.recentLosses}/${status.recentTotal} losses\n` +
+        `24h PnL: ${status.dailyPnlSol} SOL (cap: -${status.maxDailyLossSol})\n` +
+        `Screening paused. ${resumeIn}.\n\n` +
+        `/resume to clear immediately.`;
+      try {
+        const { sendMessage } = await import("./telegram.js");
+        await sendMessage(text).catch((err) => log("silent_warn", `Breaker alert failed: ${err.message}`));
+      } catch (err) {
+        log("silent_warn", `Breaker alert dispatch failed: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    log("silent_warn", `Circuit breaker recordClose failed: ${err.message}`);
+  }
 }
 
 /**
@@ -853,6 +905,27 @@ export function getPerformanceSummary(opts = {}) {
     };
   }
 
+  // Bucket by exploration flag so we can empirically check whether
+  // exploration cycles are pulling in profitable pools that the normal
+  // (Darwin-weighted) cycles would have rejected. Skipped entirely
+  // until we have at least one exploration record.
+  const explorationRecords = p.filter((x) => x.exploration === true);
+  const normalRecords = p.filter((x) => x.exploration !== true);
+  function bucketStats(records) {
+    if (records.length === 0) return null;
+    const wins = records.filter((x) => num(x.pnl_pct) > 0);
+    const sumPct = records.reduce((s, x) => s + num(x.pnl_pct), 0);
+    return {
+      count:        records.length,
+      win_rate_pct: Math.round((wins.length / records.length) * 100),
+      avg_pnl_pct:  Math.round((sumPct / records.length) * 100) / 100,
+      total_pnl_pct: Math.round(sumPct * 100) / 100,
+    };
+  }
+  const by_exploration = explorationRecords.length > 0
+    ? { exploration: bucketStats(explorationRecords), normal: bucketStats(normalRecords) }
+    : null;
+
   return {
     total_positions_closed: p.length,
     total_pnl_usd: Math.round(totalPnlUsd * 100) / 100,
@@ -866,6 +939,7 @@ export function getPerformanceSummary(opts = {}) {
     avg_winner_pnl_pct: Math.round(avgWinnerPnl * 100) / 100,
     avg_loser_pnl_pct: Math.round(avgLoserPnl * 100) / 100,
     by_close_reason,
+    by_exploration,
     window_days: windowDays ?? null,
     total_lessons: data.lessons.length,
   };

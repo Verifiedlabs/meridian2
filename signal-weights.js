@@ -87,11 +87,83 @@ export function saveWeights(data) {
 // ─── Core Algorithm ──────────────────────────────────────────────
 
 /**
+ * Split records into a deterministic 80% train / 20% holdout. Every 5th
+ * record (stride=5, offset=4) is held out; the rest are train. This keeps
+ * recent and old records distributed across both sets so neither bucket
+ * over-fits a particular regime.
+ */
+export function splitTrainHoldout(records, holdoutRatio = 0.2) {
+  if (!Array.isArray(records) || records.length === 0) {
+    return { train: [], holdout: [] };
+  }
+  const stride = Math.max(2, Math.round(1 / holdoutRatio));
+  const train = [];
+  const holdout = [];
+  for (let i = 0; i < records.length; i++) {
+    if (i % stride === stride - 1) holdout.push(records[i]);
+    else train.push(records[i]);
+  }
+  return { train, holdout };
+}
+
+/**
+ * Check whether the lift directions computed on train data are consistent
+ * with the lift directions computed on holdout. Returns an object with a
+ * `commit` boolean and explanatory metadata.
+ *
+ * Intuition: if a signal's lift is +0.3 on train but -0.1 on holdout, the
+ * train signal is likely noise — applying weight changes from it would
+ * amplify a bad pattern. We require ≥50% of validated signals to agree
+ * in direction before allowing the recalculation to commit.
+ */
+export function assessTrainHoldoutConsistency(train, holdout, minSamples = 10) {
+  const trainWins   = train.filter((p) => (p.pnl_usd ?? 0) > 0);
+  const trainLosses = train.filter((p) => (p.pnl_usd ?? 0) <= 0);
+  const holdWins    = holdout.filter((p) => (p.pnl_usd ?? 0) > 0);
+  const holdLosses  = holdout.filter((p) => (p.pnl_usd ?? 0) <= 0);
+
+  // If either side lacks bucket coverage, validation cannot run — defer to
+  // the existing min-samples gate by signaling commit=true with a reason.
+  if (trainWins.length === 0 || trainLosses.length === 0) {
+    return { commit: false, reason: "train missing wins or losses", signTotal: 0, signMatches: 0 };
+  }
+  if (holdWins.length === 0 || holdLosses.length === 0) {
+    return { commit: true, reason: "holdout missing buckets — validation skipped", signTotal: 0, signMatches: 0 };
+  }
+
+  let signMatches = 0;
+  let signTotal = 0;
+  for (const signal of SIGNAL_NAMES) {
+    // Use a relaxed minSamples for the holdout side since it's smaller.
+    const tLift = computeLift(signal, trainWins, trainLosses, Math.min(minSamples, trainWins.length + trainLosses.length));
+    const hLift = computeLift(signal, holdWins, holdLosses, Math.min(3, holdWins.length + holdLosses.length));
+    if (tLift == null || hLift == null) continue;
+    signTotal += 1;
+    // Sign match — both positive, both negative, or both ~zero (within 1e-6)
+    const tSign = Math.abs(tLift) < 1e-6 ? 0 : Math.sign(tLift);
+    const hSign = Math.abs(hLift) < 1e-6 ? 0 : Math.sign(hLift);
+    if (tSign === hSign) signMatches += 1;
+  }
+
+  // Need at least 3 signals validated to make a reliable judgment. Below
+  // that, defer to existing behavior (commit allowed).
+  if (signTotal < 3) {
+    return { commit: true, reason: `only ${signTotal} signal(s) validated — too few, accepting`, signTotal, signMatches };
+  }
+
+  const agreement = signMatches / signTotal;
+  if (agreement >= 0.5) {
+    return { commit: true, reason: `holdout agreement ${signMatches}/${signTotal} (${Math.round(agreement * 100)}%)`, signTotal, signMatches };
+  }
+  return { commit: false, reason: `holdout disagreement ${signMatches}/${signTotal} (${Math.round(agreement * 100)}%) — likely noise`, signTotal, signMatches };
+}
+
+/**
  * Recalculate signal weights based on actual position performance.
  *
  * @param {Array}  perfData - Array of performance records (from lessons.json)
  * @param {Object} cfg      - Live config object (reads cfg.darwin for tuning)
- * @returns {{ changes: Array, weights: Object }}
+ * @returns {{ changes: Array, weights: Object, validation?: Object }}
  */
 export function recalculateWeights(perfData, cfg = {}) {
   const darwin = cfg.darwin || {};
@@ -125,13 +197,27 @@ export function recalculateWeights(perfData, cfg = {}) {
     return { changes: [], weights };
   }
 
-  // Classify wins and losses
-  const wins   = recent.filter((p) => (p.pnl_usd ?? 0) > 0);
-  const losses = recent.filter((p) => (p.pnl_usd ?? 0) <= 0);
+  // Hold-out validation — split records 80/20 and check whether train
+  // and holdout agree on the direction of each signal's lift. If the
+  // pattern looks noise-driven, skip the recalc rather than commit
+  // changes that won't generalize.
+  const { train, holdout } = splitTrainHoldout(recent, 0.2);
+  const validation = assessTrainHoldoutConsistency(train, holdout, minSamples);
+  if (!validation.commit) {
+    log("signal_weights", `Skipped recalc: ${validation.reason}`);
+    return { changes: [], weights, validation };
+  }
+
+  // Classify wins and losses (use TRAIN only for weight computation so the
+  // holdout truly is held out from the fit). Falls back to recent when
+  // train is too small to be useful.
+  const fitData = train.length >= Math.max(5, minSamples - 2) ? train : recent;
+  const wins   = fitData.filter((p) => (p.pnl_usd ?? 0) > 0);
+  const losses = fitData.filter((p) => (p.pnl_usd ?? 0) <= 0);
 
   if (wins.length === 0 || losses.length === 0) {
     log("signal_weights", `Need both wins (${wins.length}) and losses (${losses.length}) to compute lift, skipping`);
-    return { changes: [], weights };
+    return { changes: [], weights, validation };
   }
 
   // Compute predictive lift for each signal

@@ -150,4 +150,45 @@ describe("getPerformanceSummary", () => {
     expect(s.by_close_reason.stop_loss.count).toBe(1);
     expect(s.by_close_reason.stop_loss.sum_pnl_pct).toBe(-6);
   });
+
+  it("by_exploration is null when no exploration records exist", () => {
+    writeLessons([
+      { pnl_usd: 1, pnl_pct: 4, range_efficiency: 100, close_reason: "take profit", recorded_at: "2026-04-30T00:00:00Z" },
+      { pnl_usd: -1, pnl_pct: -4, range_efficiency: 80, close_reason: "stop loss", recorded_at: "2026-04-30T01:00:00Z" },
+    ]);
+    const s = getPerformanceSummary();
+    expect(s.by_exploration).toBe(null);
+  });
+
+  it("by_exploration buckets normal vs exploration when mixed", () => {
+    writeLessons([
+      // 2 normal: 1 win, 1 loss → 50% WR
+      { pnl_usd: 1, pnl_pct: 4, exploration: false, close_reason: "take profit", recorded_at: "2026-04-30T00:00:00Z" },
+      { pnl_usd: -1, pnl_pct: -4, exploration: false, close_reason: "stop loss", recorded_at: "2026-04-30T01:00:00Z" },
+      // 3 exploration: 2 wins, 1 loss → 67% WR
+      { pnl_usd: 1, pnl_pct: 5, exploration: true, close_reason: "take profit", recorded_at: "2026-04-30T02:00:00Z" },
+      { pnl_usd: 1, pnl_pct: 6, exploration: true, close_reason: "take profit", recorded_at: "2026-04-30T03:00:00Z" },
+      { pnl_usd: -1, pnl_pct: -3, exploration: true, close_reason: "stop loss", recorded_at: "2026-04-30T04:00:00Z" },
+    ]);
+    const s = getPerformanceSummary();
+    expect(s.by_exploration).not.toBe(null);
+    expect(s.by_exploration.normal.count).toBe(2);
+    expect(s.by_exploration.normal.win_rate_pct).toBe(50);
+    expect(s.by_exploration.exploration.count).toBe(3);
+    expect(s.by_exploration.exploration.win_rate_pct).toBe(67);
+    expect(s.by_exploration.exploration.total_pnl_pct).toBe(8); // 5 + 6 + -3
+    expect(s.by_exploration.exploration.avg_pnl_pct).toBeCloseTo(2.67, 1);
+  });
+
+  it("by_exploration treats missing exploration field as normal", () => {
+    writeLessons([
+      // No exploration field — should bucket as normal
+      { pnl_usd: 1, pnl_pct: 4, close_reason: "take profit", recorded_at: "2026-04-30T00:00:00Z" },
+      // Explicit exploration: true
+      { pnl_usd: 1, pnl_pct: 5, exploration: true, close_reason: "take profit", recorded_at: "2026-04-30T01:00:00Z" },
+    ]);
+    const s = getPerformanceSummary();
+    expect(s.by_exploration.normal.count).toBe(1);
+    expect(s.by_exploration.exploration.count).toBe(1);
+  });
 });

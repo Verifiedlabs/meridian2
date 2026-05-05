@@ -27,7 +27,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, setPositionExploration, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -57,6 +57,11 @@ import {
   shutdownRealtimeWatcher,
   getWatcherStats,
 } from "./src/realtime-watcher.js";
+import {
+  isScreeningPaused as isScreeningPausedByBreaker,
+  getStatus as getBreakerStatus,
+  resume as resumeBreaker,
+} from "./src/circuit-breaker.js";
 import { getConnection } from "./rpc.js";
 import { PublicKey } from "@solana/web3.js";
 
@@ -385,6 +390,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
   let prePositions, preBalance;
   let liveMessage = null;
   let screenReport = null;
+  // Exploration mode: a fraction of cycles bypass Darwin weights + relax
+  // thresholds so the bot keeps probing pools just outside its learned
+  // comfort zone. Decided after pre-checks; readable from the finally
+  // block so we can tag any newly-deployed positions accordingly.
+  let explorationMode = false;
+  let prePositionAddrs = new Set();
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
     if (prePositions.total_positions >= config.risk.maxPositions) {
@@ -413,6 +424,33 @@ export async function runScreeningCycle({ silent = false } = {}) {
       _screeningBusy = false;
       return screenReport;
     }
+    // Drawdown circuit breaker — auto-pauses screening after a losing streak
+    // or after the rolling 24h SOL PnL trips the configured cap. Management
+    // cycles still run; only new deploys are blocked. isScreeningPaused()
+    // also performs auto-resume when the cooldown has elapsed.
+    if (isScreeningPausedByBreaker()) {
+      const bs = getBreakerStatus();
+      const reasonLine = `${bs.reason || "drawdown"} (resumes ${bs.willResumeAt || "after cooldown"})`;
+      log("cron", `Screening skipped — circuit breaker active: ${reasonLine}`);
+      screenReport = `Screening skipped — circuit breaker active: ${reasonLine}.`;
+      appendDecision({
+        type: "skip",
+        actor: "SCREENER",
+        summary: "Screening skipped",
+        reason: `Circuit breaker: ${bs.reason}`,
+      });
+      _screeningBusy = false;
+      return screenReport;
+    }
+    // Capture pre-cycle position addresses so we can identify which
+    // positions were newly deployed during this cycle (for exploration tagging).
+    prePositionAddrs = new Set((prePositions.positions || []).map((p) => p.position));
+    // Decide exploration mode for this cycle. Math.random is called once
+    // per cycle so behavior is deterministic within the cycle.
+    const explorationRate = Number.isFinite(config.darwin?.explorationRate)
+      ? Math.max(0, Math.min(1, config.darwin.explorationRate))
+      : 0;
+    explorationMode = explorationRate > 0 && Math.random() < explorationRate;
   } catch (e) {
     log("cron_error", `Screening pre-check failed: ${e.message}`);
     screenReport = `Screening pre-check failed: ${e.message}`;
@@ -436,8 +474,20 @@ export async function runScreeningCycle({ silent = false } = {}) {
       ? `ACTIVE STRATEGY: ${activeStrategy.name} — LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED — never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
       : `No active strategy — use strategy=${config.strategy.strategy}, bins_above=0, SOL only.`;
 
+    // Build relaxed threshold overrides when in exploration mode so the
+    // candidate fetch returns pools just outside the normal comfort zone.
+    let screeningOverrides = null;
+    if (explorationMode) {
+      const m = config.darwin?.explorationMultipliers || {};
+      const cur = config.screening;
+      screeningOverrides = {
+        maxVolatility: Number.isFinite(m.maxVolatility) ? cur.maxVolatility * m.maxVolatility : cur.maxVolatility,
+        minOrganic:    Number.isFinite(m.minOrganicDelta) ? Math.max(0, cur.minOrganic + m.minOrganicDelta) : cur.minOrganic,
+      };
+      log("cron", `🔍 EXPLORATION MODE — relaxed thresholds: maxVolatility ${cur.maxVolatility}→${screeningOverrides.maxVolatility}, minOrganic ${cur.minOrganic}→${screeningOverrides.minOrganic}`);
+    }
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
-    const topCandidates = await getTopCandidates({ limit: 10 }).catch((e) => ({ _error: e.message }));
+    const topCandidates = await getTopCandidates({ limit: 10, screeningOverrides }).catch((e) => ({ _error: e.message }));
     if (topCandidates?._error) {
       screenReport = `Screening failed: ${topCandidates._error}`;
       return screenReport;
@@ -613,8 +663,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
 
+    const explorationBanner = explorationMode
+      ? `\n🔍 EXPLORATION CYCLE — thresholds relaxed; treat learned Darwin weights as advisory only and prioritize candidates that look promising on first principles even if they sit outside the usual comfort zone.\n`
+      : "";
     const { content } = await agentLoop(`
-SCREENING CYCLE
+SCREENING CYCLE${explorationBanner}
 ${strategyBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
@@ -701,6 +754,23 @@ IMPORTANT:
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
     _screeningBusy = false;
+    // Tag any positions deployed during this cycle with the exploration
+    // flag so getPerformanceSummary can bucket exploration vs normal
+    // outcomes. Best-effort — failures here must not break the cycle.
+    try {
+      const post = await getMyPositions({ force: true });
+      const newAddrs = (post.positions || [])
+        .map((p) => p.position)
+        .filter((addr) => addr && !prePositionAddrs.has(addr));
+      for (const addr of newAddrs) {
+        setPositionExploration(addr, explorationMode);
+      }
+      if (newAddrs.length > 0) {
+        log("cron", `Tagged ${newAddrs.length} new position(s) exploration=${explorationMode}`);
+      }
+    } catch (err) {
+      log("silent_warn", `Exploration tagging failed: ${err.message}`);
+    }
     if (!silent && telegramEnabled()) {
       if (screenReport && !telegramMuted("cycle")) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch((err) => log("silent_warn", err.message));
@@ -1853,6 +1923,24 @@ function buildRiskMessage(walletInfo, posResult) {
 
     sections.push("");
     sections.push("<i>Worst-case assumes simultaneous SL hit at exact SL%; actual losses can vary with slippage and gas.</i>");
+
+    // ─── Circuit breaker state ───
+    try {
+      const bs = getBreakerStatus();
+      sections.push("");
+      sections.push("<b>Drawdown circuit breaker</b>");
+      if (bs.paused) {
+        sections.push(`  🛑 <b>PAUSED</b>  ·  ${escapeHtml(bs.reason || "drawdown")}`);
+        if (bs.willResumeAt) {
+          sections.push(`  Auto-resume: ${escapeHtml(bs.willResumeAt)}`);
+        }
+        sections.push(`  Use /resume to clear immediately.`);
+      } else {
+        sections.push(`  ✅ Active  ·  ${bs.recentLosses}/${bs.recentTotal} recent losses (trip at ${bs.streakThreshold}/${bs.streakWindow})`);
+        sections.push(`  24h PnL: <b>◎${bs.dailyPnlSol.toFixed(3)}</b> (cap: -${bs.maxDailyLossSol})`);
+      }
+    } catch { /* breaker is non-critical for /risk display */ }
+
     return sections.join("\n");
   } catch (e) {
     return `⚠️ Risk error: ${e.message}`;
@@ -2780,15 +2868,21 @@ async function telegramHandler(msg) {
   }
 
   if (text === "/resume") {
+    const breakerCleared = resumeBreaker({ manual: true });
+    const lines = [];
     if (!cronStarted) {
       cronStarted = true;
       timers.managementLastRun = Date.now();
       timers.screeningLastRun = Date.now();
       startCronJobs();
-      await sendMessage("▶️ Autonomous cycles resumed.").catch((err) => log("silent_warn", err.message));
-    } else {
-      await sendMessage("Autonomous cycles are already running.").catch((err) => log("silent_warn", err.message));
+      lines.push("▶️ Autonomous cycles resumed.");
+    } else if (!breakerCleared.wasResumed) {
+      lines.push("Autonomous cycles are already running.");
     }
+    if (breakerCleared.wasResumed) {
+      lines.push("✅ Drawdown circuit breaker cleared — screening will resume next cycle.");
+    }
+    await sendMessage(lines.join("\n")).catch((err) => log("silent_warn", err.message));
     return;
   }
 

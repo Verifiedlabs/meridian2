@@ -224,6 +224,22 @@ export function setPositionInstruction(position_address, instruction) {
   return true;
 }
 
+/**
+ * Mark a tracked position as having been deployed during an exploration
+ * cycle (relaxed thresholds, Darwin weights bypassed). The flag is read
+ * back at close time by recordPerformance so we can bucket exploration
+ * vs normal outcomes in /perf summaries.
+ */
+export function setPositionExploration(position_address, exploration) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return false;
+  pos.exploration = !!exploration;
+  save(state);
+  log("state", `Position ${position_address} exploration=${pos.exploration}`);
+  return true;
+}
+
 export function queuePeakConfirmation(position_address, candidatePnlPct, options = {}) {
   if (candidatePnlPct == null) return false;
   const state = load();

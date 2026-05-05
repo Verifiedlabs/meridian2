@@ -111,8 +111,13 @@ async function enrichPvpRisk(pools) {
  */
 export async function discoverPools({
   page_size = 50,
+  screeningOverrides = null,
 } = {}) {
-  const s = config.screening;
+  // Merge per-call overrides on top of live config. Used by exploration
+  // cycles to widen filters without mutating shared config state.
+  const s = screeningOverrides
+    ? { ...config.screening, ...screeningOverrides }
+    : config.screening;
   const filters = [
     "base_token_has_critical_warnings=false",
     "quote_token_has_critical_warnings=false",
@@ -267,15 +272,18 @@ export async function discoverPools({
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
-export async function getTopCandidates({ limit = 10 } = {}) {
+export async function getTopCandidates({ limit = 10, screeningOverrides = null } = {}) {
   const { config } = await import("../config.js");
   const source = String(config.screening.source || "meteora").toLowerCase();
   if (!["meteora", "gmgn"].includes(source)) {
     throw new Error(`Invalid screeningSource: ${config.screening.source}. Use meteora or gmgn.`);
   }
+  // GMGN path filters on different metrics (gmgn-specific) so exploration
+  // overrides are only honored on the Meteora discovery path. This is a
+  // pragmatic limitation — GMGN exploration would need separate tuning.
   const discovery = source === "gmgn"
     ? await discoverGmgnPools({ limit: Math.max(limit, config.gmgn.enrichLimit || 20) })
-    : await discoverPools({ page_size: 50 });
+    : await discoverPools({ page_size: 50, screeningOverrides });
   let { pools } = discovery;
   const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
 

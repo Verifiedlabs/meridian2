@@ -58,6 +58,13 @@ export const config = {
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+    // ─── Drawdown circuit breaker ──────────
+    // When recent performance deteriorates the breaker auto-pauses the
+    // screening cycle (management cycles continue). See src/circuit-breaker.js.
+    maxDailyLossSol:           u.maxDailyLossSol           ?? 0.5,   // trip if rolling 24h SOL PnL ≤ -value
+    drawdownStreakThreshold:   u.drawdownStreakThreshold   ?? 7,     // trip if N losses among ...
+    drawdownStreakWindow:      u.drawdownStreakWindow      ?? 10,    // ... last K closes
+    drawdownCooldownMinutes:   u.drawdownCooldownMinutes   ?? 120,   // auto-resume after this many minutes
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -248,6 +255,15 @@ export const config = {
     weightFloor:    u.darwinFloor       ?? 0.3,
     weightCeiling:  u.darwinCeiling     ?? 2.5,
     minSamples:     u.darwinMinSamples  ?? 10,
+    // Exploration budget — fraction of screening cycles that bypass the
+    // current Darwin weights and use relaxed thresholds, so the bot keeps
+    // probing pools just outside its learned comfort zone. Set to 0 to
+    // disable. See runScreeningCycle in index.js.
+    explorationRate:        u.darwinExplorationRate        ?? 0.10,
+    explorationMultipliers: u.darwinExplorationMultipliers ?? {
+      maxVolatility: 1.5,    // multiply current ceiling
+      minOrganicDelta: -10,  // subtract from current floor
+    },
   },
 
   // ─── Common Token Mints ────────────────
