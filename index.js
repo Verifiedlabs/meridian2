@@ -62,6 +62,17 @@ import {
   getStatus as getBreakerStatus,
   resume as resumeBreaker,
 } from "./src/circuit-breaker.js";
+import {
+  generateDigest as generateCoachingDigest,
+  setPendingProposal as setPendingCoachingProposal,
+  approvePendingProposal as approvePendingCoachingProposal,
+  rejectPendingProposal as rejectPendingCoachingProposal,
+  rollbackMemo as rollbackCoachingMemo,
+  getActiveMemos as getActiveCoachingMemos,
+  getPendingProposal as getPendingCoachingProposal,
+} from "./src/coaching.js";
+import { proposeMemoFromDigest } from "./src/coaching-llm.js";
+import { selectTopLessons } from "./lessons.js";
 import { getConnection } from "./rpc.js";
 import { PublicKey } from "@solana/web3.js";
 
@@ -2856,6 +2867,157 @@ async function telegramHandler(msg) {
       ].filter(Boolean).join("\n")).catch((err) => log("silent_warn", err.message));
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
+    }
+    return;
+  }
+
+  // ── /memo : Tier 2 coaching memo lifecycle ─────────────────
+  // Subcommands: list (default) | propose | approve | reject [reason] | rollback <id> | pending
+  const memoMatch = text.match(/^\/memo(?:\s+(\S+)(?:\s+([\s\S]+))?)?$/i);
+  if (memoMatch) {
+    const sub = (memoMatch[1] || "list").toLowerCase();
+    const arg = memoMatch[2] ? memoMatch[2].trim() : null;
+    try {
+      if (sub === "list") {
+        const active = getActiveCoachingMemos();
+        const pending = getPendingCoachingProposal();
+        const lines = [`📋 <b>Coaching Memos</b> — ${active.length} active`];
+        if (active.length === 0) {
+          lines.push("  (none active)");
+        } else {
+          for (const m of active) {
+            const date = String(m.approvedAt || m.createdAt || "").slice(0, 10);
+            lines.push(`\n<code>${m.id}</code> @ ${date}`);
+            for (const r of (m.rules || [])) lines.push(`  • ${escapeHtml(r)}`);
+          }
+        }
+        if (pending) {
+          lines.push(`\n⏳ <b>Pending</b>: <code>${pending.id}</code> (${pending.rules.length} rules, valid=${pending.validation?.ok ? "yes" : "no"})`);
+          lines.push("Use /memo approve or /memo reject");
+        } else {
+          lines.push("\nUse /memo propose to draft a new memo from recent perf.");
+        }
+        const html = lines.join("\n");
+        const ok = await sendHTML(html).catch((err) => { log("silent_warn", err.message); return null; });
+        if (!ok) await sendMessage(html.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
+        return;
+      }
+
+      if (sub === "pending") {
+        const p = getPendingCoachingProposal();
+        if (!p) { await sendMessage("No pending proposal. Use /memo propose to draft one."); return; }
+        const lines = [
+          `⏳ <b>Pending memo</b> <code>${p.id}</code>`,
+          p.summary ? `\n<i>${escapeHtml(p.summary)}</i>` : "",
+          "\nRules:",
+          ...p.rules.map((r, i) => `${i + 1}. ${escapeHtml(r)}`),
+          `\nValidation: ${p.validation?.ok ? "✅ ok" : "⚠️ " + (p.validation?.errors || []).join(", ")}`,
+          "\nUse /memo approve or /memo reject [reason]",
+        ];
+        const html = lines.filter(Boolean).join("\n");
+        const ok = await sendHTML(html).catch((err) => { log("silent_warn", err.message); return null; });
+        if (!ok) await sendMessage(html.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
+        return;
+      }
+
+      if (sub === "propose") {
+        const windowDays = config.coaching?.digestWindowDays ?? 7;
+        const minCloses  = config.coaching?.minClosesForProposal ?? 10;
+        const perfSummary = getPerformanceSummary({ windowDays });
+        if (!perfSummary || perfSummary.total_positions_closed < minCloses) {
+          const have = perfSummary?.total_positions_closed || 0;
+          await sendMessage(`Need ≥ ${minCloses} closes in last ${windowDays}d to propose. Have ${have}.`);
+          return;
+        }
+
+        // Load raw lessons + rank with Tier 1 scorer for digest context.
+        let rankedLessons = [];
+        try {
+          const fs = await import("fs");
+          const data = JSON.parse(fs.default.readFileSync("./lessons.json", "utf8"));
+          rankedLessons = selectTopLessons(data.lessons || [], 10, { now: Date.now() });
+        } catch (e) {
+          log("coaching_warn", `Failed to load lessons for digest: ${e.message}`);
+        }
+
+        const digest = generateCoachingDigest({ perfSummary, lessons: rankedLessons, windowDays });
+        if (!digest.ok) { await sendMessage(`Digest generation failed: ${digest.reason}`); return; }
+
+        await sendMessage(`🧠 Calling LLM to draft memo from ${perfSummary.total_positions_closed} closes (${windowDays}d)...`).catch(() => {});
+
+        let proposal;
+        try {
+          proposal = await proposeMemoFromDigest(digest.text, {
+            model: config.llm.generalModel,
+            maxTokens: config.coaching?.proposalMaxTokens ?? 1500,
+          });
+        } catch (e) {
+          await sendMessage(`❌ LLM proposal failed: ${e.message}`).catch((err) => log("silent_warn", err.message));
+          return;
+        }
+
+        const memo = setPendingCoachingProposal({
+          rules: proposal.rules,
+          summary: proposal.summary,
+          snapshot: digest.snapshot,
+        });
+
+        const lines = [
+          `✅ <b>Proposal staged</b>: <code>${memo.id}</code>`,
+          memo.summary ? `\n<i>${escapeHtml(memo.summary)}</i>` : "",
+          "\nRules:",
+          ...memo.rules.map((r, i) => `${i + 1}. ${escapeHtml(r)}`),
+          `\nValidation: ${memo.validation.ok ? "✅ ok" : "⚠️ " + memo.validation.errors.join(", ")}`,
+          "\nUse /memo approve to activate, /memo reject [reason] to discard.",
+        ];
+        const html = lines.filter(Boolean).join("\n");
+        const ok = await sendHTML(html).catch((err) => { log("silent_warn", err.message); return null; });
+        if (!ok) await sendMessage(html.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
+        return;
+      }
+
+      if (sub === "approve") {
+        const limit = config.coaching?.activeMemoLimit ?? 10;
+        const result = approvePendingCoachingProposal({ activeMemoLimit: limit });
+        if (!result.ok) {
+          if (result.reason === "no_pending") { await sendMessage("No pending proposal to approve."); return; }
+          if (result.reason === "invalid")    { await sendMessage(`Cannot approve invalid proposal: ${(result.errors || []).join(", ")}\nUse /memo reject and /memo propose again.`); return; }
+          await sendMessage(`Approve failed: ${result.reason}`); return;
+        }
+        const okHtml = await sendHTML(
+          `✅ Approved <code>${result.memo.id}</code> → ${result.activeCount} active memo(s).\nNow injecting into SCREENER + GENERAL prompts.`
+        ).catch((err) => { log("silent_warn", err.message); return null; });
+        if (!okHtml) {
+          await sendMessage(`Approved ${result.memo.id} → ${result.activeCount} active memo(s).`).catch((err) => log("silent_warn", err.message));
+        }
+        return;
+      }
+
+      if (sub === "reject") {
+        const reason = arg || "operator";
+        const result = rejectPendingCoachingProposal(reason);
+        if (!result.ok) { await sendMessage("No pending proposal to reject."); return; }
+        await sendMessage(`❌ Rejected ${result.memo.id} (${reason}).`);
+        return;
+      }
+
+      if (sub === "rollback") {
+        if (!arg) { await sendMessage("Usage: /memo rollback <memo-id>"); return; }
+        const result = rollbackCoachingMemo(arg);
+        if (!result.ok) {
+          if (result.reason === "not_found") { await sendMessage(`Memo ${arg} not in active list. Use /memo to see ids.`); return; }
+          await sendMessage(`Rollback failed: ${result.reason}`); return;
+        }
+        const remaining = getActiveCoachingMemos().length;
+        await sendMessage(`↩️ Rolled back ${result.memo.id}. ${remaining} active memo(s) remaining.`);
+        return;
+      }
+
+      await sendMessage(
+        "Unknown /memo subcommand. Try: /memo | /memo propose | /memo approve | /memo reject [reason] | /memo rollback <id> | /memo pending",
+      );
+    } catch (e) {
+      await sendMessage(`/memo error: ${e.message}`).catch((err) => log("silent_warn", err.message));
     }
     return;
   }

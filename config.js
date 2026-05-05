@@ -245,6 +245,19 @@ export const config = {
     generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
   },
 
+  // ─── Coaching (Tier 2 self-learning) ──
+  // Operator-curated memo lifecycle. /memo propose builds a digest from
+  // recent perf, calls the LLM, stages a proposal, and waits for explicit
+  // /memo approve. Active memos are injected into SCREENER + GENERAL
+  // prompts. All defaults conservative — operator must opt-in by calling
+  // /memo propose; nothing auto-runs.
+  coaching: {
+    digestWindowDays:      u.coachingWindowDays      ?? 7,
+    minClosesForProposal:  u.coachingMinCloses       ?? 10,
+    activeMemoLimit:       u.coachingActiveLimit     ?? 10,
+    proposalMaxTokens:     u.coachingMaxTokens       ?? 1500,
+  },
+
   // ─── Darwinian Signal Weighting ───────
   darwin: {
     enabled:        u.darwinEnabled     ?? true,

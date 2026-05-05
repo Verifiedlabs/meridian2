@@ -10,6 +10,7 @@
  * @returns {string} - Complete system prompt
  */
 import { config } from "./config.js";
+import { getActiveMemos, formatMemosForPrompt } from "./src/coaching.js";
 
 export function buildSystemPrompt(agentType, portfolio, positions, stateSummary = null, lessons = null, perfSummary = null, weightsSummary = null, decisionSummary = null, postmortem = null) {
   const s = config.screening;
@@ -19,6 +20,11 @@ export function buildSystemPrompt(agentType, portfolio, positions, stateSummary 
   // cost stays bounded; the agent can call get_postmortem_suggestions for
   // the full list (with action_hint detail) if it needs more.
   const postmortemBlock = renderPostMortemBlock(postmortem);
+
+  // Tier 2 self-learning: operator-approved coaching memos. Active memos
+  // override raw lessons (curated insight > raw observation). Empty string
+  // when none are active so the prompt stays tight.
+  const coachingBlock = renderCoachingBlock();
 
   // MANAGER gets a leaner prompt — positions are pre-loaded in the goal, not repeated here
   if (agentType === "MANAGER") {
@@ -60,7 +66,7 @@ BEHAVIORAL CORE:
 3. DATA-DRIVEN AUTONOMY: You have full autonomy. Guidelines are heuristics.
 4. INSTRUCTION OVERRIDE: When a position has an instruction set, evaluate the condition. If met → close immediately. BIAS TO HOLD does not apply.
 
-${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}
+${coachingBlock}${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}
 `;
   }
 
@@ -81,6 +87,11 @@ Config: ${JSON.stringify({
   management: config.management,
   schedule: config.schedule,
 }, null, 2)}
+
+${coachingBlock ? `═══════════════════════════════════════════
+ COACHING MEMOS (operator-approved)
+═══════════════════════════════════════════
+${coachingBlock}` : ""}
 
 ${lessons ? `═══════════════════════════════════════════
  LESSONS LEARNED
@@ -181,7 +192,7 @@ DEPLOY RULES:
 - Bin steps must be [${config.screening.minBinStep}-${config.screening.maxBinStep}].
 - Pick ONE pool. Deploy or explain why none qualify.
 
-${weightsSummary ? `${weightsSummary}\nPrioritize candidates whose strongest attributes align with high-weight signals.\n\n` : ""}${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}
+${weightsSummary ? `${weightsSummary}\nPrioritize candidates whose strongest attributes align with high-weight signals.\n\n` : ""}${coachingBlock}${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}
 `;
   } else if (agentType === "MANAGER") {
     basePrompt += `
@@ -219,6 +230,26 @@ PVP RULE: Treat \`pvp: HIGH\` as a major negative. It means another mint with th
   }
 
   return basePrompt + `\nTimestamp: ${new Date().toISOString()}\n`;
+}
+
+/**
+ * Render the active coaching memos block. Empty string when no memos
+ * are active so callers can splice unconditionally without worrying
+ * about leading whitespace. The block intentionally has a header line
+ * inside it so MANAGER/SCREENER prompts (which inject inline rather
+ * than as a fenced section) still display the block clearly.
+ */
+function renderCoachingBlock() {
+  let memos;
+  try {
+    memos = getActiveMemos();
+  } catch {
+    return "";
+  }
+  if (!Array.isArray(memos) || memos.length === 0) return "";
+  const body = formatMemosForPrompt(memos);
+  if (!body) return "";
+  return `COACHING MEMOS (operator-approved):\n${body}\n\n`;
 }
 
 /**
