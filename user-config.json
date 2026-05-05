@@ -4,7 +4,7 @@
   "preset": "custom",
   "rpcUrl": "https://pump.helius-rpc.com",
   "llmBaseUrl": "http://localhost:20128/v1",
-  "llmApiKey": "sk-77c0633dc80c5516-z86lsg-c422faa9",
+  "llmApiKey": "sk-77c0633dc80c5516-x30j6g-02ea42ee",
   "llmModel": "enowxai/claude-sonnet-4.5",
   "dryRun": false,
   "deployAmountSol": 0.5,
