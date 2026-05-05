@@ -351,6 +351,10 @@ function derivLesson(perf, mgmtConfig = null) {
     range_efficiency: perf.range_efficiency,
     close_reason: perf.close_reason,
     pool: perf.pool,
+    // Carry exploration flag so Tier 1 scoring can apply the noise discount.
+    // Lessons from exploration deploys are weighted 0.6× because the
+    // relaxed thresholds make the deploy decision less informative.
+    exploration: !!perf.exploration,
     created_at: new Date().toISOString(),
   };
 }
@@ -687,6 +691,172 @@ const ROLE_TAGS = {
   GENERAL:  [], // all lessons
 };
 
+// ─── Tier 1: Lesson Scoring & Selection ─────────────────────────
+// Composite-score-based lesson ranking so the prompt budget surfaces
+// the most informative, recent, and frequent patterns instead of just
+// "most recent". Pinned lessons bypass scoring (operator override).
+
+const LESSON_HALF_LIFE_DAYS = 14;     // recency decay half-life
+const LESSON_MAX_AGE_DAYS   = 60;     // sunset cutoff (non-pinned)
+const LESSON_MIN_SCORE      = 0.05;   // injection floor (non-pinned)
+const EXPLORATION_DISCOUNT  = 0.6;    // exploration lessons are noisier
+
+const OUTCOME_WEIGHTS = {
+  bad: 1.0, failed: 1.0,
+  poor: 0.7,
+  good: 0.6, worked: 0.6,
+  evolution: 0.5,
+  manual: 0.4,
+  neutral: 0.0,
+};
+
+function lessonAgeDays(lesson, now = Date.now()) {
+  if (!lesson?.created_at) return 0;
+  const t = new Date(lesson.created_at).getTime();
+  if (!Number.isFinite(t)) return 0;
+  return Math.max(0, (now - t) / (24 * 60 * 60 * 1000));
+}
+
+function outcomeWeight(outcome) {
+  return OUTCOME_WEIGHTS[outcome] ?? 0.3;
+}
+
+function magnitudeBoost(lesson) {
+  const pnl = Math.abs(Number(lesson?.pnl_pct) || 0);
+  // 1.0 base + up to +1.5 bonus for large magnitude (clamped at 30%)
+  return 1 + Math.min(pnl / 20, 1.5);
+}
+
+function recencyDecay(ageDays, halfLife = LESSON_HALF_LIFE_DAYS) {
+  return Math.exp(-ageDays * Math.LN2 / halfLife);
+}
+
+function frequencyBoost(count) {
+  return 1 + Math.log2(Math.max(1, count));
+}
+
+function isExplorationLesson(lesson) {
+  if (!lesson) return false;
+  if (lesson.exploration === true) return true;
+  return Array.isArray(lesson.tags) && lesson.tags.includes("exploration");
+}
+
+/** Normalize rule for similarity grouping: lowercase, strip numbers, collapse spaces. */
+function normalizeRuleHash(rule) {
+  if (!rule) return "";
+  return String(rule)
+    .toLowerCase()
+    .replace(/[0-9]+(\.[0-9]+)?/g, "#")
+    .replace(/[^a-z#\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
+function lessonGroupKey(lesson) {
+  const outcome    = lesson.outcome || "x";
+  const primaryTag = (lesson.tags || [])[0] || "x";
+  return `${outcome}|${primaryTag}|${normalizeRuleHash(lesson.rule)}`;
+}
+
+/** Group lessons that look like the same insight repeated. */
+export function groupSimilarLessons(lessons) {
+  const groups = new Map();
+  for (const lesson of lessons) {
+    const key = lessonGroupKey(lesson);
+    let group = groups.get(key);
+    if (!group) {
+      group = { key, members: [], count: 0 };
+      groups.set(key, group);
+    }
+    group.members.push(lesson);
+    group.count++;
+  }
+  return Array.from(groups.values());
+}
+
+/** Composite score: outcome × confidence × magnitude × recency × frequency × exploration. */
+export function scoreLesson(lesson, count = 1, now = Date.now()) {
+  const age      = lessonAgeDays(lesson, now);
+  const baseConf = Number.isFinite(Number(lesson?.confidence)) ? Number(lesson.confidence) : 0.4;
+  const score =
+    outcomeWeight(lesson?.outcome) *
+    baseConf *
+    magnitudeBoost(lesson) *
+    recencyDecay(age) *
+    frequencyBoost(count) *
+    (isExplorationLesson(lesson) ? EXPLORATION_DISCOUNT : 1.0);
+  return Math.round(score * 1000) / 1000;
+}
+
+/**
+ * Select top-N lessons by composite score with sunset + dedup applied.
+ * Pinned lessons bypass sunset and the min-score floor.
+ *
+ * @param {Array}  lessons     - candidate lessons (post-filter)
+ * @param {number} limit       - max representatives to return
+ * @param {Object} [opts]
+ * @param {number} [opts.now]                     - clock override for tests
+ * @param {number} [opts.maxAgeDays]              - override sunset cutoff
+ * @param {number} [opts.minScore]                - override score floor
+ * @returns {Array} representatives with _score and _seen attached
+ */
+export function selectTopLessons(lessons, limit, opts = {}) {
+  const {
+    now = Date.now(),
+    maxAgeDays = LESSON_MAX_AGE_DAYS,
+    minScore   = LESSON_MIN_SCORE,
+  } = opts;
+  if (!Array.isArray(lessons) || !lessons.length || limit <= 0) return [];
+
+  // 1. Sunset stale (non-pinned)
+  const cutoff = now - maxAgeDays * 24 * 60 * 60 * 1000;
+  const fresh  = lessons.filter((l) => {
+    if (l.pinned) return true;
+    if (!l.created_at) return true;
+    return new Date(l.created_at).getTime() >= cutoff;
+  });
+
+  // 2. Group similar
+  const groups = groupSimilarLessons(fresh);
+
+  // 3. Score each group, pick best representative; track all member ids
+  //    so callers can dedup across tiers without leaking duplicates.
+  const scored = groups.map((g) => {
+    let best = null;
+    let bestScore = -Infinity;
+    for (const member of g.members) {
+      const s = scoreLesson(member, g.count, now);
+      if (s > bestScore) {
+        bestScore = s;
+        best = member;
+      }
+    }
+    return {
+      lesson: best,
+      score: bestScore,
+      seen: g.count,
+      memberIds: g.members.map((m) => m.id).filter((id) => id != null),
+    };
+  });
+
+  // 4. Min score floor (non-pinned)
+  const passed = scored.filter((s) => s.lesson.pinned || s.score >= minScore);
+
+  // 5. Sort: pinned first, then by score desc
+  passed.sort((a, b) => {
+    if (!!b.lesson.pinned !== !!a.lesson.pinned) return b.lesson.pinned ? 1 : -1;
+    return b.score - a.score;
+  });
+
+  return passed.slice(0, limit).map((t) => ({
+    ...t.lesson,
+    _score: t.score,
+    _seen: t.seen,
+    _memberIds: t.memberIds,
+  }));
+}
+
 /**
  * Get lessons formatted for injection into the system prompt.
  * Structured injection with three tiers:
@@ -726,28 +896,29 @@ export function getLessonsForPrompt(opts = {}) {
   const usedIds = new Set(pinned.map((l) => l.id));
 
   // ── Tier 2: Role-matched ────────────────────────────────────────
+  // Score-ranked: composite (outcome × confidence × magnitude × recency ×
+  // frequency × exploration discount). Sunsets >60d, dedupes similar rules.
   const roleTags = ROLE_TAGS[agentType] || [];
-  const roleMatched = data.lessons
-    .filter((l) => {
-      if (usedIds.has(l.id)) return false;
-      // Include if: lesson has no role restriction OR matches this role
-      const roleOk = !l.role || l.role === agentType || agentType === "GENERAL";
-      // Include if: lesson has role-relevant tags OR no tags (general)
-      const tagOk  = roleTags.length === 0 || !l.tags?.length || l.tags.some((t) => roleTags.includes(t));
-      return roleOk && tagOk;
-    })
-    .sort(byPriority)
-    .slice(0, ROLE_CAP);
+  const roleCandidates = data.lessons.filter((l) => {
+    if (usedIds.has(l.id)) return false;
+    const roleOk = !l.role || l.role === agentType || agentType === "GENERAL";
+    const tagOk  = roleTags.length === 0 || !l.tags?.length || l.tags.some((t) => roleTags.includes(t));
+    return roleOk && tagOk;
+  });
+  const roleMatched = selectTopLessons(roleCandidates, ROLE_CAP);
 
-  roleMatched.forEach((l) => usedIds.add(l.id));
+  roleMatched.forEach((l) => {
+    usedIds.add(l.id);
+    (l._memberIds || []).forEach((id) => usedIds.add(id));
+  });
 
   // ── Tier 3: Recent fill ─────────────────────────────────────────
+  // Same score-ranked selection; usedIds excludes Tier 1+2 lessons AND
+  // their group members so we never re-surface a duplicate insight.
   const remainingBudget = RECENT_CAP - pinned.length - roleMatched.length;
+  const recentCandidates = data.lessons.filter((l) => !usedIds.has(l.id));
   const recent = remainingBudget > 0
-    ? data.lessons
-        .filter((l) => !usedIds.has(l.id))
-        .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""))
-        .slice(0, remainingBudget)
+    ? selectTopLessons(recentCandidates, remainingBudget)
     : [];
 
   const selected = [...pinned, ...roleMatched, ...recent];
@@ -770,7 +941,8 @@ function fmt(lessons) {
   return lessons.map((l) => {
     const date = l.created_at ? l.created_at.slice(0, 16).replace("T", " ") : "unknown";
     const pin  = l.pinned ? "📌 " : "";
-    return `${pin}[${l.outcome.toUpperCase()}] [${date}] ${l.rule}`;
+    const seen = (l._seen && l._seen > 1) ? ` (seen ${l._seen}×)` : "";
+    return `${pin}[${l.outcome.toUpperCase()}] [${date}] ${l.rule}${seen}`;
   }).join("\n");
 }
 
