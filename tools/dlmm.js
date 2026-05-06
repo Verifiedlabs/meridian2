@@ -1637,12 +1637,13 @@ export async function closePosition({ position_address, reason }) {
         const closeTxHashes = normalizeExecutionSignatures(submit);
         const txHashes = [...claimTxHashes, ...closeTxHashes];
 
-        await new Promise((resolve) => setTimeout(resolve, 5000));
         _positionsCacheAt = 0;
 
         // Verify via on-chain account ownership — survives Meteora API lag
         // (which can run 10s+ behind finality and used to produce false
         // "still appears open" returns even after the close tx landed).
+        // The poll loop (6 × 1.5s = up to 9s) is sufficient on its own;
+        // the previous blanket 5s sleep was redundant on top of it.
         let closedConfirmed = false;
         for (let attempt = 0; attempt < 6; attempt++) {
           const onChainClosed = await isPositionClosedOnChain(position_address);
@@ -1799,14 +1800,47 @@ export async function closePosition({ position_address, reason }) {
     const claimTxHashes = [];
     const closeTxHashes = [];
 
-    // ─── Step 1: Claim Fees (to clear account state) ───────────
-    const recentlyClaimed = tracked?.last_claim_at && (Date.now() - new Date(tracked.last_claim_at).getTime()) < 60_000;
+    // ─── Inspect position state ─────────────────────────────────
+    // Determines whether Step 2 will be `removeLiquidity({shouldClaimAndClose})`
+    // (which bundles claim + remove + close into one tx) or a bare
+    // `closePosition` on an already-empty account (which does NOT claim).
+    // We use this to decide whether the legacy Step 1 claim is still
+    // needed — for the common case (position with liquidity), Step 1 is
+    // redundant and was costing us a full extra tx round-trip per close.
+    let hasLiquidity = false;
+    let closeFromBinId = -887272;
+    let closeToBinId = 887272;
+    let cachedPositionData = null;
     try {
-      if (recentlyClaimed) {
-        log("close", `Step 1: Skipping claim — fees already claimed ${Math.round((Date.now() - new Date(tracked.last_claim_at).getTime()) / 1000)}s ago`);
+      cachedPositionData = await pool.getPosition(positionPubKey);
+      const processed = cachedPositionData?.positionData;
+      if (processed) {
+        closeFromBinId = processed.lowerBinId ?? closeFromBinId;
+        closeToBinId = processed.upperBinId ?? closeToBinId;
+        const bins = Array.isArray(processed.positionBinData) ? processed.positionBinData : [];
+        hasLiquidity = bins.some((bin) => new BN(bin.positionLiquidity || "0").gt(new BN(0)));
+      }
+    } catch (e) {
+      log("close_warn", `Could not check liquidity state: ${e.message}`);
+    }
+
+    // ─── Step 1: Claim Fees (only when Step 2 won't) ───────────
+    // Skip when:
+    //   - recently claimed (cache window): nothing to gain
+    //   - hasLiquidity=true: Step 2's removeLiquidity({shouldClaimAndClose:true})
+    //     bundles the claim into the same tx, so a separate claim is
+    //     pure round-trip overhead (~3-5s wasted per close).
+    const recentlyClaimed = tracked?.last_claim_at && (Date.now() - new Date(tracked.last_claim_at).getTime()) < 60_000;
+    const skipClaimStep = recentlyClaimed || hasLiquidity;
+    try {
+      if (skipClaimStep) {
+        const why = recentlyClaimed
+          ? `fees already claimed ${Math.round((Date.now() - new Date(tracked.last_claim_at).getTime()) / 1000)}s ago`
+          : `Step 2 will claim+close in one tx (shouldClaimAndClose)`;
+        log("close", `Step 1: Skipping claim — ${why}`);
       } else {
         log("close", `Step 1: Claiming fees for ${position_address}`);
-        const positionData = await pool.getPosition(positionPubKey);
+        const positionData = cachedPositionData ?? await pool.getPosition(positionPubKey);
         const claimTxs = await pool.claimSwapFee({
           owner: wallet.publicKey,
           position: positionData,
@@ -1828,22 +1862,6 @@ export async function closePosition({ position_address, reason }) {
     }
 
     // ─── Step 2: Remove Liquidity & Close ──────────────────────
-    let hasLiquidity = false;
-    let closeFromBinId = -887272;
-    let closeToBinId = 887272;
-    try {
-      const positionDataForClose = await pool.getPosition(positionPubKey);
-      const processed = positionDataForClose?.positionData;
-      if (processed) {
-        closeFromBinId = processed.lowerBinId ?? closeFromBinId;
-        closeToBinId = processed.upperBinId ?? closeToBinId;
-        const bins = Array.isArray(processed.positionBinData) ? processed.positionBinData : [];
-        hasLiquidity = bins.some((bin) => new BN(bin.positionLiquidity || "0").gt(new BN(0)));
-      }
-    } catch (e) {
-      log("close_warn", `Could not check liquidity state: ${e.message}`);
-    }
-
     if (hasLiquidity) {
       log("close", `Step 2: Removing liquidity and closing account`);
       const closeTx = await pool.removeLiquidity({
@@ -1879,15 +1897,16 @@ export async function closePosition({ position_address, reason }) {
     const txHashes = [...claimTxHashes, ...closeTxHashes];
     log("close", `Step 2 OK (close only): ${closeTxHashes.join(", ") || "none"}`);
     log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
-    // Wait for RPC to reflect withdrawn balances before returning — prevents
-    // agent from seeing zero balance when attempting post-close swap
-    await new Promise(r => setTimeout(r, 5000));
     _positionsCacheAt = 0;
 
     // Verify via on-chain account ownership — same rationale as the relay
     // branch above: Meteora's /positions API frequently lags 10s+ behind
     // finality, so trusting its "still open" signal led to false success:false
     // returns even when the close tx had already landed.
+    //
+    // The poll loop itself absorbs any RPC lag (up to 6 × 1.5s = 9s budget),
+    // so a separate blanket sleep is redundant. We only wait briefly on the
+    // first failed attempt to give the leader a beat to propagate state.
     let closedConfirmed = false;
     for (let attempt = 0; attempt < 6; attempt++) {
       const onChainClosed = await isPositionClosedOnChain(position_address);
