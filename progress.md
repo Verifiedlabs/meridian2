@@ -2,20 +2,28 @@
 
 > **Purpose**: enable another session (AI model or human) to pick up exactly where this conversation left off without losing context.
 
-**Last updated**: 2026-05-05 15:50 UTC+07
+**Last updated**: 2026-05-06 16:25 UTC+07
 **Repo root**: `/Users/firda/meridian2`
-**Branch**: `main` (ahead of `origin/main` by 6 commits — not pushed yet)
+**Branch**: `main` — synced with `origin/main` ✅ (all current commits pushed)
+**Test baseline**: **170/170 passing**
 
 ---
 
-## TL;DR of Current State
+## TL;DR of Current State (May 6, end of session)
 
-1. Session 1: profit-close Telegram fix + 3 high-priority hardening fixes (close mutex, on-chain verification, fatal alerts).
-2. Session 1: honest self-learning audit, presented E + A + B as next upgrade.
-3. **Session 2 (this session): all of E + A + B implemented** — drawdown circuit breaker, exploration budget, hold-out validation.
-4. **Test baseline grew 105 → 129** (24 new tests), all passing.
+Today's session was **diagnosis-heavy + 1 surgical perf fix** + planning for tomorrow.
 
-**Bot status**: runs via pm2 as `meridian2`. Config: `user-config.json` has `telegramMuteCycle: true` (suppresses cycle summaries), `muteClose: false`. Bot still running OLD code — restart needed to apply session-2 commits.
+1. ✅ Pushed yesterday's Tier 1 + Tier 2 self-learning commits (`7d87a08`, `118f7cf`).
+2. ✅ Verified security hardening (self_update RCE, update_config clamp) — no real bug.
+3. ✅ Performance audit on 73 closes — identified real issues:
+   - Trailing TP mechanism actually WORKS (corrected an earlier mislabel).
+   - Real bleeder = 8 stop-loss tail events (sum -25% pnl_pct).
+   - GME-SOL -9.72% blowout root cause: **slow close path**, NOT validator slippage.
+4. ✅ **Committed perf fix** `91e0550` — drop blanket 5s sleeps + skip redundant claim tx in `tools/dlmm.js`.
+5. ✅ Helius API key verified alive — historical 401s were stale.
+6. ✅ Identified Tier 3 self-learning gap: **top-LPer auto-discovery** — infrastructure 80% built, just not wired.
+
+**Bot status**: pm2 process `meridian2` still running pre-fix code. Restart needed to apply `91e0550` (close path optimization).
 
 ---
 
@@ -148,12 +156,56 @@ Smoke-test command from Telegram:
 - `/risk` → should display the new "Drawdown circuit breaker" section.
 - `/resume` → should clear breaker if tripped (no-op if not).
 
-## Known Follow-Ups (Not Started)
+## Known Follow-Ups (Priority Ranked for Tomorrow)
 
-1. **Per-strategy learning** (option D from earlier menu) — separate Darwin weights for spot vs bid_ask vs curve. Currently all strategies share one weight set.
-2. **Lessons retention** — `lessons.json` still grows unbounded. Need cap/merge policy.
-3. **GMGN exploration support** — overrides are ignored on the GMGN path; would need separate threshold tuning.
-4. **Validation trend tracking** — log `validation.signMatches/signTotal` over time to detect when noise level changes (regime shift detection).
+### 🔥 TIER A — Highest impact, do first
+
+**A1. Top-LPer auto-discovery** (Tier 3 self-learning, ~2-3 hours)
+
+The single highest-ROI improvement. Infrastructure 80% built, just not wired into the screening loop.
+
+- **Existing**: `tools/study.js` already wraps Meridian API endpoints `/top-lp/<pool>` and `/study-top-lp/<pool>` (uses shared public API key — no extra auth needed). Returns full LPer data: address, win_rate, ROI, preferred strategy, position history. Tools `study_top_lpers` + `get_top_lpers` are registered in `tools/executor.js:249-250` and exposed in prompt.
+- **Gap**: prompt at `@/Users/firda/meridian2/prompt.js:210-226` explicitly **forbids** auto-call ("Do NOT call get_top_candidates or study_top_lpers while you have healthy open positions"). 0 calls in 8 days of action logs. Result: feature is dead unless operator manually triggers via Telegram.
+- **No-proxy decision**: rate limit IS the cache hit policy (server caches 30m, per-pool 60s cooldown). Bypassing via proxy is pointless because the response is identical for 30m. Build client-side cache instead.
+
+Build steps:
+1. `src/top-lpers.js` — write-through persistence to `top-lpers.json`. Schema: `{address: {names, pools_seen, aggregate_stats: {win_rate, roi, total_positions}, last_seen}}`. Match `circuit-breaker.js` pattern.
+2. Client-side TTL cache (~25min, just under server's 30min) inside `tools/study.js`.
+3. SCREENER prompt: loosen "do not call" line; add "FOR EACH top-3 candidate → call study_top_lpers + persist".
+4. Auto-promotion: after wallet appears in ≥3 pools with WR ≥60% and ≥10 total positions, call existing `addSmartWallet({type:"lp"})` automatically.
+5. Telegram: `/lpers leaderboard`, `/lpers promote <addr>`, `/lpers reject <addr>` (Tier 2-style approval).
+6. Tests: persistence, scoring, auto-promotion threshold, dedup across pool visits.
+
+Why this matters most: bot is LP-focused. Tracking top LPers (not KOL traders) is the right wallet-level signal for an LP bot. Currently `smart-wallets.json` is empty — bot never gets the `check_smart_wallets_on_pool` boost. Auto-discovery fixes that without manual operator curation.
+
+### 🟡 TIER B — Worth doing, smaller scope
+
+**B1. Self-evolve TP/SL thresholds** (~1-2 hours)
+
+Currently `lessons.js evolveThresholds` evolves screening params (`maxVolatility`, `minOrganic`, `minFeeActiveTvlRatio`) but NOT risk params (`takeProfitPct`, `stopLossPct`). This is a real gap — `getPostMortemSuggestions` at `@/Users/firda/meridian2/lessons.js:1148-1162` already recommends symmetric R/R adjustment, but the system never auto-applies it.
+
+Data point: TP=4 fired only 3× in 73 closes. avg_win=1.18% (most winners don't reach TP). TP candidates evolve toward 2.5-3% would capture more wins. Same logic for SL — current -6% with 21s slow-close = effective -9% in volatile pools.
+
+Build: extend `evolveThresholds` to compute distribution of winners' peak PnL and losers' max-drawdown, propose new TP/SL via same lesson-based mechanism. Start CONSERVATIVE — propose, don't auto-apply for risk params (operator approval like Tier 2 memos).
+
+**B2. Pool concentration guard** (~30 min)
+
+Pool memory shows GME-SOL had `avg_pnl_pct: -2.11%, win_rate: 0.67` after 3 deploys. Bot redeployed 4 min after a -10% loss because cooldown only fires for "repeat fee-generating deploys", not for SL events. Add SCREENER pre-check: skip pool if `pool_memory.sample ≥ 3 AND avg_pnl_pct < -1%` unless operator explicitly overrides.
+
+### 🟢 TIER C — Log noise cleanup (low impact, easy wins)
+
+Already analyzed in earlier session. Volume rankings:
+
+- **C1. Silent "message not modified" Telegram errors** (54 logs / 8 days) — catch + swallow in `editMessage`/`editMessageWithButtons`. Cosmetic no-op.
+- **C2. Downgrade "Position settling 1-3/6"** WARN → debug (~8 logs). Keep attempt 4-6 visible.
+- **C3. Fix HTML escape bug "Unsupported start tag"** (5 logs). Hunt missing `escapeHtml` before `sendHTML` call.
+
+### ⚫ TIER D — From earlier sessions, still relevant
+
+1. **Per-strategy learning** (option D from earlier menu) — separate Darwin weights for spot vs bid_ask vs curve. Currently all strategies share one weight set. Defer until enough non-bid_ask samples exist (current data: 73/73 are bid_ask).
+2. **Lessons retention** — `lessons.json` still grows unbounded (76KB → grew to 87KB). Need cap/merge policy.
+3. **GMGN exploration support** — exploration overrides are ignored on the GMGN path; would need separate threshold tuning.
+4. **Validation trend tracking** — log `validation.signMatches/signTotal` over time for regime shift detection.
 
 ## Critical Files Quick-Reference
 
@@ -207,21 +259,71 @@ These were flagged in the audit but not yet addressed:
 
 Paste the following starter into the new session after opening repo `/Users/firda/meridian2`:
 
-> Read `progress.md` at the repo root. Session context is there. The user was deciding between 4 options for the next upgrade (E/A/B combinations). Ask the user which they chose and proceed with implementation following the specs in the file. Match the user's casual Indonesian-English style.
+> Read `progress.md` at the repo root. Session context is there. User wants to continue with the priority list at "Known Follow-Ups". Default plan is Tier A1 (top-LPer auto-discovery) unless user picks otherwise. Match the user's casual Indonesian-English style.
 
-For a new AI model, the first calls should be:
+For a new AI model, first calls should be:
 
 ```
 1. read_file /Users/firda/meridian2/progress.md
-2. run_command "git log --oneline -n 10" to confirm commit state
-3. run_command "npm test" to confirm 105 tests still pass
-4. Ask user which option (1/2/3/4) they want to proceed with
+2. run_command "git log --oneline -n 5"   → confirm latest is 91e0550
+3. run_command "npm test"                  → confirm 170 tests pass
+4. Ask user: "Lanjut Tier A1 (top-LPer auto-discovery) atau pick yang lain?"
 ```
+
+Default recommendation if user says "bebas/yaudah/gas": **A1 first** (highest ROI, infrastructure ready).
 
 ---
 
 ## Open Questions for Next Session
 
-1. **Which of E / A / B to implement?** (User decision pending.)
-2. **Should uncommitted work get pushed?** Branch is 5 commits ahead of `origin/main`; user hasn't pushed yet. Check with user before `git push`.
-3. **Should we restart pm2 to apply current commits?** Bot is still running the old code since the last restart — fixes aren't live until `pm2 restart meridian2`. User may want to smoke-test first.
+1. **Which tier to start with?** Default = A1 (top-LPer auto-discovery). Operator can override.
+2. **pm2 restart not yet done** for `91e0550` close-path optimization. Restart `meridian2` to apply, then watch median close duration_ms in `logs/actions-*.jsonl` (expected drop ~13s → ~5-8s).
+3. **For A1**: whether to auto-promote LPers to `smart_wallets.json` automatically after threshold OR require Telegram approval (Tier 2-style). Default proposed: auto-promote with threshold (≥3 pools, WR ≥60%, ≥10 positions) but provide `/lpers reject <addr>` to undo.
+
+---
+
+## Diagnosis Notes (May 6 — for context)
+
+These were discovered today but NOT acted on (unless explicitly mentioned in commits above). Useful background for future sessions:
+
+### Performance audit (n=73 closes / 7.8 days)
+
+```
+Win rate         : 63.0%  (46W / 26L / 1 flat)
+Avg PnL/trade    : +0.236%
+True $ net       : +$4.23 (final-init+fees) on $1333 cumulative
+Gross fee yield  : 1.503% / 7.8d ≈ ~70% APY-equiv
+Avg hold         : 58 min
+Range efficiency : 88.7%
+```
+
+### True exit-mechanism breakdown (after re-classifying mislabeled "trailing TP" buckets):
+
+```
+OOR_PUMPED (rule 3):  n=30  +15.35% sum  +0.51% avg  $4.05 fees   ← workhorse
+TRAILING_DROP (real): n= 9  +12.37% sum  +1.37% avg  $8.59 fees   ← BEST $/trade
+LOW_YIELD:            n=13   +0.99% sum  +0.08% avg  $0.16 fees   ← deploy waste
+STOP_LOSS:            n= 8  -25.55% sum  -3.19% avg  $4.75 fees   ← 💀 main drag
+TAKE_PROFIT:          n= 3  +12.47% sum  +4.16% avg  $1.20 fees   ← rare hit
+```
+
+Stop-loss tail events (6 real, 2 mislabeled positive):
+- STJUDE -4.93% (organic=26, low quality)
+- BELIEF -6.05% (vol=5.34, high vol)
+- Dragon -5.14% (vol=3.77, organic=82)
+- UNIPUMP -3.39%, Spirit -4.29%
+- **GME -9.72%** (worst single, 62% past SL threshold) — root cause = slow close path (fixed in `91e0550`)
+
+### Slow-close root cause (for future ref)
+
+Pre-fix `closePosition` flow: 5s blanket sleep + redundant Step 1 claim tx + Step 2 close+claim tx = ~13s median, p95 20.5s. The 5s sleep was deflagged as redundant (poll loop covered RPC lag); Step 1 was redundant when Step 2 used `shouldClaimAndClose`. Both fixed without behavior change — failure modes preserved.
+
+### Key infrastructure already in place but underused
+
+| Feature | Status | Why dormant |
+|---|---|---|
+| `study_top_lpers` tool | wired but 0 calls in 8 days | prompt forbids auto-call (`prompt.js:210`) |
+| `add_smart_wallet` tracker | 0 entries in `smart-wallets.json` | never populated |
+| `check_smart_wallets_on_pool` | works but always returns `tracked=0` | depends on smart-wallets.json |
+| `get_postmortem_suggestions` | active | already advises symmetric R/R but auto-evolve doesn't act on it |
+| `getPerformanceSummary by_exploration` | active | useful for Tier B1 (TP/SL evolve) data |
