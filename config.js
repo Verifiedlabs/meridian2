@@ -258,6 +258,20 @@ export const config = {
     proposalMaxTokens:     u.coachingMaxTokens       ?? 1500,
   },
 
+  // ─── Smart-LPer Auto-Discovery (Tier 3 self-learning) ───────
+  // Top-LPer addresses harvested from Meridian /top-lp endpoint via
+  // study_top_lpers tool. When the same wallet shows up in enough pools
+  // with strong stats, it auto-promotes into smart-wallets.json so
+  // check_smart_wallets_on_pool can use it during screening. Operator
+  // can override via /lpers promote / /lpers reject from Telegram.
+  smartLpers: {
+    autoPromoteEnabled:      u.smartLpersAutoPromote       ?? true,
+    autoPromoteMinPools:     u.smartLpersMinPools          ?? 3,    // distinct pools the LPer must appear in
+    autoPromoteMinWinRate:   u.smartLpersMinWinRate        ?? 0.6,  // 60%
+    autoPromoteMinPositions: u.smartLpersMinPositions      ?? 10,   // total positions tracked by Meridian
+    recencyDecayDays:        u.smartLpersRecencyDecayDays  ?? 30,   // halflife for leaderboard scoring
+  },
+
   // ─── Darwinian Signal Weighting ───────
   darwin: {
     enabled:        u.darwinEnabled     ?? true,

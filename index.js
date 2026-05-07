@@ -72,6 +72,13 @@ import {
   getPendingProposal as getPendingCoachingProposal,
 } from "./src/coaching.js";
 import { proposeMemoFromDigest } from "./src/coaching-llm.js";
+import {
+  getLeaderboard as getLpersLeaderboard,
+  promoteLper,
+  rejectLper,
+  getStats as getLpersStats,
+  getLperRecord,
+} from "./src/top-lpers.js";
 import { selectTopLessons } from "./lessons.js";
 import { getConnection } from "./rpc.js";
 import { PublicKey } from "@solana/web3.js";
@@ -3018,6 +3025,132 @@ async function telegramHandler(msg) {
       );
     } catch (e) {
       await sendMessage(`/memo error: ${e.message}`).catch((err) => log("silent_warn", err.message));
+    }
+    return;
+  }
+
+  // ── /lpers : Tier 3 self-learning — top-LPer auto-discovery ────
+  // Subcommands: leaderboard (default) | stats | promote <addr> | reject <addr> [reason] | info <addr>
+  const lpersMatch = text.match(/^\/lpers(?:\s+(\S+)(?:\s+(\S+))?(?:\s+([\s\S]+))?)?$/i);
+  if (lpersMatch) {
+    const sub = (lpersMatch[1] || "leaderboard").toLowerCase();
+    const arg1 = lpersMatch[2] || null;
+    const arg2 = lpersMatch[3] ? lpersMatch[3].trim() : null;
+    try {
+      if (sub === "leaderboard" || sub === "list" || sub === "top") {
+        const board = getLpersLeaderboard({ limit: 15 });
+        if (board.length === 0) {
+          await sendMessage("📊 <b>Top LPers</b> — no data yet. Bot will populate this as it screens pools.").catch(() => {});
+          return;
+        }
+        const lines = [`📊 <b>Top LPer Leaderboard</b> — ${board.length} tracked`];
+        for (let i = 0; i < board.length; i++) {
+          const e = board[i];
+          const flag = e.promoted ? "✅" : "  ";
+          lines.push(
+            `${flag} ${i + 1}. <code>${e.address.slice(0, 8)}…</code> ${escapeHtml(e.name)}` +
+            ` | pools=${e.pools_seen} pos=${e.total_positions} WR=${(e.win_rate * 100).toFixed(0)}% ROI=${(e.roi * 100).toFixed(1)}%` +
+            ` | score=${e.score}`,
+          );
+        }
+        lines.push("\n✅ = already promoted to smart-wallets");
+        lines.push("Use /lpers promote &lt;addr&gt; or /lpers reject &lt;addr&gt;");
+        const html = lines.join("\n");
+        const ok = await sendHTML(html).catch((err) => { log("silent_warn", err.message); return null; });
+        if (!ok) await sendMessage(html.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
+        return;
+      }
+
+      if (sub === "stats") {
+        const s = getLpersStats();
+        const t = s.thresholds;
+        const lines = [
+          "📈 <b>Top LPer Tracker — Stats</b>",
+          `Total tracked: <b>${s.total_tracked}</b>`,
+          `  Promoted: ${s.promoted}`,
+          `  Pending: ${s.pending}`,
+          `  Near-qualifying: ${s.near_qualifying}`,
+          `  Rejected: ${s.rejected}`,
+          "",
+          "Auto-promote thresholds:",
+          `  pools_seen ≥ ${t.autoPromoteMinPools}`,
+          `  win_rate ≥ ${(t.autoPromoteMinWinRate * 100).toFixed(0)}%`,
+          `  total_positions ≥ ${t.autoPromoteMinPositions}`,
+          `  enabled: ${t.autoPromoteEnabled ? "yes" : "no"}`,
+          "",
+          `History: ${s.promotions_log} promotions, ${s.rejections_log} rejections logged`,
+        ];
+        const html = lines.join("\n");
+        const ok = await sendHTML(html).catch((err) => { log("silent_warn", err.message); return null; });
+        if (!ok) await sendMessage(html.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
+        return;
+      }
+
+      if (sub === "promote") {
+        if (!arg1) { await sendMessage("Usage: /lpers promote <address> [reason]"); return; }
+        const result = promoteLper({ address: arg1, reason: arg2 || "manual" });
+        if (!result.ok) {
+          if (result.reason === "invalid_address") { await sendMessage(`Invalid address: ${arg1}`); return; }
+          if (result.reason === "not_found")       { await sendMessage(`Address not in tracker yet: ${arg1.slice(0, 12)}…`); return; }
+          if (result.reason === "rejected")        { await sendMessage(`Address is in the rejected list. Use /lpers unreject first.`); return; }
+          await sendMessage(`Promote failed: ${result.reason}`); return;
+        }
+        if (result.reason === "already_promoted") {
+          await sendMessage(`Already promoted: ${arg1.slice(0, 12)}…`).catch(() => {});
+          return;
+        }
+        await sendMessage(`✅ Promoted ${arg1.slice(0, 12)}… → added to smart-wallets.`).catch(() => {});
+        return;
+      }
+
+      if (sub === "reject") {
+        if (!arg1) { await sendMessage("Usage: /lpers reject <address> [reason]"); return; }
+        const reason = arg2 || "operator";
+        const result = rejectLper({ address: arg1, reason });
+        if (!result.ok) { await sendMessage(`Reject failed: ${result.reason}`); return; }
+        const tag = result.proactive ? " (pre-emptive)" : "";
+        await sendMessage(`🚫 Rejected ${arg1.slice(0, 12)}…${tag} — ${reason}`).catch(() => {});
+        return;
+      }
+
+      if (sub === "info") {
+        if (!arg1) { await sendMessage("Usage: /lpers info <address>"); return; }
+        const r = getLperRecord(arg1);
+        if (!r) { await sendMessage(`Not tracked: ${arg1.slice(0, 12)}…`); return; }
+        const stats = r.aggregate_stats || {};
+        const lines = [
+          `🔍 <b>${escapeHtml(r.name)}</b>`,
+          `<code>${r.address}</code>`,
+          `Status: ${r.promoted ? "✅ promoted" : r.rejected ? "🚫 rejected" : "⏳ pending"}`,
+          r.rejected && r.rejection_reason ? `Rejection reason: ${escapeHtml(r.rejection_reason)}` : "",
+          "",
+          `pools_seen: ${r.pools_seen?.length || 0}`,
+          `total_positions: ${stats.total_positions ?? 0}`,
+          `win_rate: ${((stats.win_rate ?? 0) * 100).toFixed(1)}%`,
+          `roi: ${((stats.roi ?? 0) * 100).toFixed(1)}%`,
+          `avg_pnl_pct: ${(stats.avg_pnl_pct ?? 0).toFixed(2)}%`,
+          `preferred: ${stats.preferred_strategy || "?"} / ${stats.preferred_range_style || "?"}`,
+          "",
+          `first_seen: ${(r.first_seen_at || "").slice(0, 19)}`,
+          `last_seen: ${(r.last_seen_at || "").slice(0, 19)}`,
+        ].filter(Boolean);
+        if (r.pools_seen?.length) {
+          lines.push("\nPools:");
+          for (const p of r.pools_seen.slice(0, 6)) {
+            lines.push(`  • ${escapeHtml(p.pool_name || p.pool.slice(0, 10))} ×${p.count}`);
+          }
+        }
+        const html = lines.join("\n");
+        const ok = await sendHTML(html).catch((err) => { log("silent_warn", err.message); return null; });
+        if (!ok) await sendMessage(html.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
+        return;
+      }
+
+      await sendMessage(
+        "Unknown /lpers subcommand. Try: /lpers | /lpers stats | /lpers promote <addr> | /lpers reject <addr> [reason] | /lpers info <addr>",
+      );
+    } catch (e) {
+      await sendMessage(`/lpers error: ${e.message}`).catch((err) => log("silent_warn", err.message));
     }
     return;
   }

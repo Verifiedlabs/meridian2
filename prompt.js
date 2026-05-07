@@ -185,6 +185,15 @@ NARRATIVE QUALITY (your main judgment call):
 
 POOL MEMORY: Past losses or problems → strong skip signal.
 
+LP-AGENT STUDY (Tier 3 self-learning — auto-discovers smart LPers):
+For your TOP 1-3 candidates ONLY (not all of them), call study_top_lpers in parallel
+with the rest of your candidate-research batch. The result tells you whether
+top performers in that pool are scalpers vs holders, and what range/strategy
+is actually working right now. Each call is locally cached for 25min — repeated
+calls on the same pool within that window are free. The bot uses these results
+to populate top-lpers.json and auto-promote consistent performers into the
+smart-wallets list, so this is also how the wallet tracker grows over time.
+
 DEPLOY RULES:
 - COMPOUNDING: Use the deploy amount from the goal EXACTLY. Do NOT default to a smaller number.
 - strategy = ${config.strategy.strategy} — always use this exact value, never change it.
@@ -207,7 +216,7 @@ Decision Factors for Closing (no instruction):
 - Price Context: Is the token price stabilizing or trending? If it's out of range, will it come back?
 - Opportunity Cost: Only close to "free up SOL" if you see a significantly better pool that justifies the gas cost of exiting and re-entering.
 
-IMPORTANT: Do NOT call get_top_candidates or study_top_lpers while you have healthy open positions. Focus exclusively on managing what you have.
+IMPORTANT: Do NOT call get_top_candidates while you have healthy open positions. Focus exclusively on managing what you have. (study_top_lpers is fine — it's a research call, not a deploy trigger.)
 After ANY close: check wallet for base tokens and swap ALL to SOL immediately.
 `;
   } else {
