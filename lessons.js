@@ -648,10 +648,16 @@ export function proposeTpSlAdjustment(perfData, mgmtConfig, opts = {}) {
   // ── 1. takeProfitPct ─────────────────────────────────────────
   if (winners.length >= 5) {
     const winnerPnls = winners.map((p) => p.pnl_pct);
-    const tpHits = perfData.filter((p) => {
-      const c = classifyCloseReason(p.close_reason);
-      return c === "take_profit" || c === "trailing";
-    }).length;
+    // Only HARD take-profit hits count toward "is the TP target ever
+    // reached". Trailing exits are a different mechanism (close on
+    // pullback from peak), so including them masks an under-firing
+    // hard TP — which is the exact case where a lowering proposal is
+    // most valuable. Real-world example from this codebase: 7 hard TP
+    // hits + 24 trailing exits in 95 closes. Counting both gives 32%
+    // (rule blocked) when the truth is hard TP fires only 7%.
+    const tpHits = perfData.filter(
+      (p) => classifyCloseReason(p.close_reason) === "take_profit",
+    ).length;
     const tpRate = tpHits / perfData.length;
     const p60 = percentile(winnerPnls, 60);
     const avgWinner = avg(winnerPnls);
@@ -664,7 +670,7 @@ export function proposeTpSlAdjustment(perfData, mgmtConfig, opts = {}) {
       if (newTp < currentTp && changePct >= RISK_MIN_CHANGE_PCT) {
         proposals.takeProfitPct = newTp;
         rationale.takeProfitPct =
-          `TP hits ${(tpRate * 100).toFixed(0)}% (${tpHits}/${perfData.length}). ` +
+          `Hard TP hits ${(tpRate * 100).toFixed(0)}% (${tpHits}/${perfData.length}). ` +
           `Winners avg ${avgWinner.toFixed(2)}%, p60=${p60.toFixed(2)}%. ` +
           `Lower TP ${currentTp} → ${newTp} to capture more winners.`;
       }

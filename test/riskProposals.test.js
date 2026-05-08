@@ -141,6 +141,37 @@ describe("proposeTpSlAdjustment — TP heuristics", () => {
       expect(result.proposals.takeProfitPct).toBeUndefined();
     }
   });
+
+  // Regression for the production case where 95 closes had only 7 hard
+  // TP hits but 24 trailing exits. The original heuristic counted both
+  // and saw 32% > 20% threshold so it never proposed lowering, even
+  // though winners' max barely crossed TP. The fix excludes trailing
+  // from tpRate so this scenario produces a proposal.
+  it("proposes lower TP when hard TP rarely fires even with many trailing exits", () => {
+    const perf = [
+      // 5 hard TP hits at 4.1% (just above TP=5 — wait, baseMgmt.takeProfitPct=5)
+      ...Array.from({ length: 5 }, () => makePerf({
+        pnl_pct: 1.5,
+        close_reason: "take profit hit",
+      })),
+      // 30 trailing exits clustered at 1-1.5% — they are NOT TP hits
+      ...Array.from({ length: 30 }, (_, i) => makePerf({
+        pnl_pct: 1 + (i % 2) * 0.4,
+        close_reason: "trailing exit",
+      })),
+      // 10 OOR closes around 1%
+      ...Array.from({ length: 10 }, () => makePerf({
+        pnl_pct: 1.1,
+        close_reason: "out of range",
+      })),
+    ];
+    // tpRate = 5/45 = 11% < 20% → fires.
+    const result = proposeTpSlAdjustment(perf, baseMgmt);
+    expect(result).not.toBeNull();
+    expect(result.proposals.takeProfitPct).toBeDefined();
+    expect(result.proposals.takeProfitPct).toBeLessThan(baseMgmt.takeProfitPct);
+    expect(result.rationale.takeProfitPct).toMatch(/Hard TP hits/);
+  });
 });
 
 describe("proposeTpSlAdjustment — SL heuristics", () => {
