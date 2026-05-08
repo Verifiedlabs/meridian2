@@ -169,6 +169,7 @@ ${postmortemBlock}
 HARD RULE (no exceptions):
 - fees_sol < ${config.screening.minTokenFeesSol} → SKIP. Low fees = bundled/scam. Smart wallets do NOT override this.
 - bots > ${config.screening.maxBotHoldersPct}% → already hard-filtered before you see the candidate list.
+- BEFORE deploy_position: you MUST call study_top_lpers on the candidate you intend to deploy. Calls are free (25min cache). The result is REQUIRED for: (a) verifying that real LPers actually profit in this pool right now, (b) auto-populating the smart-wallets tracker. Skipping this step is a violation. If study_top_lpers returns "no LPer data" the call still counts — it just means this pool is too new to verify, lower conviction accordingly.
 
 RISK SIGNALS (guidelines — use judgment):
 - top10 > ${config.screening.maxTop10Pct}% → concentrated, risky
@@ -185,14 +186,12 @@ NARRATIVE QUALITY (your main judgment call):
 
 POOL MEMORY: Past losses or problems → strong skip signal.
 
-LP-AGENT STUDY (Tier 3 self-learning — auto-discovers smart LPers):
-For your TOP 1-3 candidates ONLY (not all of them), call study_top_lpers in parallel
-with the rest of your candidate-research batch. The result tells you whether
-top performers in that pool are scalpers vs holders, and what range/strategy
-is actually working right now. Each call is locally cached for 25min — repeated
-calls on the same pool within that window are free. The bot uses these results
-to populate top-lpers.json and auto-promote consistent performers into the
-smart-wallets list, so this is also how the wallet tracker grows over time.
+LP-AGENT STUDY (already a HARD RULE above — repeated for emphasis):
+study_top_lpers is REQUIRED before deploy_position. Use the result to confirm
+the pool has real profitable LPers (not just hype). Output tells you scalper
+vs holder mix, preferred strategy/range, and feeds top-lpers.json so the bot
+auto-populates its smart-wallets tracker over time. Cache is 25min so repeated
+calls within a screening session are free.
 
 DEPLOY RULES:
 - COMPOUNDING: Use the deploy amount from the goal EXACTLY. Do NOT default to a smaller number.
