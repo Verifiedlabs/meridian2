@@ -52,6 +52,10 @@ beforeEach(() => {
   config.risk.maxDeployAmount = 50;
   config.management.deployAmountSol = 0.5;
   config.management.gasReserve = 0.2;
+  // Disable A1 study-before-deploy guard for legacy tests so they
+  // continue to exercise their original assertions. The guard has its
+  // own dedicated describe block below.
+  if (config.smartLpers) config.smartLpers.enforceStudyBeforeDeploy = false;
   process.env.DRY_RUN = "true";
 });
 
@@ -194,5 +198,101 @@ describe("runSafetyChecks: deploy_position", () => {
     });
     expect(result.pass).toBe(true);
     process.env.DRY_RUN = "true";
+  });
+});
+
+// ─── A1 hard guard: study_top_lpers required before deploy_position ──
+//
+// The guard checks whether studyTopLPers() was called for the same pool
+// within the cache TTL (25min). If not, deploy is blocked with an
+// actionable error message that tells the LLM to retry after calling
+// study_top_lpers. We exercise both paths here (block when no study,
+// pass-through after a study) and verify the disable flag works.
+describe("runSafetyChecks: A1 study-before-deploy guard", () => {
+  let _resetStudyCacheForTesting;
+  let studyTopLPers;
+
+  beforeEach(async () => {
+    config.smartLpers.enforceStudyBeforeDeploy = true;
+    setMyPositions([]);
+    const studyMod = await import("../tools/study.js");
+    _resetStudyCacheForTesting = studyMod._resetStudyCacheForTesting;
+    studyTopLPers = studyMod.studyTopLPers;
+    _resetStudyCacheForTesting();
+  });
+
+  it("blocks deploy when no recent study call for the pool", async () => {
+    const result = await runSafetyChecks("deploy_position", {
+      pool_address: POOL,
+      bin_step: 100,
+      amount_y: 0.5,
+    });
+    expect(result.pass).toBe(false);
+    expect(result.reason).toMatch(/study_top_lpers required/);
+    expect(result.reason).toContain(POOL);
+  });
+
+  it("includes a copy-paste-ready retry hint in the error message", async () => {
+    const result = await runSafetyChecks("deploy_position", {
+      pool_address: POOL,
+      bin_step: 100,
+      amount_y: 0.5,
+    });
+    expect(result.reason).toContain(`study_top_lpers({pool_address: "${POOL}"})`);
+  });
+
+  it("passes through when a recent study has been recorded", async () => {
+    // Mock global fetch to satisfy studyTopLPers without hitting the API.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ topLpers: [], historicalOwners: [] }),
+    });
+
+    try {
+      // Populate the cache via a real (but mocked-fetch) study call
+      await studyTopLPers({ pool_address: POOL });
+
+      const result = await runSafetyChecks("deploy_position", {
+        pool_address: POOL,
+        bin_step: 100,
+        amount_y: 0.5,
+      });
+      // Guard passes — bin_step etc. then validate further. With
+      // bin_step=100 and amount_y=0.5 within bounds, the rest pass.
+      expect(result.pass).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("can be disabled via config.smartLpers.enforceStudyBeforeDeploy", async () => {
+    config.smartLpers.enforceStudyBeforeDeploy = false;
+    const result = await runSafetyChecks("deploy_position", {
+      pool_address: POOL,
+      bin_step: 100,
+      amount_y: 0.5,
+    });
+    // Without the guard, the rest of the safety chain runs and passes.
+    expect(result.pass).toBe(true);
+  });
+
+  it("does not block tools other than deploy_position", async () => {
+    const result = await runSafetyChecks("close_position", {
+      position_address: "abc",
+    });
+    // close_position has its own checks; the study guard MUST NOT fire.
+    expect(result.reason || "").not.toMatch(/study_top_lpers/);
+  });
+
+  it("blocks even when bin_step would be valid (guard runs first)", async () => {
+    const result = await runSafetyChecks("deploy_position", {
+      pool_address: POOL,
+      bin_step: 100,         // valid
+      amount_y: 0.5,         // valid
+      base_mint: TOKEN_A,    // valid
+    });
+    expect(result.pass).toBe(false);
+    expect(result.reason).toMatch(/study_top_lpers required/);
   });
 });

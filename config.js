@@ -285,6 +285,11 @@ export const config = {
     autoPromoteMinWinRate:   u.smartLpersMinWinRate        ?? 0.6,  // 60%
     autoPromoteMinPositions: u.smartLpersMinPositions      ?? 10,   // total positions tracked by Meridian
     recencyDecayDays:        u.smartLpersRecencyDecayDays  ?? 30,   // halflife for leaderboard scoring
+    // Hard guard: deploy_position requires a recent study_top_lpers call
+    // for the same pool. Closes the loophole where the LLM ignores the
+    // prompt rule. When blocked, the LLM gets an actionable error message
+    // and a Telegram warning fires (so operator can spot persistent skipping).
+    enforceStudyBeforeDeploy: u.enforceStudyBeforeDeploy    ?? true,
   },
 
   // ─── Darwinian Signal Weighting ───────

@@ -23,6 +23,25 @@ function getCachedStudy(pool_address) {
   return hit.data;
 }
 
+/**
+ * True iff studyTopLPers() has been called for this pool within the
+ * cache TTL (default 25min). Used by the executor's deploy_position
+ * safety check to enforce A1 self-learning loop — without this guard
+ * the LLM can silently bypass the prompt rule that requires a study
+ * call before every deploy.
+ *
+ * @param {string} pool_address
+ * @returns {boolean}
+ */
+export function hasRecentStudy(pool_address) {
+  return getCachedStudy(pool_address) !== null;
+}
+
+// Test-only: force-clear the cache so tests start from a known state.
+export function _resetStudyCacheForTesting() {
+  _studyCache.clear();
+}
+
 function putCachedStudy(pool_address, data) {
   _studyCache.set(pool_address, { data, fetchedAt: Date.now() });
 }

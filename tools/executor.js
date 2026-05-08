@@ -10,7 +10,7 @@ import {
   searchPools,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
-import { studyTopLPers } from "./study.js";
+import { studyTopLPers, hasRecentStudy } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, getPerformanceSummary, getPostMortemSuggestions, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
 
@@ -33,7 +33,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 const GMGN_CONFIG_PATH = path.join(__dirname, "../gmgn-config.json");
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+import { notifyDeploy, notifyClose, notifySwap, sendMessage } from "../telegram.js";
 
 const SENSITIVE_CONFIG_KEYS = new Set([
   "gmgnApiKey",
@@ -765,6 +765,26 @@ export async function executeTool(name, args) {
 export async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
+      // ─── A1 hard guard: study_top_lpers must be called first ───
+      // Closes the loophole where the LLM ignores the prompt rule
+      // ("MUST call study_top_lpers BEFORE deploy_position"). The guard
+      // checks the in-memory study cache (25min TTL) — pass-through if
+      // the LLM already studied this pool, hard-block otherwise. The
+      // returned error message is actionable so the LLM retries with
+      // study_top_lpers and then deploy_position in the same agent loop.
+      // Disable via config.smartLpers.enforceStudyBeforeDeploy = false.
+      if (config.smartLpers?.enforceStudyBeforeDeploy !== false) {
+        const poolForStudy = args.pool_address;
+        if (poolForStudy && !hasRecentStudy(poolForStudy)) {
+          const reason = `study_top_lpers required before deploy_position. Call study_top_lpers({pool_address: "${poolForStudy}"}) first, then retry. This is a hard guard — calls are cached for 25min so the retry is free. The result is needed to verify real LPer profitability and feed top-lpers.json self-learning.`;
+          // Telegram alert so the operator can see how often the LLM is
+          // skipping the study step. This is best-effort — never blocks
+          // the safety check return.
+          sendMessage(`🛡️ Guard: deploy blocked for ${poolForStudy.slice(0, 8)} — study_top_lpers not called first. LLM will be told to retry.`).catch(() => {});
+          return { pass: false, reason };
+        }
+      }
+
       // Reject pools with bin_step out of configured range
       const minStep = config.screening.minBinStep;
       const maxStep = config.screening.maxBinStep;
