@@ -196,6 +196,37 @@ export async function recordPerformance(perf) {
         log("evolve", `Darwin: skipped recalc — ${wResult.validation.reason}`);
       }
     }
+
+    // ── B1: Risk parameter (TP/SL) proposals ──
+    // Generate-only — never auto-applied. Operator approves via /risk accept.
+    if (config?.risk?.autoProposeRiskParams !== false && config?.management) {
+      try {
+        const proposal = proposeTpSlAdjustment(data.performance, config.management);
+        if (proposal) {
+          const stored = storeRiskProposal(proposal);
+          if (stored && stored.status === "pending") {
+            // Telegram alert — operator can review with /risk
+            try {
+              const { sendMessage } = await import("./telegram.js");
+              const lines = ["💡 <b>Risk proposal</b> — review with /risk"];
+              for (const [k, v] of Object.entries(proposal.proposals)) {
+                lines.push(`  • ${k}: ${proposal.current[k]} → <b>${v}</b>`);
+              }
+              lines.push(`<i>Sample: ${proposal.sample_size} closes (${proposal.winners}W/${proposal.losers}L)</i>`);
+              lines.push(`Use /risk accept ${stored.id} or /risk reject ${stored.id}.`);
+              const text = lines.join("\n");
+              await sendMessage(text, { parseMode: "HTML" }).catch((err) =>
+                log("silent_warn", `Risk proposal alert failed: ${err.message}`),
+              );
+            } catch (err) {
+              log("silent_warn", `Risk proposal dispatch failed: ${err.message}`);
+            }
+          }
+        }
+      } catch (err) {
+        log("silent_warn", `proposeTpSlAdjustment failed: ${err.message}`);
+      }
+    }
   }
 
   void pushHivePerformanceEvent({
@@ -554,6 +585,264 @@ function nudge(current, target, maxChange) {
   const maxDelta = current * maxChange;
   if (Math.abs(delta) <= maxDelta) return target;
   return current + Math.sign(delta) * maxDelta;
+}
+
+// ─── Risk Parameter Proposals (B1: TP/SL self-evolve) ──────────
+//
+// Risk params (takeProfitPct / stopLossPct) are PROPOSED, not auto-applied.
+// Operator approval via /risk accept|reject is required because mis-tuned
+// risk params can amplify drawdown. Proposals expire after 7 days.
+
+const RISK_PROPOSAL_EXPIRY_DAYS = 7;
+const RISK_MIN_SAMPLE = 10;          // need ≥10 closes to propose
+const RISK_MIN_CHANGE_PCT = 0.15;    // ≥15% change vs current to surface
+const TP_FLOOR = 1.5;
+const TP_CEILING = 12;
+const SL_FLOOR = -15; // most negative we'll propose
+const SL_CEILING = -2; // least negative we'll propose
+
+function classifyCloseReason(reason) {
+  const text = String(reason || "").toLowerCase();
+  if (text.includes("stop loss") || text.includes("stop_loss")) return "stop_loss";
+  if (text.includes("take profit") || text.includes("take_profit")) return "take_profit";
+  if (text.includes("trailing")) return "trailing";
+  return "other";
+}
+
+/**
+ * Analyze closed-position distribution and propose TP/SL adjustments.
+ * Returns { proposals: { takeProfitPct?, stopLossPct? }, rationale } or null.
+ *
+ * Heuristics:
+ *  TP — if TP+trailing rarely fires AND most winners stop well below current
+ *       TP, lower TP toward the 60th percentile of winners.
+ *  SL — if SL events overshoot the threshold by ≥1.5% on average (slow
+ *       close slippage), tighten SL by the average overshoot. Conversely,
+ *       if no losses are reaching SL after enough samples, can loosen.
+ *
+ * The function never mutates config. Caller is responsible for persisting
+ * the proposal via storeRiskProposal.
+ *
+ * @param {Array}  perfData    Performance records (lessons.json `performance`)
+ * @param {Object} mgmtConfig  Live config.management object (for current TP/SL)
+ * @param {Object} [opts]
+ * @param {number} [opts.minSample] override RISK_MIN_SAMPLE
+ */
+export function proposeTpSlAdjustment(perfData, mgmtConfig, opts = {}) {
+  if (!perfData || !mgmtConfig) return null;
+  const minSample = Number.isFinite(opts.minSample) && opts.minSample > 0
+    ? opts.minSample
+    : RISK_MIN_SAMPLE;
+  if (perfData.length < minSample) return null;
+
+  const currentTp = Number.isFinite(mgmtConfig.takeProfitPct) ? mgmtConfig.takeProfitPct : null;
+  const currentSl = Number.isFinite(mgmtConfig.stopLossPct) ? mgmtConfig.stopLossPct : null;
+  if (currentTp == null || currentSl == null) return null;
+
+  const winners = perfData.filter((p) => Number.isFinite(p.pnl_pct) && p.pnl_pct > 0);
+  const losers  = perfData.filter((p) => Number.isFinite(p.pnl_pct) && p.pnl_pct < 0);
+
+  const proposals = {};
+  const rationale = {};
+
+  // ── 1. takeProfitPct ─────────────────────────────────────────
+  if (winners.length >= 5) {
+    const winnerPnls = winners.map((p) => p.pnl_pct);
+    const tpHits = perfData.filter((p) => {
+      const c = classifyCloseReason(p.close_reason);
+      return c === "take_profit" || c === "trailing";
+    }).length;
+    const tpRate = tpHits / perfData.length;
+    const p60 = percentile(winnerPnls, 60);
+    const avgWinner = avg(winnerPnls);
+
+    // Lower TP if it rarely fires AND winners cluster well below it.
+    if (tpRate < 0.20 && p60 < currentTp * 0.85) {
+      const target = clamp(Math.max(p60 * 1.05, avgWinner * 0.9), TP_FLOOR, TP_CEILING);
+      const newTp = Number(target.toFixed(1));
+      const changePct = Math.abs(newTp - currentTp) / Math.max(currentTp, 0.5);
+      if (newTp < currentTp && changePct >= RISK_MIN_CHANGE_PCT) {
+        proposals.takeProfitPct = newTp;
+        rationale.takeProfitPct =
+          `TP hits ${(tpRate * 100).toFixed(0)}% (${tpHits}/${perfData.length}). ` +
+          `Winners avg ${avgWinner.toFixed(2)}%, p60=${p60.toFixed(2)}%. ` +
+          `Lower TP ${currentTp} → ${newTp} to capture more winners.`;
+      }
+    }
+  }
+
+  // ── 2. stopLossPct ───────────────────────────────────────────
+  if (losers.length >= 3) {
+    const slLosers = losers.filter((p) => classifyCloseReason(p.close_reason) === "stop_loss");
+    if (slLosers.length >= 3) {
+      const overshoots = slLosers.map((p) => p.pnl_pct - currentSl); // negative = past SL
+      const avgOvershoot = avg(overshoots);
+
+      // SL overshoots threshold by >1.5% on average — tighten by that amount
+      if (avgOvershoot < -1.5) {
+        const target = clamp(currentSl - avgOvershoot, SL_FLOOR, SL_CEILING);
+        // Cap tightening at 50% of current — never propose tightening too aggressively
+        const minSl = currentSl * 1.5;
+        const safeTarget = Math.max(target, minSl);
+        const newSl = Number(safeTarget.toFixed(1));
+        const changePct = Math.abs(newSl - currentSl) / Math.max(Math.abs(currentSl), 0.5);
+        if (newSl > currentSl && changePct >= RISK_MIN_CHANGE_PCT) {
+          proposals.stopLossPct = newSl;
+          rationale.stopLossPct =
+            `${slLosers.length} SL events overshoot by avg ${avgOvershoot.toFixed(2)}% ` +
+            `(slow close slippage). Tighten SL ${currentSl} → ${newSl} to compensate.`;
+        }
+      }
+    }
+  }
+
+  if (Object.keys(proposals).length === 0) return null;
+
+  return {
+    proposals,
+    rationale,
+    sample_size: perfData.length,
+    winners: winners.length,
+    losers: losers.length,
+    current: { takeProfitPct: currentTp, stopLossPct: currentSl },
+  };
+}
+
+/**
+ * Persist a risk-proposal record into lessons.json under `risk_proposals`.
+ * Returns the stored proposal with assigned id and status="pending".
+ * Skips when an identical pending proposal already exists (dedup).
+ */
+export function storeRiskProposal(proposalData) {
+  if (!proposalData?.proposals) return null;
+  const data = load();
+  data.risk_proposals = Array.isArray(data.risk_proposals) ? data.risk_proposals : [];
+
+  // Dedup: if a pending proposal with identical numeric proposals exists,
+  // refresh its timestamp instead of creating a duplicate.
+  const existing = data.risk_proposals.find(
+    (rp) =>
+      rp.status === "pending" &&
+      rp.proposals?.takeProfitPct === proposalData.proposals.takeProfitPct &&
+      rp.proposals?.stopLossPct === proposalData.proposals.stopLossPct,
+  );
+  if (existing) {
+    existing.refreshed_at = new Date().toISOString();
+    existing.sample_size = proposalData.sample_size ?? existing.sample_size;
+    save(data);
+    return existing;
+  }
+
+  const proposal = {
+    id: Date.now(),
+    proposals: proposalData.proposals,
+    rationale: proposalData.rationale,
+    sample_size: proposalData.sample_size,
+    winners: proposalData.winners,
+    losers: proposalData.losers,
+    current: proposalData.current,
+    status: "pending",
+    created_at: new Date().toISOString(),
+  };
+  data.risk_proposals.push(proposal);
+  // Cap at last 50 — protects against unbounded growth
+  if (data.risk_proposals.length > 50) {
+    data.risk_proposals = data.risk_proposals.slice(-50);
+  }
+  save(data);
+  log("evolve", `Risk proposal queued: ${JSON.stringify(proposalData.proposals)}`);
+  return proposal;
+}
+
+/**
+ * List pending risk proposals (newest first), filtering out expired ones.
+ */
+export function getPendingRiskProposals() {
+  const data = load();
+  const all = Array.isArray(data.risk_proposals) ? data.risk_proposals : [];
+  const cutoff = Date.now() - RISK_PROPOSAL_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
+  return all
+    .filter((rp) => rp.status === "pending" && new Date(rp.created_at).getTime() >= cutoff)
+    .slice()
+    .reverse();
+}
+
+/**
+ * Accept a pending proposal — applies it to user-config.json + live config.
+ * Returns { success, applied, rejected_reason? }.
+ */
+export function acceptRiskProposal(id, liveConfig) {
+  const data = load();
+  data.risk_proposals = Array.isArray(data.risk_proposals) ? data.risk_proposals : [];
+  const proposal = data.risk_proposals.find((rp) => rp.id === id);
+  if (!proposal) return { success: false, error: "proposal not found" };
+  if (proposal.status !== "pending") {
+    return { success: false, error: `proposal already ${proposal.status}` };
+  }
+
+  // Persist to user-config.json
+  let userConfig = {};
+  if (fs.existsSync(USER_CONFIG_PATH)) {
+    try { userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8")); } catch { /* ignore */ }
+  }
+  const applied = {};
+  if (proposal.proposals.takeProfitPct != null) {
+    userConfig.takeProfitPct = proposal.proposals.takeProfitPct;
+    applied.takeProfitPct = proposal.proposals.takeProfitPct;
+  }
+  if (proposal.proposals.stopLossPct != null) {
+    userConfig.stopLossPct = proposal.proposals.stopLossPct;
+    applied.stopLossPct = proposal.proposals.stopLossPct;
+  }
+  userConfig._lastRiskAccepted = new Date().toISOString();
+  writeJsonAtomicSync(USER_CONFIG_PATH, userConfig);
+
+  // Apply to live config if provided
+  if (liveConfig?.management) {
+    if (applied.takeProfitPct != null) liveConfig.management.takeProfitPct = applied.takeProfitPct;
+    if (applied.stopLossPct != null) liveConfig.management.stopLossPct = applied.stopLossPct;
+  }
+
+  proposal.status = "accepted";
+  proposal.accepted_at = new Date().toISOString();
+
+  // Audit lesson so the change appears in lesson timeline
+  data.lessons.push({
+    id: Date.now(),
+    rule: `[RISK ACCEPTED #${id}] Applied ${Object.entries(applied).map(([k, v]) => `${k}=${v}`).join(", ")} — ${Object.values(proposal.rationale).join("; ")}`,
+    tags: ["risk_change", "config_change", "accepted"],
+    outcome: "manual",
+    created_at: new Date().toISOString(),
+  });
+
+  save(data);
+  log("evolve", `Risk proposal #${id} accepted: ${JSON.stringify(applied)}`);
+  return { success: true, applied };
+}
+
+/**
+ * Reject a pending proposal — leaves config untouched.
+ */
+export function rejectRiskProposal(id) {
+  const data = load();
+  data.risk_proposals = Array.isArray(data.risk_proposals) ? data.risk_proposals : [];
+  const proposal = data.risk_proposals.find((rp) => rp.id === id);
+  if (!proposal) return { success: false, error: "proposal not found" };
+  if (proposal.status !== "pending") {
+    return { success: false, error: `proposal already ${proposal.status}` };
+  }
+  proposal.status = "rejected";
+  proposal.rejected_at = new Date().toISOString();
+  save(data);
+  log("evolve", `Risk proposal #${id} rejected`);
+  return { success: true };
+}
+
+// Test helper — never call from production code
+export function _resetRiskProposalsForTesting() {
+  const data = load();
+  data.risk_proposals = [];
+  save(data);
 }
 
 // ─── Manual Lessons ────────────────────────────────────────────

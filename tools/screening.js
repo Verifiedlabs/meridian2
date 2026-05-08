@@ -2,7 +2,7 @@ import { config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
-import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
+import { isBaseMintOnCooldown, isPoolOnCooldown, getPoolHistoryStats } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { discoverGmgnPools } from "./gmgn.js";
 
@@ -331,6 +331,27 @@ export async function getTopCandidates({ limit = 10, screeningOverrides = null }
         log("screening", `Filtered cooldown token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)})`);
         pushFilteredReason(filteredOut, p, "token cooldown active");
         return false;
+      }
+      // B2: pool history guard — skip pools with consistently negative
+      // historical PnL even when no cooldown is active.
+      if (config.screening.poolHistoryGuardEnabled !== false) {
+        const stats = getPoolHistoryStats(p.pool);
+        const minSamples = Number.isFinite(config.screening.poolHistoryMinSamples)
+          ? config.screening.poolHistoryMinSamples
+          : 3;
+        const maxAvgPnl = Number.isFinite(config.screening.poolHistoryMaxAvgPnl)
+          ? config.screening.poolHistoryMaxAvgPnl
+          : -1;
+        if (
+          stats &&
+          stats.total_deploys >= minSamples &&
+          stats.avg_pnl_pct <= maxAvgPnl
+        ) {
+          const reason = `bad pool history (n=${stats.total_deploys}, avg PnL ${stats.avg_pnl_pct}%)`;
+          log("screening", `Filtered ${p.name} (${p.pool.slice(0, 8)}) — ${reason}`);
+          pushFilteredReason(filteredOut, p, reason);
+          return false;
+        }
       }
       return true;
     })

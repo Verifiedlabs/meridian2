@@ -1987,7 +1987,11 @@ export async function closePosition({ position_address, reason }) {
                 break;
               }
             } else {
-              log("close_warn", `Position not found in status=closed response (attempt ${attempt + 1}/6) — may still be settling`);
+              // Early settling polls (1-3) are routine — log at debug level.
+              // Late polls (4-6) stay as warnings so a stuck close is visible.
+              const earlyAttempt = attempt + 1 <= 3;
+              const tag = earlyAttempt ? "close" : "close_warn";
+              log(tag, `Position not found in status=closed response (attempt ${attempt + 1}/6) — may still be settling`);
             }
           }
           if (attempt < 5) await new Promise((r) => setTimeout(r, 5000));

@@ -235,6 +235,27 @@ export function isBaseMintOnCooldown(baseMint) {
   );
 }
 
+/**
+ * Read-only stats lookup for screening guards. Returns aggregate metrics
+ * without any cooldown-side-effects so callers can make pure decisions.
+ *
+ * @param {string} poolAddress
+ * @returns {{ total_deploys, avg_pnl_pct, win_rate, name } | null}
+ */
+export function getPoolHistoryStats(poolAddress) {
+  if (!poolAddress) return null;
+  const db = load();
+  const entry = db[poolAddress];
+  if (!entry || !entry.total_deploys) return null;
+  return {
+    name: entry.name,
+    total_deploys: entry.total_deploys,
+    avg_pnl_pct: entry.avg_pnl_pct,
+    win_rate: entry.win_rate,
+    last_outcome: entry.last_outcome,
+  };
+}
+
 // ─── Read ──────────────────────────────────────────────────────
 
 /**

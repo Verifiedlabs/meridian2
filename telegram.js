@@ -83,6 +83,19 @@ export function isEnabled() {
   return !!TOKEN;
 }
 
+// Some Telegram errors are benign noise rather than real failures:
+//   - "message is not modified" when an edit produces identical content
+//   - "message to edit not found" when the user deleted the live message
+// We swallow them silently to keep operator logs readable.
+function isBenignTelegramError(method, errText) {
+  if (method !== "editMessageText") return false;
+  const t = String(errText || "").toLowerCase();
+  return (
+    t.includes("message is not modified") ||
+    t.includes("message to edit not found")
+  );
+}
+
 async function postTelegram(method, body) {
   if (!TOKEN || !chatId) return null;
   try {
@@ -93,7 +106,9 @@ async function postTelegram(method, body) {
     });
     if (!res.ok) {
       const err = await res.text();
-      log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
+      if (!isBenignTelegramError(method, err)) {
+        log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
+      }
       return null;
     }
     return await res.json();
@@ -113,7 +128,9 @@ async function postTelegramRaw(method, body) {
     });
     if (!res.ok) {
       const err = await res.text();
-      log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
+      if (!isBenignTelegramError(method, err)) {
+        log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
+      }
       return null;
     }
     return await res.json();
@@ -138,9 +155,22 @@ export async function sendMessageWithButtons(text, inlineKeyboard, options = {})
   return postTelegram("sendMessage", body);
 }
 
+// Strip HTML tags as a last-resort fallback when Telegram rejects malformed
+// entities. Keeps the message readable rather than dropping it silently.
+function stripHtmlTags(text) {
+  return String(text || "")
+    .replace(/<\/?[a-z][^>]*>/gi, "")  // valid-looking tags
+    .replace(/<[^>]*>/g, "");          // anything else that looks like a tag
+}
+
 export async function sendHTML(html) {
   if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
+  const text = String(html || "").slice(0, 4096);
+  const result = await postTelegram("sendMessage", { text, parse_mode: "HTML" });
+  if (result) return result;
+  // Fallback: HTML parser rejected the message. Send as plain text so the
+  // operator still sees the content. Already logged inside postTelegram.
+  return postTelegram("sendMessage", { text: stripHtmlTags(text).slice(0, 4096) });
 }
 
 export async function editMessage(text, messageId) {

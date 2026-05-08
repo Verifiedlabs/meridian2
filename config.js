@@ -65,6 +65,11 @@ export const config = {
     drawdownStreakThreshold:   u.drawdownStreakThreshold   ?? 7,     // trip if N losses among ...
     drawdownStreakWindow:      u.drawdownStreakWindow      ?? 10,    // ... last K closes
     drawdownCooldownMinutes:   u.drawdownCooldownMinutes   ?? 120,   // auto-resume after this many minutes
+    // ─── B1: TP/SL self-evolve proposals ───────
+    // When true (default) lessons.js generates TP/SL change proposals every
+    // 5 closed positions. Proposals are queued — never auto-applied.
+    // Operator approves via Telegram /risk accept <id> or /risk reject <id>.
+    autoProposeRiskParams:     u.autoProposeRiskParams     ?? true,
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -99,6 +104,16 @@ export const config = {
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
     dropOkxRugpull:     u.dropOkxRugpull     ?? true, // hard-drop pools with OKX is_rugpull flag
+    // ─── B2: Pool history guard ─────────────
+    // Skip pools with consistently bad past performance. Triggers when a
+    // pool has at least `poolHistoryMinSamples` recorded deploys AND its
+    // average pnl_pct is at-or-below `poolHistoryMaxAvgPnl`. Distinct from
+    // the cooldown system (which fires on specific close reasons): this
+    // catches pools that are reliably money-losing across deploys, even
+    // when individual closes don't trigger cooldowns.
+    poolHistoryGuardEnabled: u.poolHistoryGuardEnabled ?? true,
+    poolHistoryMinSamples:   u.poolHistoryMinSamples   ?? 3,
+    poolHistoryMaxAvgPnl:    u.poolHistoryMaxAvgPnl    ?? -1,  // % — skip if avg <= this
   },
 
   gmgn: {

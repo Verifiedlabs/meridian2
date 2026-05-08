@@ -8,7 +8,16 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { formatGmgnCandidateForPrompt } from "./tools/gmgn.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
-import { evolveThresholds, getPerformanceSummary, getPerformanceHistory, listLessons, getPostMortemSuggestions } from "./lessons.js";
+import {
+  evolveThresholds,
+  getPerformanceSummary,
+  getPerformanceHistory,
+  listLessons,
+  getPostMortemSuggestions,
+  getPendingRiskProposals,
+  acceptRiskProposal,
+  rejectRiskProposal,
+} from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
   startPolling,
@@ -1959,6 +1968,22 @@ function buildRiskMessage(walletInfo, posResult) {
       }
     } catch { /* breaker is non-critical for /risk display */ }
 
+    // ─── Pending risk proposals (B1) ───
+    try {
+      const proposals = getPendingRiskProposals();
+      if (proposals.length > 0) {
+        sections.push("");
+        sections.push(`<b>💡 Pending TP/SL proposals (${proposals.length})</b>`);
+        for (const p of proposals.slice(0, 3)) {
+          const changes = Object.entries(p.proposals)
+            .map(([k, v]) => `${k}: ${p.current[k]} → <b>${v}</b>`)
+            .join("  ·  ");
+          sections.push(`  <code>#${p.id}</code>  ${changes}`);
+        }
+        sections.push(`  <i>Review with /risk proposals · accept with /risk accept &lt;id&gt;</i>`);
+      }
+    } catch { /* proposals are non-critical */ }
+
     return sections.join("\n");
   } catch (e) {
     return `⚠️ Risk error: ${e.message}`;
@@ -2677,7 +2702,73 @@ async function telegramHandler(msg) {
     return;
   }
 
-  if (text === "/risk") {
+  if (text === "/risk" || text.startsWith("/risk ")) {
+    const parts = text.split(/\s+/).slice(1);
+    const sub = parts[0]?.toLowerCase();
+
+    // ── /risk proposals — list pending TP/SL proposals
+    if (sub === "proposals" || sub === "list") {
+      try {
+        const proposals = getPendingRiskProposals();
+        if (proposals.length === 0) {
+          await sendMessage("No pending risk proposals.").catch((err) => log("silent_warn", err.message));
+          return;
+        }
+        const lines = [`💡 <b>Pending risk proposals (${proposals.length})</b>`, ""];
+        for (const p of proposals) {
+          const changes = Object.entries(p.proposals)
+            .map(([k, v]) => `${k}: ${p.current[k]} → <b>${v}</b>`)
+            .join("\n  ");
+          const why = Object.values(p.rationale || {}).join(" · ");
+          lines.push(`<b>#${p.id}</b>`);
+          lines.push(`  ${changes}`);
+          lines.push(`  <i>${escapeHtml(why)}</i>`);
+          lines.push(`  <i>n=${p.sample_size} (${p.winners}W/${p.losers}L)</i>`);
+          lines.push("");
+        }
+        lines.push("Use <code>/risk accept &lt;id&gt;</code> or <code>/risk reject &lt;id&gt;</code>.");
+        const body = lines.join("\n");
+        const ok = await sendHTML(body).catch((err) => { log("silent_warn", err.message); return null; });
+        if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
+      } catch (e) {
+        await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
+      }
+      return;
+    }
+
+    // ── /risk accept <id> | /risk reject <id>
+    if (sub === "accept" || sub === "reject") {
+      const id = parseInt(parts[1], 10);
+      if (!Number.isFinite(id)) {
+        await sendMessage(`Usage: /risk ${sub} <id>\n\nList pending with /risk proposals.`).catch((err) => log("silent_warn", err.message));
+        return;
+      }
+      try {
+        const result = sub === "accept"
+          ? acceptRiskProposal(id, config)
+          : rejectRiskProposal(id);
+        if (!result.success) {
+          await sendMessage(`❌ ${result.error}`).catch((err) => log("silent_warn", err.message));
+          return;
+        }
+        if (sub === "accept") {
+          const applied = result.applied || {};
+          const lines = [`✅ <b>Risk proposal #${id} accepted</b>`];
+          for (const [k, v] of Object.entries(applied)) {
+            lines.push(`  ${k} = <b>${v}</b>`);
+          }
+          lines.push("<i>Live config updated. Next cycle uses the new value.</i>");
+          await sendHTML(lines.join("\n")).catch((err) => log("silent_warn", err.message));
+        } else {
+          await sendMessage(`Rejected proposal #${id}.`).catch((err) => log("silent_warn", err.message));
+        }
+      } catch (e) {
+        await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
+      }
+      return;
+    }
+
+    // ── /risk (default snapshot)
     try {
       const [wallet, posResult] = await Promise.all([
         getWalletBalances().catch((err) => { log("silent_warn", err.message); return null; }),
