@@ -18,6 +18,11 @@ export const MANAGER_TOOLS = new Set([
   "get_position_pnl",
   "get_my_positions",
   "get_wallet_balance",
+  // Research-only — prompt explicitly allows this in the MANAGER role
+  // (no deploy trigger). Useful when checking whether the open
+  // position's pool has profitable LPers worth holding alongside.
+  "study_top_lpers",
+  "get_top_lpers",
 ]);
 
 export const SCREENER_TOOLS = new Set([
@@ -33,6 +38,11 @@ export const SCREENER_TOOLS = new Set([
   "get_pool_memory",
   "get_wallet_balance",
   "get_my_positions",
+  // A1 self-learning — required before deploy_position. Without this
+  // in the SCREENER toolkit the LLM literally answers "tool not
+  // available" and skips the study step entirely.
+  "study_top_lpers",
+  "get_top_lpers",
 ]);
 
 /**
