@@ -149,6 +149,7 @@ export function formatHelpText() {
     "/history — last 7d of closed positions with PnL",
     "/lessons — auto-derived lessons + close-reason breakdown",
     "/perf — performance summary (close-reason histogram, win rate, PnL)",
+    "/calendar [YYYY-MM] — daily PnL calendar with prev/next nav (default: current month)",
     "/postmortem — diagnostic suggestions (high/medium severity flags)",
     "/risk — exposure snapshot + worst-case loss if all SLs fire",
     "/risk proposals — list pending TP/SL self-evolve proposals",

@@ -500,17 +500,38 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct }) {
+export async function notifyClose({ pair, pnlUsd, pnlPct, reason }) {
   if (hasActiveLiveMessage()) return;
   if (isMuted("close")) {
     logMuteSkip("close", `${pair} pnl=${(pnlUsd ?? 0).toFixed(2)} pct=${(pnlPct ?? 0).toFixed(2)}%`);
     return;
   }
   const sign = pnlUsd >= 0 ? "+" : "";
+  const reasonStr = formatCloseReason(reason);
   await sendHTML(
     `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)` +
+    (reasonStr ? `\n<i>${reasonStr}</i>` : "")
   );
+}
+
+// Format the raw close reason for the Telegram alert. Strips the noisy
+// `realtime:` prefix (the user already sees this is a close) and the
+// generic `agent decision` fallback (not informative). Truncates long
+// reasons (e.g. trailing-TP detail strings) so the message stays compact.
+function formatCloseReason(reason) {
+  if (!reason) return "";
+  let text = String(reason).trim();
+  if (!text) return "";
+  // Drop the `realtime:` prefix added by the fast-close path — adds no
+  // information for the operator and crowds the message.
+  text = text.replace(/^realtime:\s*/i, "");
+  // The default `agent decision` reason carries no real information.
+  if (/^agent decision$/i.test(text)) return "";
+  // Strip HTML-special chars to be safe under parseMode=HTML.
+  text = text.replace(/[<>&]/g, " ");
+  if (text.length > 120) text = text.slice(0, 117) + "...";
+  return text;
 }
 
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {

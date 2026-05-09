@@ -182,3 +182,171 @@ function loadJson(file) {
     return null;
   }
 }
+
+/**
+ * Convenience wrapper: read lessons.json and pass `performance` into
+ * buildPnlCalendar. Falls back to an empty array on any read/parse error so
+ * the caller still gets a valid (empty) calendar instead of a crash.
+ */
+export function buildPnlCalendarFromDisk(opts = {}) {
+  const data = loadJson(LESSONS_FILE);
+  const perf = Array.isArray(data?.performance) ? data.performance : [];
+  return buildPnlCalendar(perf, opts);
+}
+
+/**
+ * Render a per-day PnL calendar view for one month. Aggregates closed-position
+ * PnL by UTC day so the operator can review daily results without opening
+ * Meteora's web dashboard.
+ *
+ * Returns:
+ *   {
+ *     text,          // HTML-formatted message body (caller wraps with sendHTML)
+ *     year, month,   // resolved target month (month is 0-indexed)
+ *     prevYM,        // "YYYY-MM" label for the previous month (1-indexed month)
+ *     nextYM,        // "YYYY-MM" label for the next month (1-indexed month)
+ *     hasPrev,       // false when there are no records before the target month
+ *     hasNext,       // false when target month is current month or later
+ *     totals,        // { pnl_usd, count, wins, losses }
+ *     empty,         // true when no closes recorded in the target month
+ *   }
+ *
+ * Exported for unit testing and reuse from the Telegram /calendar command +
+ * panel:calendar callback.
+ */
+export function buildPnlCalendar(performance, opts = {}) {
+  const { year: optYear, month: optMonth, now = new Date() } = opts;
+
+  // Default to the current UTC month when no target was specified.
+  const target = (optYear != null && optMonth != null)
+    ? new Date(Date.UTC(optYear, optMonth, 1))
+    : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+
+  if (Number.isNaN(target.getTime())) {
+    throw new Error(`buildPnlCalendar: invalid target year/month (${optYear}/${optMonth})`);
+  }
+
+  const targetYear = target.getUTCFullYear();
+  const targetMonth = target.getUTCMonth();
+  const monthStart = Date.UTC(targetYear, targetMonth, 1);
+  const monthEnd = Date.UTC(targetYear, targetMonth + 1, 1);
+  const daysInMonth = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
+
+  // Pre-seed every day so future-day rows can be skipped uniformly without
+  // mid-loop "is this day in the buckets" checks.
+  const buckets = new Array(daysInMonth + 1).fill(null).map(() => ({
+    pnl: 0, count: 0, wins: 0, losses: 0,
+  }));
+
+  let earliestRecordTs = Infinity;
+  for (const p of Array.isArray(performance) ? performance : []) {
+    const ts = new Date(p?.recorded_at || p?.closed_at || 0).getTime();
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    if (ts < earliestRecordTs) earliestRecordTs = ts;
+    if (ts < monthStart || ts >= monthEnd) continue;
+    const day = new Date(ts).getUTCDate();
+    const bucket = buckets[day];
+    if (!bucket) continue;
+    const pnl = Number(p.pnl_usd) || 0;
+    bucket.pnl += pnl;
+    bucket.count += 1;
+    if (pnl > 0.005) bucket.wins += 1;
+    else if (pnl < -0.005) bucket.losses += 1;
+  }
+
+  const todayUtcStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+
+  // Build a one-line-per-day list. Future days within the target month are
+  // hidden so the message stays compact when looking at the current month.
+  const dayLines = [];
+  let monthPnl = 0;
+  let monthCount = 0;
+  let monthWins = 0;
+  let monthLosses = 0;
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dayStart = Date.UTC(targetYear, targetMonth, d);
+    if (dayStart > todayUtcStart) break;
+    const b = buckets[d];
+    monthPnl += b.pnl;
+    monthCount += b.count;
+    monthWins += b.wins;
+    monthLosses += b.losses;
+    const dayDate = new Date(dayStart);
+    const dayName = dayDate.toLocaleString("en-US", { weekday: "short", timeZone: "UTC" });
+    const dd = String(d).padStart(2, "0");
+    if (b.count === 0) {
+      dayLines.push(`<code>${dd} ${dayName}</code>  ·   —`);
+    } else {
+      const dot = b.pnl > 0.005 ? "🟢" : b.pnl < -0.005 ? "🔴" : "⚪";
+      const sign = b.pnl >= 0 ? "+" : "-";
+      const pnlStr = `${sign}$${Math.abs(b.pnl).toFixed(2)}`;
+      const countStr = b.count > 1 ? `(${b.count})` : "(1)";
+      dayLines.push(`<code>${dd} ${dayName}</code>  ${dot} <b>${pnlStr}</b>  ${countStr}`);
+    }
+  }
+
+  const monthLabel = new Date(monthStart).toLocaleString("en-US", {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+
+  const lines = [];
+  lines.push(`📅 <b>Daily PnL · ${monthLabel}</b>`);
+  lines.push("━━━━━━━━━━━━━━━━━━━");
+  if (dayLines.length === 0) {
+    lines.push("<i>No days in this month yet.</i>");
+  } else {
+    lines.push(...dayLines);
+  }
+  lines.push("━━━━━━━━━━━━━━━━━━━");
+  if (monthCount === 0) {
+    lines.push("<i>No closed positions this month.</i>");
+  } else {
+    const monthSign = monthPnl >= 0 ? "+" : "-";
+    const wr = Math.round((monthWins / monthCount) * 100);
+    lines.push(
+      `<b>Month:</b> ${monthSign}$${Math.abs(monthPnl).toFixed(2)} · ` +
+      `WR ${wr}% (${monthWins}W/${monthLosses}L) · ${monthCount} closes`,
+    );
+  }
+
+  // Compose YYYY-MM labels (1-indexed for human readability) for the
+  // navigation buttons. Wrap month overflow correctly when crossing
+  // December → January boundaries.
+  const fmtYM = (y, m /* 0-indexed */) => {
+    let yy = y;
+    let mm = m;
+    if (mm < 0) { yy -= 1; mm += 12; }
+    if (mm > 11) { yy += 1; mm -= 12; }
+    return `${yy}-${String(mm + 1).padStart(2, "0")}`;
+  };
+
+  const currentMonthStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+  const hasNext = monthStart < currentMonthStart;
+  // Allow Prev as long as there is at least one record strictly before the
+  // target month start. Falls back to true when no records exist (the user
+  // can scroll back, see empty months, then return). When records exist but
+  // all are within or after the target month, hide Prev so the user doesn't
+  // wander into ancient empty months.
+  const hasPrev = !Number.isFinite(earliestRecordTs)
+    ? false
+    : earliestRecordTs < monthStart;
+
+  return {
+    text: lines.join("\n"),
+    year: targetYear,
+    month: targetMonth,
+    prevYM: fmtYM(targetYear, targetMonth - 1),
+    nextYM: fmtYM(targetYear, targetMonth + 1),
+    hasPrev,
+    hasNext,
+    totals: {
+      pnl_usd: Math.round(monthPnl * 100) / 100,
+      count: monthCount,
+      wins: monthWins,
+      losses: monthLosses,
+    },
+    empty: monthCount === 0,
+  };
+}

@@ -35,7 +35,7 @@ import {
   isMuted as telegramMuted,
   createLiveMessage,
 } from "./telegram.js";
-import { generateBriefing } from "./briefing.js";
+import { generateBriefing, buildPnlCalendarFromDisk } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, setPositionExploration, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
@@ -983,6 +983,7 @@ async function handleRealtimeOor({ positionAddress, poolAddress, activeBin, lowe
         pair: result.pool_name || positionAddress.slice(0, 8),
         pnlUsd: result.pnl_usd ?? 0,
         pnlPct: result.pnl_pct ?? 0,
+        reason: rule.reason,
       }).catch((err) => log("notify_warn", err.message));
     } else if (result?.skipped) {
       // Another caller (management cron or /close) already holds the close
@@ -1514,6 +1515,7 @@ async function renderControlPanel() {
     ],
     [
       { text: "⚠️ Risk",        callback_data: "panel:risk" },
+      { text: "📅 Calendar",    callback_data: "panel:calendar" },
     ],
     [
       { text: "💼 Wallet",     callback_data: "panel:wallet" },
@@ -1643,6 +1645,44 @@ async function buildHistoryMessage(limit = 10) {
   } catch (e) {
     return `History error: ${e.message}`;
   }
+}
+
+// Build a calendar view of daily PnL for one month. Reused by both the
+// /calendar slash command and the panel:calendar callback. Reads
+// performance records from lessons.json (no on-chain RPC) so it's cheap
+// to render — the operator can flip months without a per-click cost.
+//
+// `target` accepts:
+//   - null/undefined        → current UTC month
+//   - "YYYY-MM" string      → that specific month
+//   - { year, month0 }      → explicit (month0 is 0-indexed)
+function buildCalendarView(target = null) {
+  let year = null;
+  let month = null;
+  if (typeof target === "string") {
+    const m = target.match(/^(\d{4})-(\d{1,2})$/);
+    if (m) {
+      year = parseInt(m[1], 10);
+      month = parseInt(m[2], 10) - 1;
+    }
+  } else if (target && typeof target === "object") {
+    if (Number.isFinite(target.year) && Number.isFinite(target.month0)) {
+      year = target.year;
+      month = target.month0;
+    }
+  }
+  const cal = buildPnlCalendarFromDisk(
+    year != null && month != null ? { year, month } : {},
+  );
+  const navRow = [];
+  if (cal.hasPrev) navRow.push({ text: "◀ Prev",   callback_data: `panel:calendar_nav:${cal.prevYM}` });
+  navRow.push({ text: "📅 Today", callback_data: "panel:calendar" });
+  if (cal.hasNext) navRow.push({ text: "Next ▶",   callback_data: `panel:calendar_nav:${cal.nextYM}` });
+  const keyboard = [
+    navRow,
+    [{ text: "↩ Back to Panel", callback_data: "panel:refresh" }],
+  ];
+  return { ...cal, keyboard };
 }
 
 // Build the Lessons panel view: pinned + recent + close-reason breakdown.
@@ -2324,6 +2364,29 @@ async function applyControlPanelCallback(msg) {
     });
     return;
   }
+  // panel:calendar           → current month
+  // panel:calendar_nav:YYYY-MM → specific month (from prev/next nav button)
+  if (action === "calendar" || action === "calendar_nav") {
+    await ack();
+    const target = action === "calendar_nav" ? (parts[2] || null) : null;
+    let cal;
+    try {
+      cal = buildCalendarView(target);
+    } catch (e) {
+      await editMessageWithButtons(`Error: ${escapeHtml(e.message)}`, messageId,
+        [[{ text: "↩ Back to Panel", callback_data: "panel:refresh" }]],
+      ).catch((err) => log("silent_warn", err.message));
+      return;
+    }
+    await editMessageWithButtons(cal.text, messageId, cal.keyboard, { parseMode: "HTML" })
+      .catch(async () => {
+        // HTML rejected — strip tags
+        const plain = cal.text.replace(/<[^>]+>/g, "");
+        await editMessageWithButtons(plain, messageId, cal.keyboard)
+          .catch(() => sendMessageWithButtons(plain, cal.keyboard));
+      });
+    return;
+  }
   if (action === "settings") {
     await ack();
     await showSettingsMenu({ messageId });
@@ -2692,6 +2755,26 @@ async function telegramHandler(msg) {
     const body = buildPerformanceMessage();
     const ok = await sendHTML(body).catch((err) => { log("silent_warn", err.message); return null; });
     if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
+    return;
+  }
+
+  // /calendar [YYYY-MM] — daily PnL calendar with prev/next nav.
+  // No arg = current month. Uses callback nav buttons so the operator
+  // can flip months without retyping commands.
+  const calendarMatch = text.match(/^\/calendar(?:\s+(\d{4}-\d{1,2}))?$/i);
+  if (calendarMatch) {
+    try {
+      const cal = buildCalendarView(calendarMatch[1] || null);
+      const ok = await sendMessageWithButtons(cal.text, cal.keyboard, { parseMode: "HTML" })
+        .catch((err) => { log("silent_warn", err.message); return null; });
+      if (!ok) {
+        // HTML rejected — strip tags and retry without parse_mode
+        await sendMessageWithButtons(cal.text.replace(/<[^>]+>/g, ""), cal.keyboard)
+          .catch((err) => log("silent_warn", err.message));
+      }
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
+    }
     return;
   }
 
