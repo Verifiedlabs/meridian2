@@ -30,24 +30,28 @@ Meridian opens, monitors, and closes concentrated-liquidity positions on Meteora
 
 ## What it does
 
-- **Screens pools** — every 30 minutes (default), scans Meteora DLMM pools and filters by fee/TVL ratio, organic score, holder count, market cap, bin step, bundler %, top-10 holder concentration, OKX rugpull/wash-trading flags, and more.
+- **Screens pools** — every 30 minutes (default), scans Meteora **or GMGN** pools and filters by fee/TVL ratio, organic score, holder count, market cap, bin step, bundler %, top-10 holder concentration, KOL/smart-degen counts, OKX rugpull/wash-trading flags, and more.
 - **Deploys positions** — picks the best surviving candidate and opens an LP position with a sized, configurable SOL amount (the LLM decides which pool, you set the bounds).
-- **Manages positions** — every 10 minutes, evaluates each open position for stop-loss, take-profit, out-of-range, low-yield, and PnL-suspect exits.
+- **Manages positions** — every 10 minutes, evaluates each open position for stop-loss, take-profit (incl. **adaptive trailing**), out-of-range, low-yield, and PnL-suspect exits.
+- **Realtime fast-close** — a WebSocket watcher reacts within seconds when price pumps far above range or trips a profit-protection rule, instead of waiting for the next 10-min management cycle.
 - **Claims fees** — when fees accrued cross your `minClaimAmount` threshold.
-- **Closes and re-deploys** — when a position hits exit criteria, closes it, optionally swaps the base token back to SOL, and feeds the result into the lessons system.
-- **Learns** — closed-position outcomes are recorded; after 10+ closes, the **darwin tuner** auto-evolves screening thresholds based on your actual win/loss data.
-- **Talks to you** — REPL prompt, Telegram bot, daily briefings, OOR alerts, deploy/close notifications.
+- **Closes and re-deploys** — when a position hits exit criteria, closes it, optionally swaps the base token back to SOL, and feeds the result into the lessons system. Each close notification now includes the close reason.
+- **Self-protects** — circuit breaker trips on daily-loss / consecutive-loss limits and pauses new deploys until cooldown elapses; exploration budget caps over-deployment to similar pools; pool-history guard cools down pools that keep dumping you.
+- **Learns** — five tiers of self-learning: composite-scored lesson injection, operator-curated coaching memos, top-LPer auto-discovery, TP/SL self-evolve proposals (operator-approved), and pool-level guards. After 10+ closes, the **darwin tuner** auto-evolves screening thresholds based on your actual win/loss data.
+- **Talks to you** — REPL prompt, Telegram **control panel** with inline buttons, daily briefings, OOR alerts, deploy/close notifications, daily PnL calendar, postmortem flags, exposure/risk snapshot.
 
 ---
 
 ## How it works
 
-Meridian runs a **ReAct loop**: each cycle the LLM reads live data → calls a tool → reads the result → calls another tool, etc. → makes a decision. Two specialised agents run on independent cron schedules:
+Meridian runs a **ReAct loop**: each cycle the LLM reads live data → calls a tool → reads the result → calls another tool, etc. → makes a decision. Three specialised agent roles run on independent cron schedules, each with its own scoped toolkit (so a SCREENER can't accidentally close positions, a MANAGER can't deploy fresh ones):
 
-| Agent | Default cadence | Role |
+| Role | Default cadence | What it does |
 |---|---|---|
-| **Hunter Alpha** (screener) | every 30 min | finds and deploys into the best surviving candidate |
-| **Healer Alpha** (manager) | every 10 min | evaluates each open position and acts (stay / close / claim / swap) |
+| **SCREENER** (Hunter Alpha) | every 30 min | discovers candidates → studies top LPers → deploys into the best surviving one |
+| **MANAGER** (Healer Alpha) | every 10 min | evaluates each open position and acts (stay / close / claim / swap) |
+| **GENERAL** | on demand | free-form chat / Telegram commands, full toolkit |
+| **Realtime watcher** | continuous | WS-driven fast-close on profit-protection / OOR rules |
 | **Health check** | every 60 min | summarises portfolio state to Telegram |
 
 **Data sources:**
@@ -104,9 +108,10 @@ LLMs are accessed via **OpenRouter** by default, but you can swap any OpenAI-com
 ```bash
 git clone https://github.com/Verifiedlabs/meridian.git
 cd meridian
-git checkout experimental    # the active development branch
 npm install
 ```
+
+Default branch is `main` and is the active development branch.
 
 If `npm install` errors on your machine, make sure you're on Node.js **18 or newer** (`node -v`).
 
@@ -188,18 +193,15 @@ Keep `.env.raw` and `.envrypt` local — both are gitignored.
 npm test
 ```
 
-You should see:
+You should see something like:
 
 ```
- ✓ test/state.test.js (19)
- ✓ test/runSafetyChecks.test.js (11)
- ✓ test/evolveThresholds.test.js (7)
- ✓ test/computeDeployAmount.test.js (9)
-
- Test Files  4 passed (4)
-      Tests  46 passed (46)
-   Duration  ~1s
+ Test Files  18 passed (18)
+      Tests  258 passed (258)
+   Duration  ~2s
 ```
+
+The suite covers state machine transitions, safety checks, deterministic close rules, agent role gating, threshold evolution, holdout validation, adaptive trailing, circuit breaker, top-LPer scoring, lesson scoring, performance summaries, postmortem suggestions, risk proposals, pool-history guard, daily PnL chart, daily PnL calendar, and coaching.
 
 If any test fails, do **not** continue. Open an issue with the output.
 
@@ -304,14 +306,43 @@ TELEGRAM_ALLOWED_USER_IDS=<your user id from step 2>
 ### What you'll get
 
 - Cycle reports (every screening + management run)
-- Deploy notifications: pair, amount, position address, tx hash
-- Close notifications: pair, PnL, fees earned
+- Deploy notifications: pair, amount, position address, tx hash, range coverage, bin step, base fee
+- Close notifications: pair, PnL, **close reason** (e.g. `Trailing TP: peak 5.2% → 3.5%`, `Out of range too long`, `Low yield: fee/TVL 0.3% < 1%`)
 - OOR alerts: when a position is out of range past your wait threshold
-- Daily briefing: 24-hour portfolio summary
+- Daily briefing: 24-hour portfolio summary with 7-day PnL chart + postmortem flags
+- Postmortem flags: high/medium severity diagnostic alerts when patterns emerge in the last N closes
 
 ### Commands
 
-You can chat with the bot the same way as in the REPL — `/positions`, `/wallet`, `/screen`, `/help`, free-form questions. Only allowed user IDs can send commands.
+You can chat with the bot the same way as in the REPL or use slash commands. Only allowed user IDs can send commands.
+
+**Quickest path: `/panel`** — opens the **MERIDIAN CONTROL PANEL** with inline buttons for every common action. No need to memorise commands.
+
+| Command | What it does |
+|---|---|
+| `/panel` or `/dashboard` | Open the control panel (recommended UX) |
+| `/help` | Show all commands |
+| `/status` or `/wallet` | Wallet balance + open positions |
+| `/positions` | Detailed table of open positions |
+| `/pool <n>` | Detailed info for one position |
+| `/close <n>` / `/closeall` | Close one or all positions |
+| `/set <n> <note>` | Add an operator note to a position (LLM reads it) |
+| `/screen` / `/candidates` / `/deploy <n>` | Force-screen now, list cached candidates, deploy by index |
+| `/history` | Last 7 days of closed positions with PnL + reasons |
+| `/perf` | Performance summary (close-reason histogram, win rate, PnL) |
+| `/calendar [YYYY-MM]` | **Daily PnL calendar** with prev/next nav (default: current month) |
+| `/lessons` | Auto-derived lessons + close-reason breakdown |
+| `/postmortem` or `/pm` | High/medium severity diagnostic flags |
+| `/risk` | Exposure snapshot + worst-case loss if all SLs fire |
+| `/risk proposals` / `/risk accept <id>` / `/risk reject <id>` | Operator-approved TP/SL self-evolve proposals |
+| `/why <n>` | Explain why a specific position was deployed |
+| `/briefing` | Morning briefing on demand |
+| `/config` / `/settings` / `/setcfg <key> <value>` | Show / button-edit / persist runtime config |
+| `/hive` / `/hive pull` | HiveMind sync status / manual pull |
+| `/pause` / `/resume` | Stop / start cron cycles |
+| `/stop` | Graceful shutdown |
+
+Free-form chat (anything not matching a slash command) is routed through the GENERAL agent — `"close everything"`, `"how much have we earned today?"`, `"what do you think of pool 2?"`.
 
 ---
 
@@ -345,22 +376,17 @@ After `npm start` or `npm run dev`, the prompt looks like:
 >
 ```
 
+The REPL exposes the same slash-command surface as Telegram (see the Telegram **Commands** table above) — `/status`, `/positions`, `/screen`, `/close <n>`, `/history`, `/perf`, `/calendar`, `/lessons`, `/postmortem`, `/risk`, `/why <n>`, `/briefing`, `/config`, `/settings`, `/pause`, `/resume`, `/stop`. Plus the REPL-only shortcuts:
+
 | Command | What it does |
 |---|---|
 | `1`, `2`, `3` ... | Manually deploy into the numbered candidate from last `/candidates` |
 | `auto` | Let the agent pick the best candidate and deploy now (skip cron wait) |
-| `/status` or `/wallet` | Wallet balance + open positions + countdown |
-| `/positions` | Detailed table of open positions with PnL, fees, range, age |
-| `/candidates` or `/screen` | Force a screening cycle right now |
-| `/close <n>` | Close position number `<n>` (from `/positions` list) |
-| `/set <n> <note>` | Add a note to position `<n>` |
-| `/help` | Show all commands |
-| `/config` | Print current runtime config |
+| `go` | Start cron without deploying anything |
 | `/learn` | Run `study_top_lpers` on every candidate pool, save lessons |
 | `/learn <pool_address>` | Study a specific pool |
 | `/thresholds` | Show current screening thresholds + closed-position stats |
 | `/evolve` | Trigger threshold darwin tuning (needs 5+ closed positions) |
-| `/stop` | Graceful shutdown |
 | anything else | Free-form chat with the agent — ask questions, request analysis, instruct actions |
 
 Free-form chat persists session history (last 10 messages), so you can have a conversation: `"close everything"`, `"how much have we earned today?"`, `"what do you think of pool 2?"`.
@@ -391,15 +417,35 @@ Free-form chat persists session history (last 10 messages), so you can have a co
 
 ## How it learns
 
-Meridian builds knowledge in three places:
+Meridian's self-learning system has five tiers, each operating on a different timescale:
 
-### `lessons.json`
+### Tier 0 — `lessons.json` recorder
 
-Every closed position is recorded with PnL, hold duration, exit reason, fees earned. The `recordPerformance()` function in `lessons.js` writes these and auto-derives short structured lessons after each batch of closes. Lessons are injected into the LLM's system prompt for subsequent cycles, so the agent gets smarter over time.
+Every closed position is recorded with PnL, hold duration, exit reason, fees earned, range efficiency. The `recordPerformance()` function in `lessons.js` writes these and **auto-derives short structured lessons** after each batch of closes (e.g. `"OOR pumped above range — consider tighter upside coverage on memecoin pools"`).
 
-### `pool-memory.json`
+### Tier 1 — composite-scored lesson injection
 
-Per-pool deploy history + snapshots. Used to detect "this pool keeps dumping me out of range — cooldown" patterns. Configurable via `oorCooldownTriggerCount` + `oorCooldownHours`.
+Lessons are scored by `recency × evidence_weight × pinned-priority` and the top-N injected into the LLM's system prompt for subsequent cycles. So the agent doesn't drown in noise — it sees only the most relevant + recent + high-evidence rules. See `selectTopLessons()` in `lessons.js`.
+
+### Tier 2 — coaching memos (operator-curated)
+
+You can pin / unpin lessons, add manual coaching memos with `addLesson(rule, tags, { pinned: true })` (or via the LLM tool), and they ride alongside auto-derived lessons in the prompt. See `src/coaching.js` + `src/coaching-llm.js`.
+
+### Tier 3 — top-LPer auto-discovery
+
+Before deploying, the SCREENER **must** call `study_top_lpers` (this is a hard rule in the prompt). The tool fetches the top LP wallets active on the pool from LPAgent, derives behaviour patterns (avg hold time, range width, win rate), and stores them in `top-lpers.json`. The agent then mimics what successful LPers do on similar pools. See `src/top-lpers.js`.
+
+### Tier 4 — TP/SL self-evolve proposals
+
+`proposeTpSlAdjustment()` analyses winners vs losers across the last N closes and emits **proposals** (e.g. `"loosen stopLossPct from -40 to -45 — current SL is firing on 38% of trades that would have recovered"`). Proposals are surfaced via `/risk proposals` and require **operator approval** — never auto-applied. See `lessons.js`.
+
+### Tier 5 — pool-level guards
+
+- `pool-memory.json` — Per-pool deploy history + snapshots. Detects "this pool keeps dumping me out of range" patterns and cools down the pool (`oorCooldownTriggerCount` + `oorCooldownHours`).
+- **Repeat-deploy cooldown** — Caps re-deploys into the same pool within a window unless minimum fees were earned last time.
+- **Circuit breaker** (`src/circuit-breaker.js`) — Trips on daily-loss / consecutive-loss limits and blocks new deploys until cooldown elapses.
+- **Exploration budget** — Caps how many deploys go to similar (low-evidence) pools so the agent doesn't over-explore at the expense of validated picks.
+- **Holdout validation** — Reserves a % of closes for out-of-sample threshold evaluation.
 
 ### Darwin threshold tuning
 
@@ -437,45 +483,58 @@ A collective-intelligence module where multiple Meridian agents anonymously shar
    ```
 3. Restart the bot.
 
-To register a new agent ID, see the snippet in `hive-mind.js`. Without `HIVE_MIND_API_KEY`, the bot runs fully local — no telemetry leaves your machine.
+To register a new agent ID, see the snippet in `hivemind.js`. Without `HIVE_MIND_API_KEY`, the bot runs fully local — no telemetry leaves your machine.
 
 ---
 
 ## Repo layout
 
 ```
-index.js                    REPL + cron orchestration + Telegram polling
+index.js                    REPL + cron orchestration + Telegram polling + control panel
 agent.js                    ReAct loop (LLM ↔ tools)
 config.js                   Loads user-config.json + .env
 prompt.js                   System prompts per agent role
 state.js                    Position registry (state.json)
-lessons.js                  Closed-position recorder + darwin tuner
+lessons.js                  Closed-position recorder + darwin tuner + TP/SL proposals
 pool-memory.js              Per-pool deploy history (pool-memory.json)
 strategy-library.js         Saved LP strategies
-briefing.js                 Daily Telegram summary
-telegram.js                 Telegram bot polling + notifications
-hive-mind.js                Optional collective intelligence sync
+briefing.js                 Daily briefing + 7-day PnL chart + daily PnL calendar
+telegram.js                 Telegram bot polling + notifications + control-panel rendering
+hivemind.js                 Optional collective-intelligence sync
 smart-wallets.js            KOL/alpha wallet tracker
+signal-tracker.js           Multi-signal aggregation (Discord, Twitter, GMGN, etc.)
+signal-weights.js           Signal-weight tuning from outcomes
+decision-log.js             Per-position decision log (why deployed / closed)
 token-blacklist.js          Permanent token blacklist
 logger.js                   Daily-rotating logs (logs/)
 rpc.js                      Multi-endpoint RPC failover
 tx-priority.js              Priority-fee + compute-budget helpers
 envcrypt.js                 AES-256-GCM env encryption (v2)
+fs-utils.js                 Atomic file writes
 
 src/
-  format.js                 Pure formatting helpers (countdown, candidates, etc.)
+  format.js                 Pure formatting helpers (countdown, candidates, help text)
   deterministic.js          Deterministic close-rule logic
   agent-roles.js            Tool sets per agent role (SCREENER / MANAGER / GENERAL)
+  adaptive-trailing.js      Volatility-aware trailing-TP trigger
+  circuit-breaker.js        Daily-loss / consecutive-loss circuit breaker
+  realtime-watcher.js       WS subscriber for fast-close on price moves
+  top-lpers.js              Top-LPer auto-discovery + scoring
+  coaching.js               Operator-curated coaching memos
+  coaching-llm.js           LLM-side coaching tool implementations
 
 tools/
   definitions.js            Tool schemas (what the LLM sees)
   executor.js               Tool dispatch + safety checks + update_config validators
   dlmm.js                   Meteora DLMM SDK wrapper
-  screening.js              Pool discovery + filtering pipeline
+  screening.js              Pool discovery + filtering pipeline (Meteora + GMGN)
   wallet.js                 Wallet balances + Jupiter swap
   token.js                  Token info + holders + narrative
   study.js                  Top-LPer study via LPAgent
   okx.js                    OKX risk/cluster/price enrichment
+  gmgn.js                   GMGN screener client
+  twitter.js                Twitter sentiment for tokens
+  chart-indicators.js       TA indicator pulls for pool charts
 
 presets/
   conservative.json         Low-risk preset
@@ -484,14 +543,10 @@ presets/
   micro-live.json           Real-data collection preset
   README.md                 Preset documentation
 
-test/
-  state.test.js             19 tests
-  runSafetyChecks.test.js   11 tests
-  evolveThresholds.test.js  7 tests
-  computeDeployAmount.test.js 9 tests
+test/                       18 vitest files, 258 tests total
 ```
 
-Run `npm test` to execute the 46 unit tests (~1s).
+Run `npm test` to execute all unit tests (~2s).
 
 ---
 
