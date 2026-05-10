@@ -2,10 +2,10 @@
 
 > **Purpose**: enable another session (AI model or human) to pick up exactly where this conversation left off without losing context.
 
-**Last updated**: 2026-05-10 14:20 UTC+07
+**Last updated**: 2026-05-10 14:40 UTC+07
 **Repo root**: `/Users/firda/meridian2`
-**Branch**: `main` — ahead of `origin/main` by 1 commit (Darwin pipeline fix, not yet pushed)
-**Test baseline**: **265/265 passing**
+**Branch**: `main` — ahead of `origin/main` by 1 commit (D5: hive_consensus + study_win_rate, not yet pushed)
+**Test baseline**: **276/276 passing**
 
 ---
 
@@ -28,7 +28,7 @@ Bot now learns autonomously across **8 layers**:
 | 7 | Lessons retention (D2) | `lessons.js selectTopLessons` (60d sunset + score-rank) | ✅ |
 | 8 | Hivemind + drawdown breaker + adaptive trailing | `hivemind.js`, `src/circuit-breaker.js`, `src/adaptive-trailing.js` | ✅ |
 
-**Open gaps (all defer-able)**: D1 per-strategy weights (only relevant if non-bid_ask strategies used), D3 validation trend tracking, D4 GMGN exploration overrides, D5 stage `study_win_rate` + `hive_consensus` (declared in `SIGNAL_NAMES` but never populated — Darwin learns from 9/11 signals).
+**Open gaps (all defer-able)**: D1 per-strategy weights (only relevant if non-bid_ask strategies used), D3 validation trend tracking, D4 GMGN exploration overrides. Darwin now learns from **11/11 signals**.
 
 ---
 
@@ -37,6 +37,8 @@ Bot now learns autonomously across **8 layers**:
 | Commit | What |
 |---|---|
 | `34d3bbb` | `fix(darwin): connect signal pipeline — staged signals now reach lessons.json` |
+| `3c67a79` | `docs(progress): refresh handoff — Darwin pipeline fix + D5 gap + new diagnosis lessons` |
+| `61c3f6d` | `feat(darwin): D5 — populate hive_consensus + study_win_rate signals` |
 
 ### Diagnosis path (May 10)
 
@@ -53,6 +55,15 @@ Darwin signal weighting was inert despite `signal-tracker.js` + `signal-weights.
 **Test coverage** (`test/signalPipeline.test.js`, +7): stage/clear round-trip, per-pool isolation, `state.trackPosition` preservation, integration `stage→retrieve→track→recordPerformance` with assertion on `lessons.json`, back-compat null guard.
 
 **Verification path live**: Darwin will recalc on the next 5-close cadence once enough fresh records (with `signal_snapshot` populated) accumulate above `darwinMinSamples: 10`. Watch `[evolve] Darwin: adjusted N signal weight(s)` in `logs/agent-YYYY-MM-DD.log`.
+
+### D5 closed (commit `61c3f6d`)
+
+After the pipeline fix, two signals declared in `SIGNAL_NAMES` were still null on every record (`extractNumeric` saw 0 samples → lift always null):
+
+- **`hive_consensus`** (boolean, by design choice): true iff at least one HiveMind shared lesson's rule text mentions the candidate's primary token symbol (case-insensitive, ≥2 chars to skip noisy `X` matches). Computed once-per-cycle in `index.js` from `getSharedLessons()` and threaded into the existing `stageSignals({...})` call. Moved from `HIGHER_IS_BETTER` → `BOOLEAN_SIGNALS` in `signal-weights.js` so `computeBooleanLift` handles it (numeric `extractNumeric` drops booleans via `typeof` check).
+- **`study_win_rate`** (numeric mean of `studyResult.lpers[].summary.win_rate`): enriched at deploy time inside `tools/dlmm.deployPosition` after `getAndClearStagedSignals()`. The study cache is warm at that point because `executor.runSafetyChecks` forces `study_top_lpers` before `deploy_position`. Cold pools leave the field null — `extractNumeric` drops nulls, so missing data doesn't pollute lift.
+
+New exports: `signal-tracker.computeHiveConsensus`, `signal-tracker.computeStudyWinRate`, `hivemind.getSharedLessons`, `tools/study.getStudyCacheData`. Tests: 11 added covering both helpers' edge cases.
 
 ---
 
@@ -177,11 +188,6 @@ Exploration mode (`darwin.explorationRate`) loosens thresholds for Meteora disco
 
 **To implement**: separate exploration thresholds for GMGN stages. ~30 min.
 
-### D5 — Stage `study_win_rate` + `hive_consensus`
-These two signals are declared in `SIGNAL_NAMES` (`signal-weights.js:20-32`) but never populated by the staging call at `index.js:675`. After the 5/10 pipeline fix Darwin learns from **9 of 11** signals. `study_win_rate` would come from `tools/study.js` cache; `hive_consensus` from `hivemind.js` shared lessons. Both are present in the screening flow already — just need to be threaded into `stageSignals({...})`.
-
-**To implement**: ~15-30 min, low risk.
-
 ### Tier C — Log noise (cosmetic)
 Most cleaned in `2e2dd41`. Remaining: `editMessage` "message not modified" 400s — already swallowed. Watch for any new noise.
 
@@ -236,16 +242,16 @@ Most cleaned in `2e2dd41`. Remaining: `editMessage` "message not modified" 400s 
 ## How to Resume in Next Session
 
 1. Read this `progress.md`.
-2. `git log --oneline -n 5` → confirm latest is `34d3bbb` or newer.
-3. `npm test` → confirm 265+ tests pass.
+2. `git log --oneline -n 5` → confirm latest is `61c3f6d` or newer.
+3. `npm test` → confirm 276+ tests pass.
 4. Check live state:
    ```bash
    ls -la top-lpers.json smart-wallets.json
    cat lessons.json | python3 -c "import sys,json; d=json.load(sys.stdin); print('proposals:', len(d.get('risk_proposals',[])), 'lessons:', len(d.get('lessons',[])), 'perf:', len(d.get('performance',[])))"
    tail -50 logs/agent-$(date +%Y-%m-%d).log
    ```
-5. Verify Darwin recalc fired at least once: `cat signal-weights.json | python3 -c "import sys,json; d=json.load(sys.stdin); print('recalc_count:', d.get('recalc_count',0), 'last:', d.get('last_recalc'))"`. If `recalc_count > 0`, the 5/10 fix is confirmed live.
-6. Ask user what to work on. Default options: D5 (stage missing 2 signals, ~30min), D1 (per-strategy weights, ~2-3h), D3 (validation trend, ~1h), D4 (GMGN exploration, ~30min), or new direction.
+5. Verify Darwin recalc fired at least once: `cat signal-weights.json | python3 -c "import sys,json; d=json.load(sys.stdin); print('recalc_count:', d.get('recalc_count',0), 'last:', d.get('last_recalc'))"`. If `recalc_count > 0`, the 5/10 fix is confirmed live. Spot-check that `lessons.json` perf records have `signal_snapshot.hive_consensus` (boolean) and (for warm pools) `signal_snapshot.study_win_rate` (number).
+6. Ask user what to work on. Default options: D1 (per-strategy weights, ~2-3h), D3 (validation trend, ~1h), D4 (GMGN exploration, ~30min), or new direction.
 
 ---
 
