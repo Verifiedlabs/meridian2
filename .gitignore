@@ -9,6 +9,7 @@ node_modules/
 
 # User config (contains RPC URL, wallet key, API keys)
 gmgn-config.json
+user-config.json
 
 # Runtime state (position tracking, lessons — user-specific)
 state.json
@@ -19,6 +20,9 @@ strategy-library.json
 decision-log.json
 hivemind-cache.json
 signal-weights.json
+lessons.json
+circuit-breaker.json
+top-lpers.json
 
 # Logs
 logs/
