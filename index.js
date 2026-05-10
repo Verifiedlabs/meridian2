@@ -42,9 +42,9 @@ import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memor
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { getTwitterSentiment } from "./tools/twitter.js";
-import { stageSignals } from "./signal-tracker.js";
+import { stageSignals, computeHiveConsensus } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
-import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
+import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, getSharedLessons, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision, getDecisionsByPosition } from "./decision-log.js";
 import {
   stripThink,
@@ -602,6 +602,14 @@ export async function runScreeningCycle({ silent = false } = {}) {
       passing.map(({ pool }) => getActiveBin({ pool_address: pool.pool }))
     );
 
+    // Snapshot the shared HiveMind lessons once per cycle so each candidate
+    // can compute its hive_consensus boolean without re-reading the cache.
+    // Empty array (not null) when Darwin is off or HiveMind has no lessons,
+    // so computeHiveConsensus() short-circuits to false cleanly.
+    const sharedHiveLessons = config.darwin?.enabled
+      ? getSharedLessons({ agentType: "SCREENER", maxLessons: 50 })
+      : [];
+
     // Build compact candidate blocks
     const candidateBlocks = passing.map(({ pool, sw, n, ti, tw, mem }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
@@ -670,7 +678,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
         ].filter(Boolean).join("\n");
       }
 
-      // Stage signals for Darwinian weighting — captured before LLM decides
+      // Stage signals for Darwinian weighting — captured before LLM decides.
+      // study_win_rate is enriched later in dlmm.deployPosition() (after the
+      // executor's hard guard ensures the study cache is warm); hive_consensus
+      // is computed here from the always-warm hivemind shared-lessons cache.
       if (config.darwin?.enabled) {
         stageSignals(pool.pool, {
           organic_score:         pool.organic_score         ?? null,
@@ -682,6 +693,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
           narrative_quality:     n?.narrative ? "present" : "absent",
           volatility:            pool.volatility            ?? null,
           twitter_sentiment:     tw?.sentiment              ?? null,
+          hive_consensus:        computeHiveConsensus(pool.name, sharedHiveLessons),
         });
       }
 

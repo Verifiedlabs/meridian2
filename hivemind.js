@@ -154,15 +154,25 @@ function normalizeSharedLesson(lesson) {
   };
 }
 
-export function getSharedLessonsForPrompt({ agentType = "GENERAL", maxLessons = 6 } = {}) {
+/**
+ * Raw shared-lessons array from the hivemind cache, filtered by role and
+ * sorted by score. Used by:
+ *  - getSharedLessonsForPrompt — joins into a prompt string for the LLM
+ *  - signal-tracker computeHiveConsensus — scans rule text for token symbol
+ *    match to derive the per-pool hive_consensus boolean signal
+ */
+export function getSharedLessons({ agentType = "GENERAL", maxLessons = 50 } = {}) {
   const role = String(agentType || "GENERAL").toUpperCase();
-  const shared = (readCache().sharedLessons || [])
+  return (readCache().sharedLessons || [])
     .map(normalizeSharedLesson)
     .filter(Boolean)
     .filter((lesson) => !lesson.role || lesson.role === role || role === "GENERAL")
     .sort((left, right) => (Number(right.score) || 0) - (Number(left.score) || 0))
     .slice(0, maxLessons);
+}
 
+export function getSharedLessonsForPrompt({ agentType = "GENERAL", maxLessons = 6 } = {}) {
+  const shared = getSharedLessons({ agentType, maxLessons });
   if (!shared.length) return null;
   return shared
     .map((lesson) => `[HIVEMIND${lesson.score != null ? ` score=${lesson.score}` : ""}] ${lesson.rule}`)

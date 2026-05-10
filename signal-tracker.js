@@ -55,3 +55,58 @@ export function getAndClearStagedSignals(poolAddress) {
 export function getStagedPools() {
   return [..._staged.keys()];
 }
+
+// ─── D5 helpers: derive the two missing Darwin signals ───────────
+// hive_consensus + study_win_rate are both declared in SIGNAL_NAMES
+// (signal-weights.js) but were never populated by the staging call.
+// These pure helpers extract them from data the bot already has, so
+// the wiring is a one-liner in index.js / dlmm.js and the math is
+// independently testable.
+
+/**
+ * Boolean: true iff at least one HiveMind shared lesson mentions the
+ * candidate's primary token symbol (the part of pool_name before "-" or "/").
+ *
+ * Match is case-insensitive substring on lesson.rule. Symbols shorter
+ * than 2 chars are skipped to avoid false positives on tickers like "X".
+ *
+ * Used as a per-pool boolean signal — Darwin learns whether "hive has
+ * an opinion about this token" predicts winners or losers.
+ *
+ * @param {string} poolName  e.g. "Mustard-SOL"
+ * @param {Array<{rule: string}>} sharedLessons  from hivemind.getSharedLessons()
+ * @returns {boolean}
+ */
+export function computeHiveConsensus(poolName, sharedLessons) {
+  if (!Array.isArray(sharedLessons) || sharedLessons.length === 0) return false;
+  const symbol = String(poolName || "")
+    .split(/[-/]/)[0]
+    ?.trim()
+    .toLowerCase();
+  if (!symbol || symbol.length < 2) return false;
+  return sharedLessons.some((lesson) => {
+    const rule = String(lesson?.rule || "").toLowerCase();
+    return rule.includes(symbol);
+  });
+}
+
+/**
+ * Mean win_rate across the top LPers returned by studyTopLPers().
+ *
+ * Returns null if the study cache is empty/unavailable for this pool —
+ * Darwin's extractNumeric() drops null values automatically so a missing
+ * snapshot for cold pools doesn't pollute the lift calculation.
+ *
+ * Win rates are already 0..1 in the study schema (see tools/study.js:114).
+ *
+ * @param {Object|null} studyResult  cached output of studyTopLPers
+ * @returns {number|null} mean win rate in [0, 1], or null if unavailable
+ */
+export function computeStudyWinRate(studyResult) {
+  if (!studyResult || !Array.isArray(studyResult.lpers)) return null;
+  const winRates = studyResult.lpers
+    .map((lper) => lper?.summary?.win_rate)
+    .filter((v) => typeof v === "number" && Number.isFinite(v));
+  if (winRates.length === 0) return null;
+  return winRates.reduce((sum, v) => sum + v, 0) / winRates.length;
+}

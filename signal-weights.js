@@ -40,11 +40,15 @@ const HIGHER_IS_BETTER = new Set([
   "volume",
   "holder_count",
   "study_win_rate",
-  "hive_consensus",
 ]);
 
-// Boolean signals — compared by win rate when present vs absent
-const BOOLEAN_SIGNALS = new Set(["smart_wallets_present"]);
+// Boolean signals — compared by win rate when present vs absent.
+// hive_consensus is true iff at least one HiveMind shared lesson
+// mentions the candidate's token symbol — see signal-tracker
+// computeHiveConsensus(). It's classified as boolean (not numeric)
+// because computeNumericLift's extractNumeric() drops booleans;
+// computeBooleanLift handles them natively.
+const BOOLEAN_SIGNALS = new Set(["smart_wallets_present", "hive_consensus"]);
 
 // Categorical signals — compared by win rate across categories
 const CATEGORICAL_SIGNALS = new Set(["narrative_quality", "twitter_sentiment"]);

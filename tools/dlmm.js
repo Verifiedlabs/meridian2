@@ -29,7 +29,8 @@ import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { watchPosition, unwatchPosition } from "../src/realtime-watcher.js";
-import { getAndClearStagedSignals } from "../signal-tracker.js";
+import { getAndClearStagedSignals, computeStudyWinRate } from "../signal-tracker.js";
+import { getStudyCacheData } from "./study.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -611,7 +612,19 @@ export async function deployPosition({
   // disabled or this pool wasn't staged (e.g. manual deploy outside the
   // screening loop). Safe to call once per deploy — the helper is
   // destructive by design so signals don't leak across cycles.
-  const stagedSignals = getAndClearStagedSignals(pool_address);
+  let stagedSignals = getAndClearStagedSignals(pool_address);
+  // D5: enrich the snapshot with study_win_rate at deploy time. The study
+  // cache is warm here because executor.runSafetyChecks forces the LLM
+  // to call study_top_lpers before deploy_position. Cold pools (no LPer
+  // history yet) leave the field null — Darwin's extractNumeric drops
+  // nulls, so missing data doesn't pollute the lift calculation.
+  if (stagedSignals) {
+    const studyData = getStudyCacheData(pool_address);
+    const studyWinRate = computeStudyWinRate(studyData);
+    if (studyWinRate != null) {
+      stagedSignals = { ...stagedSignals, study_win_rate: studyWinRate };
+    }
+  }
   const activeStrategy = strategy || config.strategy.strategy;
   let activeBinsBelow = bins_below ?? config.strategy.binsBelow;
   let activeBinsAbove = bins_above ?? 0;

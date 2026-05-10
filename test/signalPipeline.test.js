@@ -37,6 +37,8 @@ const {
   stageSignals,
   getAndClearStagedSignals,
   getStagedPools,
+  computeHiveConsensus,
+  computeStudyWinRate,
 } = await import("../signal-tracker.js");
 const { trackPosition, getTrackedPosition } = await import("../state.js");
 const { recordPerformance } = await import("../lessons.js");
@@ -224,5 +226,97 @@ describe("integration: signal-tracker → state → lessons", () => {
     // that pre-dates the Darwin pipeline fix
     const entry = data.performance[0];
     expect(entry.signal_snapshot ?? null).toBe(null);
+  });
+});
+
+// ─── D5: hive_consensus + study_win_rate helpers ─────────────────────
+// These derive the two SIGNAL_NAMES entries that were declared but never
+// populated before the 5/10 work. Pure functions, so the tests are
+// straight input/output assertions with no filesystem state.
+
+describe("computeHiveConsensus", () => {
+  it("returns false when sharedLessons is empty / null / undefined", () => {
+    expect(computeHiveConsensus("Mustard-SOL", [])).toBe(false);
+    expect(computeHiveConsensus("Mustard-SOL", null)).toBe(false);
+    expect(computeHiveConsensus("Mustard-SOL", undefined)).toBe(false);
+  });
+
+  it("returns false when no rule mentions the pool's primary symbol", () => {
+    const lessons = [
+      { rule: "AVOID: high-volatility curve pools at low organic" },
+      { rule: "PREFER: bid_ask with smart wallets present" },
+    ];
+    expect(computeHiveConsensus("Mustard-SOL", lessons)).toBe(false);
+  });
+
+  it("returns true when a rule mentions the symbol case-insensitively", () => {
+    const lessons = [
+      { rule: "AVOID: bots in xyz pools" },
+      { rule: "PREFER: MUSTARD-type pools at high fee/TVL" },
+    ];
+    expect(computeHiveConsensus("Mustard-SOL", lessons)).toBe(true);
+  });
+
+  it("splits on slash too (poolName like 'Foo/SOL')", () => {
+    const lessons = [{ rule: "Foo had a strong fee yield in May" }];
+    expect(computeHiveConsensus("Foo/SOL", lessons)).toBe(true);
+  });
+
+  it("returns false for a single-letter symbol to avoid false positives", () => {
+    const lessons = [{ rule: "Avoid X bin steps below 50" }];
+    // "X" is too short — would otherwise spuriously match every rule containing "x"
+    expect(computeHiveConsensus("X-SOL", lessons)).toBe(false);
+  });
+
+  it("handles missing/blank pool names gracefully", () => {
+    const lessons = [{ rule: "anything" }];
+    expect(computeHiveConsensus("", lessons)).toBe(false);
+    expect(computeHiveConsensus(null, lessons)).toBe(false);
+  });
+
+  it("ignores lessons with no rule text", () => {
+    const lessons = [{}, { rule: null }, { rule: "" }, { rule: "Mustard run" }];
+    expect(computeHiveConsensus("Mustard-SOL", lessons)).toBe(true);
+  });
+});
+
+describe("computeStudyWinRate", () => {
+  it("returns null for empty / null / malformed input", () => {
+    expect(computeStudyWinRate(null)).toBe(null);
+    expect(computeStudyWinRate(undefined)).toBe(null);
+    expect(computeStudyWinRate({})).toBe(null);
+    expect(computeStudyWinRate({ lpers: [] })).toBe(null);
+  });
+
+  it("returns the mean win_rate across all populated lpers", () => {
+    const study = {
+      lpers: [
+        { summary: { win_rate: 0.6 } },
+        { summary: { win_rate: 0.8 } },
+        { summary: { win_rate: 0.4 } },
+      ],
+    };
+    // (0.6 + 0.8 + 0.4) / 3 = 0.6
+    expect(computeStudyWinRate(study)).toBeCloseTo(0.6, 5);
+  });
+
+  it("skips lpers with missing/non-numeric win_rate", () => {
+    const study = {
+      lpers: [
+        { summary: { win_rate: 0.7 } },
+        { summary: {} },
+        { summary: { win_rate: "0.5" } }, // string, must be skipped
+        { summary: { win_rate: 0.5 } },
+      ],
+    };
+    // Only 0.7 + 0.5 contribute → 0.6
+    expect(computeStudyWinRate(study)).toBeCloseTo(0.6, 5);
+  });
+
+  it("returns null when every lper lacks a numeric win_rate", () => {
+    const study = {
+      lpers: [{ summary: {} }, { summary: { win_rate: null } }],
+    };
+    expect(computeStudyWinRate(study)).toBe(null);
   });
 });

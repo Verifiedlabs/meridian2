@@ -42,6 +42,22 @@ export function _resetStudyCacheForTesting() {
   _studyCache.clear();
 }
 
+/**
+ * Read-only access to the study cache for the given pool.
+ * Returns the cached `result` object (with `.lpers`, `.patterns`, etc.)
+ * or null if the pool was never studied or the cache TTL elapsed.
+ *
+ * Used by dlmm.deployPosition() to enrich the staged Darwin signals
+ * with study_win_rate at deploy time — the cache is warm at this point
+ * because the executor's hard guard forces studyTopLPers() before deploy.
+ *
+ * Non-destructive: unlike getAndClearStagedSignals, multiple deploys
+ * in the same TTL window keep seeing the same cached result.
+ */
+export function getStudyCacheData(pool_address) {
+  return getCachedStudy(pool_address);
+}
+
 function putCachedStudy(pool_address, data) {
   _studyCache.set(pool_address, { data, fetchedAt: Date.now() });
 }
