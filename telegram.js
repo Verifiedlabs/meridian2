@@ -140,6 +140,14 @@ async function postTelegramRaw(method, body) {
   }
 }
 
+/**
+ * Plain-text send. Intentionally one-arg — does NOT accept parseMode/options.
+ *
+ * If you need HTML rendering (`<b>`, `<i>`, etc.) call `sendHTML(text)` instead.
+ * `sendHTML` forces `parse_mode: "HTML"` and falls back to strip-tags when
+ * Telegram rejects malformed entities. Passing `{ parseMode: "HTML" }` here
+ * is silently ignored.
+ */
 export async function sendMessage(text) {
   if (!TOKEN || !chatId) return;
   return postTelegram("sendMessage", { text: String(text).slice(0, 4096) });

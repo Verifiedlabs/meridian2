@@ -205,9 +205,13 @@ export async function recordPerformance(perf) {
         if (proposal) {
           const stored = storeRiskProposal(proposal);
           if (stored && stored.status === "pending") {
-            // Telegram alert — operator can review with /risk
+            // Telegram alert — operator can review with /risk.
+            // Uses sendHTML (not sendMessage) so the <b>/<i> tags actually
+            // render. sendMessage discards its second arg, so an earlier
+            // call site that passed { parseMode: "HTML" } silently produced
+            // raw-tagged messages until this fix.
             try {
-              const { sendMessage } = await import("./telegram.js");
+              const { sendHTML } = await import("./telegram.js");
               const lines = ["💡 <b>Risk proposal</b> — review with /risk"];
               for (const [k, v] of Object.entries(proposal.proposals)) {
                 lines.push(`  • ${k}: ${proposal.current[k]} → <b>${v}</b>`);
@@ -215,7 +219,7 @@ export async function recordPerformance(perf) {
               lines.push(`<i>Sample: ${proposal.sample_size} closes (${proposal.winners}W/${proposal.losers}L)</i>`);
               lines.push(`Use /risk accept ${stored.id} or /risk reject ${stored.id}.`);
               const text = lines.join("\n");
-              await sendMessage(text, { parseMode: "HTML" }).catch((err) =>
+              await sendHTML(text).catch((err) =>
                 log("silent_warn", `Risk proposal alert failed: ${err.message}`),
               );
             } catch (err) {
