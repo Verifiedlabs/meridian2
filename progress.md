@@ -2,16 +2,18 @@
 
 > **Purpose**: enable another session (AI model or human) to pick up exactly where this conversation left off without losing context.
 
-**Last updated**: 2026-05-08 10:50 UTC+07
+**Last updated**: 2026-05-10 14:20 UTC+07
 **Repo root**: `/Users/firda/meridian2`
-**Branch**: `main` — synced with `origin/main` ✅
-**Test baseline**: **244/244 passing**
+**Branch**: `main` — ahead of `origin/main` by 1 commit (Darwin pipeline fix, not yet pushed)
+**Test baseline**: **265/265 passing**
 
 ---
 
-## TL;DR — Bot is ~95% Self-Learning
+## TL;DR — Bot is ~95% Self-Learning (Darwin layer revived 5/10)
 
-Today (May 8) closed the major self-learning gaps. **A1 (top-LPer auto-discovery) live + verified**, **B1 (TP/SL self-evolve) heuristic fixed**, **hard guard prevents the LLM from skipping `study_top_lpers`**.
+**May 10**: discovered & fixed silent bug in Darwin signal pipeline — `stageSignals()` was wired in screening but `getAndClearStagedSignals()` was never called downstream, so `signal-weights.json` had `recalc_count: 0` after 116 closes. Pipeline now end-to-end live.
+
+**May 8** closed the major self-learning gaps. **A1 (top-LPer auto-discovery) live + verified**, **B1 (TP/SL self-evolve) heuristic fixed**, **hard guard prevents the LLM from skipping `study_top_lpers`**.
 
 Bot now learns autonomously across **8 layers**:
 
@@ -19,18 +21,42 @@ Bot now learns autonomously across **8 layers**:
 |---|---|---|---|
 | 1 | Pool memory + cooldowns | `pool-memory.js` | ✅ |
 | 2 | Lessons engine + threshold evolve | `lessons.js` | ✅ |
-| 3 | Darwin signal weighting | `signal-weights.js` | ✅ |
+| 3 | Darwin signal weighting | `signal-weights.js` | ✅ pipeline fixed 5/10 |
 | 4 | Top LPer auto-discovery (A1) | `src/top-lpers.js`, `tools/study.js` | ✅ live since 5/8 |
 | 5 | TP/SL self-evolve (B1) | `lessons.js proposeTpSlAdjustment` | ✅ |
 | 6 | Pool concentration guard (B2) | `tools/screening.js:335-355` | ✅ |
 | 7 | Lessons retention (D2) | `lessons.js selectTopLessons` (60d sunset + score-rank) | ✅ |
 | 8 | Hivemind + drawdown breaker + adaptive trailing | `hivemind.js`, `src/circuit-breaker.js`, `src/adaptive-trailing.js` | ✅ |
 
-**Open gaps (all defer-able)**: D1 per-strategy weights (only relevant if non-bid_ask strategies used), D3 validation trend tracking, D4 GMGN exploration overrides.
+**Open gaps (all defer-able)**: D1 per-strategy weights (only relevant if non-bid_ask strategies used), D3 validation trend tracking, D4 GMGN exploration overrides, D5 stage `study_win_rate` + `hive_consensus` (declared in `SIGNAL_NAMES` but never populated — Darwin learns from 9/11 signals).
 
 ---
 
-## Today's Session (May 8) — Commits
+## May 10 Session — Commits
+
+| Commit | What |
+|---|---|
+| `34d3bbb` | `fix(darwin): connect signal pipeline — staged signals now reach lessons.json` |
+
+### Diagnosis path (May 10)
+
+Darwin signal weighting was inert despite `signal-tracker.js` + `signal-weights.js` both being implemented. Root cause: **the bridge was missing**.
+
+1. `index.js:675` calls `stageSignals(pool.pool, {...9 signals})` per candidate during screening — works.
+2. `signal-weights.js` reads `entry.signal_snapshot` from each closed-position record in `lessons.json` — works.
+3. **Gap**: nothing called `getAndClearStagedSignals(pool_address)`. Staged signals expired silently after 10min TTL. `state.trackPosition()` accepted a `signal_snapshot` param but no call site supplied it. `recordPerformance()` then had no `signal_snapshot` to forward.
+
+**Evidence** (pre-fix): 116 perf records / 0 with `signal_snapshot`; 117 tracked positions / all `signal_snapshot=null`; `signal-weights.json` `recalc_count: 0`, `history: []`.
+
+**Fix** (`tools/dlmm.js`): retrieve once at top of `deployPosition()`, forward to both `trackPosition()` paths (relay + manual), forward `tracked.signal_snapshot` into both `recordPerformance()` paths. 11 lines added, 0 deleted.
+
+**Test coverage** (`test/signalPipeline.test.js`, +7): stage/clear round-trip, per-pool isolation, `state.trackPosition` preservation, integration `stage→retrieve→track→recordPerformance` with assertion on `lessons.json`, back-compat null guard.
+
+**Verification path live**: Darwin will recalc on the next 5-close cadence once enough fresh records (with `signal_snapshot` populated) accumulate above `darwinMinSamples: 10`. Watch `[evolve] Darwin: adjusted N signal weight(s)` in `logs/agent-YYYY-MM-DD.log`.
+
+---
+
+## May 8 Session — Commits
 
 | Commit | What |
 |---|---|
@@ -151,6 +177,11 @@ Exploration mode (`darwin.explorationRate`) loosens thresholds for Meteora disco
 
 **To implement**: separate exploration thresholds for GMGN stages. ~30 min.
 
+### D5 — Stage `study_win_rate` + `hive_consensus`
+These two signals are declared in `SIGNAL_NAMES` (`signal-weights.js:20-32`) but never populated by the staging call at `index.js:675`. After the 5/10 pipeline fix Darwin learns from **9 of 11** signals. `study_win_rate` would come from `tools/study.js` cache; `hive_consensus` from `hivemind.js` shared lessons. Both are present in the screening flow already — just need to be threaded into `stageSignals({...})`.
+
+**To implement**: ~15-30 min, low risk.
+
 ### Tier C — Log noise (cosmetic)
 Most cleaned in `2e2dd41`. Remaining: `editMessage` "message not modified" 400s — already swallowed. Watch for any new noise.
 
@@ -205,15 +236,16 @@ Most cleaned in `2e2dd41`. Remaining: `editMessage` "message not modified" 400s 
 ## How to Resume in Next Session
 
 1. Read this `progress.md`.
-2. `git log --oneline -n 5` → confirm latest is `0c936d2` or newer.
-3. `npm test` → confirm 244+ tests pass.
+2. `git log --oneline -n 5` → confirm latest is `34d3bbb` or newer.
+3. `npm test` → confirm 265+ tests pass.
 4. Check live state:
    ```bash
    ls -la top-lpers.json smart-wallets.json
    cat lessons.json | python3 -c "import sys,json; d=json.load(sys.stdin); print('proposals:', len(d.get('risk_proposals',[])), 'lessons:', len(d.get('lessons',[])), 'perf:', len(d.get('performance',[])))"
    tail -50 logs/agent-$(date +%Y-%m-%d).log
    ```
-5. Ask user what to work on. Default options: D1 (per-strategy weights, ~2-3h), D3 (validation trend, ~1h), D4 (GMGN exploration, ~30min), or new direction.
+5. Verify Darwin recalc fired at least once: `cat signal-weights.json | python3 -c "import sys,json; d=json.load(sys.stdin); print('recalc_count:', d.get('recalc_count',0), 'last:', d.get('last_recalc'))"`. If `recalc_count > 0`, the 5/10 fix is confirmed live.
+6. Ask user what to work on. Default options: D5 (stage missing 2 signals, ~30min), D1 (per-strategy weights, ~2-3h), D3 (validation trend, ~1h), D4 (GMGN exploration, ~30min), or new direction.
 
 ---
 
@@ -227,3 +259,12 @@ When a feature doesn't fire despite "being implemented":
 4. **Telegram alert on guard fire** — silent enforcement is invisible. You want to know when the LLM is being lazy.
 
 This pattern applies to any future feature with "LLM must call X before Y" semantics.
+
+## Diagnosis Lessons (May 10)
+
+When a self-learning subsystem appears implemented but produces no observable change:
+
+1. **Trace the data flow end-to-end, not just per-module presence**. The Darwin bug had a stager (`stageSignals`) and a consumer (`signal-weights`) both correct in isolation — the bridge `getAndClearStagedSignals` was simply never called. `grep -rn` for the consumer function name across the repo before assuming it works.
+2. **Verify with live state files**, not just unit tests. `signal-weights.json` showed `recalc_count: 0` after 116 closes — that's a smoking gun. Periodic spot-check of state files catches silent dormancy.
+3. **A `Map` with TTL fails silently**. The 10-min TTL on `_staged` means missed retrievals look exactly like "no signal data available" — no error, no warning. For pipelines with fire-and-forget staging, log on TTL eviction or assert downstream coverage in tests.
+4. **The destination schema accepting an optional field is not proof the field flows**. `state.trackPosition({signal_snapshot})` happily accepted `null` for 117 deploys; type-loose JS gave no hint that nobody was supplying it.
