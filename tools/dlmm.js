@@ -29,6 +29,7 @@ import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { watchPosition, unwatchPosition } from "../src/realtime-watcher.js";
+import { getAndClearStagedSignals } from "../signal-tracker.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -605,6 +606,12 @@ export async function deployPosition({
   initial_value_usd,
 }) {
   pool_address = normalizeMint(pool_address);
+  // Retrieve and consume the screening-time signal snapshot so it can be
+  // attached to the tracked position. Returns null if Darwin staging is
+  // disabled or this pool wasn't staged (e.g. manual deploy outside the
+  // screening loop). Safe to call once per deploy — the helper is
+  // destructive by design so signals don't leak across cycles.
+  const stagedSignals = getAndClearStagedSignals(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
   let activeBinsBelow = bins_below ?? config.strategy.binsBelow;
   let activeBinsAbove = bins_above ?? 0;
@@ -804,6 +811,7 @@ export async function deployPosition({
           amount_x: finalAmountX,
           active_bin: activeBin.binId,
           initial_value_usd,
+          signal_snapshot: stagedSignals,
         });
         watchPosition({
           positionAddress,
@@ -956,6 +964,7 @@ export async function deployPosition({
       amount_x: finalAmountX,
       active_bin: activeBin.binId,
       initial_value_usd,
+      signal_snapshot: stagedSignals,
     });
     watchPosition({
       positionAddress: newPosition.publicKey.toString(),
@@ -1725,6 +1734,7 @@ export async function closePosition({ position_address, reason }) {
             minutes_in_range: minutesHeld - minutesOOR,
             minutes_held: minutesHeld,
             close_reason: reason || "agent decision",
+            signal_snapshot: tracked.signal_snapshot || null,
           });
 
           appendDecision({
@@ -2037,6 +2047,7 @@ export async function closePosition({ position_address, reason }) {
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: reason || "agent decision",
+        signal_snapshot: tracked.signal_snapshot || null,
       });
 
       appendDecision({
