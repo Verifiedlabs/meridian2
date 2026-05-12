@@ -388,6 +388,7 @@ After executing, write a brief one-line result per position.
     mgmtReport = `Management cycle failed: ${error.message}`;
   } finally {
     _managementBusy = false;
+    drainTelegramQueue().catch((err) => log("silent_warn", err.message));
     if (!silent && telegramEnabled()) {
       if (mgmtReport && !telegramMuted("cycle")) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch((err) => log("silent_warn", err.message));
@@ -435,6 +436,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         reason: `Max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`,
       });
       _screeningBusy = false;
+      drainTelegramQueue().catch((err) => log("silent_warn", err.message));
       return screenReport;
     }
     const minRequired = config.management.deployAmountSol + config.management.gasReserve;
@@ -449,6 +451,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         reason: `Insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired})`,
       });
       _screeningBusy = false;
+      drainTelegramQueue().catch((err) => log("silent_warn", err.message));
       return screenReport;
     }
     // Drawdown circuit breaker — auto-pauses screening after a losing streak
@@ -467,6 +470,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         reason: `Circuit breaker: ${bs.reason}`,
       });
       _screeningBusy = false;
+      drainTelegramQueue().catch((err) => log("silent_warn", err.message));
       return screenReport;
     }
     // Capture pre-cycle position addresses so we can identify which
@@ -482,6 +486,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     log("cron_error", `Screening pre-check failed: ${e.message}`);
     screenReport = `Screening pre-check failed: ${e.message}`;
     _screeningBusy = false;
+    drainTelegramQueue().catch((err) => log("silent_warn", err.message));
     return screenReport;
   }
   if (!silent && telegramEnabled() && !telegramMuted("cycle")) {
@@ -793,6 +798,7 @@ IMPORTANT:
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
     _screeningBusy = false;
+    drainTelegramQueue().catch((err) => log("silent_warn", err.message));
     // Tag any positions deployed during this cycle with the exploration
     // flag so getPerformanceSummary can bucket exploration vs normal
     // outcomes. Best-effort — failures here must not break the cycle.
@@ -847,6 +853,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
       log("cron_error", `Health check failed: ${error.message}`);
     } finally {
       _managementBusy = false;
+      drainTelegramQueue().catch((err) => log("silent_warn", err.message));
     }
   });
 
