@@ -1776,9 +1776,15 @@ function buildLessonsMessage(limit = 8) {
       if (/screeningSource=/i.test(r) && /Telegram/i.test(r)) return true;
       return false;
     };
+    // listLessons returns the newest `limit*4` items but in oldest-first order
+    // (it slices the array's tail). After filtering UI pollution we want the
+    // newest `limit` of what remains, so take the tail again — not the head.
+    // Using .slice(0, limit) here was the source of the /lessons display
+    // showing stale 5-day-old lessons even though briefing's Highlights
+    // section was reading fresh ones from the same file.
     const recent = (listLessons({ pinned: false, limit: limit * 4 }).lessons || [])
       .filter(l => !isUiPollution(l))
-      .slice(0, limit);
+      .slice(-limit);
     const summary = getPerformanceSummary();
     const hist = getPerformanceHistory({ hours: 24 * 30, limit: 500 }); // last 30d, up to 500
 
