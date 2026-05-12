@@ -80,6 +80,33 @@ export const config = {
     // 24h-window fee/TVL floor (percent). Mirrors management.minFeePerTvl24h
     // so we don't enter pools we'd immediately close on the yield rule.
     minFeePer24h:      u.minFeePer24h      ?? 0,
+    // ── Pre-Deploy Yield Backtest ─────────────────────────────────
+    // Simulates the proposed deploy (single-sided SOL, range = active±binsBelow)
+    // against the pool's last N hours of OHLCV. Computes:
+    //   - in_range_pct: % of candles where price stayed inside our range
+    //   - vol_share_pct: share of window volume that flowed through our range
+    //   - projected_24h_yield: what we'd actually claim, scaled to 24h
+    //
+    // Two independent toggles:
+    //   `enabled`     — run the computation and surface to Telegram/LLM (cheap)
+    //   `gateEnabled` — actually reject candidates that fail the gate (riskier)
+    //
+    // Recommended rollout:
+    //   1. Set enabled=true, gateEnabled=false. Observe values in /candidates
+    //      across several screening cycles.
+    //   2. Once thresholds look right against actual deploys, flip
+    //      gateEnabled=true.
+    //
+    // On any API/network error the gate fails OPEN — we never starve the
+    // bot because of a transient backtest failure (see evaluateBacktestGate).
+    backtest: {
+      enabled:             u.backtestEnabled             ?? false, // master: compute + display
+      gateEnabled:         u.backtestGateEnabled         ?? false, // hard reject if true
+      windowHours:         u.backtestWindowHours         ?? 6,
+      timeframe:           u.backtestTimeframe           ?? "5m",
+      minProjectedYield:   u.backtestMinProjectedYield   ?? 8,    // % per 24h
+      minInRangeFraction:  u.backtestMinInRangeFraction  ?? 0.4,  // 40% of candles inside range
+    },
     maxVolatility:     u.maxVolatility     ?? 5.0,   // ceiling for pool.volatility — auto-evolved by lessons.js
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
@@ -442,6 +469,14 @@ export function reloadScreeningThresholds() {
     if (fresh.screeningSource != null) s.source = fresh.screeningSource;
     if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
     if (fresh.minFeePer24h         != null) s.minFeePer24h         = fresh.minFeePer24h;
+    // Backtest sub-block (see screening.backtest definition above)
+    if (!s.backtest) s.backtest = {};
+    if (fresh.backtestEnabled            !== undefined) s.backtest.enabled            = fresh.backtestEnabled;
+    if (fresh.backtestGateEnabled        !== undefined) s.backtest.gateEnabled        = fresh.backtestGateEnabled;
+    if (fresh.backtestWindowHours        != null)       s.backtest.windowHours        = fresh.backtestWindowHours;
+    if (fresh.backtestTimeframe          != null)       s.backtest.timeframe          = fresh.backtestTimeframe;
+    if (fresh.backtestMinProjectedYield  != null)       s.backtest.minProjectedYield  = fresh.backtestMinProjectedYield;
+    if (fresh.backtestMinInRangeFraction != null)       s.backtest.minInRangeFraction = fresh.backtestMinInRangeFraction;
     if (fresh.maxVolatility        != null) s.maxVolatility        = fresh.maxVolatility;
     if (fresh.useDiscordSignals !== undefined) s.useDiscordSignals = fresh.useDiscordSignals;
     if (fresh.discordSignalMode != null) s.discordSignalMode = fresh.discordSignalMode;

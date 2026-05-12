@@ -371,6 +371,56 @@ export async function getTopCandidates({ limit = 10, screeningOverrides = null }
     }
   }
 
+  // ── Pre-Deploy Yield Backtest ──────────────────────────────────
+  // Symmetric for both meteora & gmgn sources. Runs in parallel for all
+  // remaining candidates. Two independent toggles:
+  //   backtest.enabled     — compute + attach result to candidate
+  //   backtest.gateEnabled — actually reject candidates that fail the gate
+  // Failures (network, missing data) fail OPEN — never starve the bot.
+  const btCfg = config.screening.backtest;
+  if (btCfg?.enabled && eligible.length > 0) {
+    const { runYieldBacktest, evaluateBacktestGate } = await import("./backtest.js");
+    const { computeBinsBelow } = await import("../src/format.js");
+    const results = await Promise.all(
+      eligible.map((p) =>
+        runYieldBacktest({
+          poolAddress: p.pool,
+          binsBelow:   computeBinsBelow(p.volatility),
+          cfg:         btCfg,
+        }).catch((e) => ({ ok: false, reason: `exception: ${e.message}` })),
+      ),
+    );
+    for (let i = 0; i < eligible.length; i++) {
+      eligible[i].backtest = results[i];
+    }
+    if (btCfg.gateEnabled) {
+      const before = eligible.length;
+      const survivors = [];
+      for (const p of eligible) {
+        const reject = evaluateBacktestGate(p.backtest, btCfg);
+        if (reject) {
+          pushFilteredReason(filteredOut, p, reject);
+          log("backtest", `Filtered ${p.name} (${p.pool.slice(0, 8)}) — ${reject}`);
+        } else {
+          survivors.push(p);
+        }
+      }
+      eligible.splice(0, eligible.length, ...survivors);
+      if (eligible.length < before) {
+        log("backtest", `Backtest gate removed ${before - eligible.length} pool(s)`);
+      }
+    } else {
+      // Observability mode: just log a sample so the operator can build trust
+      // in the values before flipping gateEnabled=true.
+      const sample = eligible.slice(0, 3).map((p) => {
+        const b = p.backtest;
+        if (!b?.ok) return `${p.name}=err:${b?.reason || "?"}`;
+        return `${p.name}: in-range ${(b.in_range_pct * 100).toFixed(0)}% · proj ${b.projected_24h_yield}%`;
+      }).join(" | ");
+      if (sample) log("backtest", `[observe] ${sample}`);
+    }
+  }
+
   // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
   // Skipped for GMGN: bundler/bot/wash data already sourced from GMGN pipeline
   if (source !== "gmgn" && eligible.length > 0) {

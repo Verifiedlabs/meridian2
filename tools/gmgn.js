@@ -772,6 +772,15 @@ export function formatGmgnCandidateForPrompt(p) {
   const risk = [top10, dev, bot, fresh, bundler].filter(Boolean).join(" | ");
   const traction = [holders, fees, smart, kol].filter(Boolean).join(" | ");
 
+  // Pre-deploy backtest: simulates this exact range deploy against last N hours
+  // of OHLCV. Helps the LLM avoid pools where 24h yield looks fine but the
+  // proposed range catches little volume.
+  let backtestLine = "";
+  if (p.backtest?.ok) {
+    const b = p.backtest;
+    backtestLine = `\n  Backtest(${b.window_hours}h): in-range=${(b.in_range_pct * 100).toFixed(0)}% · vol-share=${(b.vol_share_pct * 100).toFixed(0)}% · proj-24h-yield=${b.projected_24h_yield}%`;
+  }
+
   return [
     `[${header}]`,
     pool ? `  Pool: ${pool}` : null,
@@ -780,6 +789,7 @@ export function formatGmgnCandidateForPrompt(p) {
     kolLine || null,
     dumpKolLine || null,
     indLine || null,
+    backtestLine || null,
   ].filter(Boolean).join("\n");
 }
 

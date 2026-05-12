@@ -1130,12 +1130,35 @@ function describeLatestCandidates(limit = 5) {
       : `Yield 5m: <b>${feeTvl != null ? Number(feeTvl).toFixed(2) + "%" : "—"}</b>`;
     const inRangeStr = active != null ? `${active}%` : "—";
     const organicStr = organic != null ? `${organic}/100` : "—";
+
+    // Pre-deploy backtest line — shown only when backtest.enabled and result
+    // is present. Uses an emoji badge so the operator can scan quickly:
+    //   ✅ proj >= minProj && range >= minRange (would pass gate)
+    //   ⚠️ partial (passes one but not both, OR projected < min)
+    //   ❌ would fail gate
+    let backtestLine = "";
+    const bt = pool.backtest;
+    if (bt) {
+      if (bt.ok === true) {
+        const btCfg = config.screening?.backtest || {};
+        const minProj  = Number.isFinite(btCfg.minProjectedYield) ? btCfg.minProjectedYield : 0;
+        const minRange = Number.isFinite(btCfg.minInRangeFraction) ? btCfg.minInRangeFraction : 0;
+        const projOK   = bt.projected_24h_yield >= minProj;
+        const rangeOK  = bt.in_range_pct >= minRange;
+        const badge = projOK && rangeOK ? "✅" : (!projOK && !rangeOK ? "❌" : "⚠️");
+        backtestLine = `   📊 Backtest ${bt.window_hours}h: <b>${Number(bt.projected_24h_yield).toFixed(1)}%</b> proj  ·  in-range <b>${(bt.in_range_pct * 100).toFixed(0)}%</b> ${badge}`;
+      } else {
+        backtestLine = `   📊 Backtest: <i>n/a (${escapeHtml(bt.reason || "error")})</i>`;
+      }
+    }
+
     return [
       `${i + 1}. <b>${escapeHtml(pool.name || "?")}</b>`,
       `   ${yieldLine}`,
       `   TVL: <b>${tvlStr}</b>  ·  Vol: <b>${vol}</b>`,
       `   In-range: <b>${inRangeStr}</b>  ·  Organic: <b>${organicStr}</b>`,
-    ].join("\n");
+      backtestLine || null,
+    ].filter(Boolean).join("\n");
   });
   const updated = _latestCandidatesAt
     ? new Date(_latestCandidatesAt).toLocaleString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit" })
@@ -1201,9 +1224,16 @@ function settingValue(key) {
     minHolders: config.screening.minHolders,
     minMcap: config.screening.minMcap,
     minFeeActiveTvlRatio: config.screening.minFeeActiveTvlRatio,
+    minFeePer24h: config.screening.minFeePer24h,
     minTokenFeesSol: config.screening.minTokenFeesSol,
     minBinStep: config.screening.minBinStep,
     maxBinStep: config.screening.maxBinStep,
+    // Pre-deploy yield backtest (see config.screening.backtest)
+    backtestEnabled:           config.screening.backtest?.enabled,
+    backtestGateEnabled:       config.screening.backtest?.gateEnabled,
+    backtestWindowHours:       config.screening.backtest?.windowHours,
+    backtestMinProjectedYield: config.screening.backtest?.minProjectedYield,
+    backtestMinInRangeFraction:config.screening.backtest?.minInRangeFraction,
     // Twitter
     twitterEnabled: config.twitter?.enabled,
     twitterMode: config.twitter?.mode,
@@ -1369,6 +1399,10 @@ function renderSettingsMenu(page = "main") {
       ],
       [toggleButton("blockPvpSymbols", "🛡 Block PVP")],
       [inputButton("managementIntervalMin", "⏱ Manage (min)")[0], inputButton("screeningIntervalMin", "⏱ Screen (min)")[0]],
+      // ── Pre-Deploy Yield Backtest ──
+      [toggleButton("backtestEnabled", "📊 Backtest"), toggleButton("backtestGateEnabled", "🚪 Gate")],
+      [inputButton("backtestWindowHours", "⏳ Window (h)")[0], inputButton("backtestMinProjectedYield", "Min Proj %", { digits: 1 })[0]],
+      [inputButton("backtestMinInRangeFraction", "Min In-Range", { digits: 2 })[0], inputButton("minFeePer24h", "Min 24h Yield", { digits: 1 })[0]],
     ];
 
   } else if (page === "filter") {
@@ -1385,6 +1419,10 @@ function renderSettingsMenu(page = "main") {
       ],
       [toggleButton("useDiscordSignals", "📡 Discord Signals"), toggleButton("blockPvpSymbols", "🛡 Block PVP")],
       [inputButton("managementIntervalMin", "⏱ Manage (min)")[0], inputButton("screeningIntervalMin", "⏱ Screen (min)")[0]],
+      // ── Pre-Deploy Yield Backtest ──
+      [toggleButton("backtestEnabled", "📊 Backtest"), toggleButton("backtestGateEnabled", "🚪 Gate")],
+      [inputButton("backtestWindowHours", "⏳ Window (h)")[0], inputButton("backtestMinProjectedYield", "Min Proj %", { digits: 1 })[0]],
+      [inputButton("backtestMinInRangeFraction", "Min In-Range", { digits: 2 })[0], inputButton("minFeePer24h", "Min 24h Yield", { digits: 1 })[0]],
     ];
 
   } else if (page === "indicators" && isGmgn) {
@@ -2599,6 +2637,7 @@ async function applySettingsMenuCallback(msg) {
     const inputPage = ["gmgnPreferredKolNames", "gmgnPreferredKolMinHoldPct", "gmgnDumpKolNames", "gmgnDumpKolMinHoldPct"].includes(inputKey) ? "kol"
       : ["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours", "minBinsBelow", "maxBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(inputKey) ? "filter"
       : ["useDiscordSignals", "blockPvpSymbols", "screeningSource", "gmgnRequireKol"].includes(inputKey) ? "filter"
+      : inputKey.startsWith("backtest") || inputKey === "minFeePer24h" ? "filter"
       : inputKey.startsWith("indicator") || inputKey === "chartIndicatorsEnabled" || inputKey === "rsiLength" || inputKey === "requireAllIntervals" ? "indicators"
       : inputKey.startsWith("gmgn") && !["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours"].includes(inputKey) ? "indicators"
       : ["solMode", "lpAgentRelayEnabled", "hiveMindEnabled", "twitterEnabled", "twitterMode"].includes(inputKey) ? "main"
@@ -2684,7 +2723,8 @@ async function applySettingsMenuCallback(msg) {
     : ["gmgnPreferredKolNames", "gmgnPreferredKolMinHoldPct", "gmgnDumpKolNames", "gmgnDumpKolMinHoldPct", "gmgnRequireKol", "gmgnMinKolCount"].includes(key) ? "kol"
     : ["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours", "gmgnMinTotalFeeSol", "gmgnMinHolders", "gmgnInterval"].includes(key) ? "filter"
     : ["useDiscordSignals", "blockPvpSymbols", "managementIntervalMin", "screeningIntervalMin", "strategy"].includes(key) ? "filter"
-    : ["minTvl", "maxTvl", "minVolume", "minOrganic", "minHolders", "minMcap", "minFeeActiveTvlRatio", "minTokenFeesSol", "minBinStep", "maxBinStep"].includes(key) ? "filter"
+    : ["minTvl", "maxTvl", "minVolume", "minOrganic", "minHolders", "minMcap", "minFeeActiveTvlRatio", "minFeePer24h", "minTokenFeesSol", "minBinStep", "maxBinStep"].includes(key) ? "filter"
+    : key.startsWith("backtest") ? "filter"
     : ["gmgnIndicatorFilter", "gmgnIndicatorInterval", "gmgnRequireBullishSt", "gmgnRejectAtBottom", "gmgnRequireAboveSt", "gmgnMinRsi", "gmgnMaxRsi"].includes(key) ? "indicators"
     : key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals" ? "indicators"
     : ["solMode", "lpAgentRelayEnabled", "hiveMindEnabled", "twitterEnabled", "twitterMode", "screeningSource", "chartIndicatorsEnabled", "trailingTakeProfit"].includes(key) ? "main"

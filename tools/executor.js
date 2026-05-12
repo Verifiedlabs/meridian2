@@ -137,6 +137,13 @@ const CONFIG_VALIDATORS = {
   maxBinStep:             num(1, 10000, { integer: true }),
   minFeeActiveTvlRatio:   num(0, 100),
   minFeePer24h:           num(0, 100),
+  // ── Pre-deploy yield backtest (see config.screening.backtest) ──
+  backtestEnabled:            bool(),
+  backtestGateEnabled:        bool(),
+  backtestWindowHours:        num(1, 168, { integer: true }),       // 1h–7d
+  backtestTimeframe:          oneOf(["5m", "30m", "1h", "2h", "4h", "12h", "24h"]),
+  backtestMinProjectedYield:  num(0, 1000),
+  backtestMinInRangeFraction: num(0, 1),
   maxVolatility:          num(0, 1000),
   minTokenFeesSol:        num(0, 1e9),
   maxBundlePct:           num(0, 100),
@@ -342,6 +349,13 @@ const toolMap = {
       screeningSource: ["screening", "source"],
       minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
       minFeePer24h: ["screening", "minFeePer24h"],
+      // backtest sub-block
+      backtestEnabled:            ["screening", "backtest", "enabled"],
+      backtestGateEnabled:        ["screening", "backtest", "gateEnabled"],
+      backtestWindowHours:        ["screening", "backtest", "windowHours"],
+      backtestTimeframe:          ["screening", "backtest", "timeframe"],
+      backtestMinProjectedYield:  ["screening", "backtest", "minProjectedYield"],
+      backtestMinInRangeFraction: ["screening", "backtest", "minInRangeFraction"],
       maxVolatility: ["screening", "maxVolatility"],
       excludeHighSupplyConcentration: ["screening", "excludeHighSupplyConcentration"],
       minTvl: ["screening", "minTvl"],
