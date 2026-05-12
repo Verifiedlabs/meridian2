@@ -1109,16 +1109,44 @@ function getLatestCandidatesMeta() {
 }
 
 function describeLatestCandidates(limit = 5) {
-  if (!_latestCandidates.length) return "No cached candidates yet. Run /screen first.";
-  const lines = _latestCandidates.slice(0, limit).map((pool, i) => {
-    const feeTvl = pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio ?? "?";
-    const vol = pool.volume_window ?? pool.volume_24h ?? "?";
-    const active = pool.active_pct ?? "?";
-    const organic = pool.organic_score ?? "?";
-    return `${i + 1}. ${pool.name} | fee/aTVL ${feeTvl}% | vol $${vol} | in-range ${active}% | organic ${organic}`;
+  if (!_latestCandidates.length) {
+    return "<i>No cached candidates yet. Tap 🔍 Screen Now or run /screen.</i>";
+  }
+  const cards = _latestCandidates.slice(0, limit).map((pool, i) => {
+    const feeTvl = pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio;
+    const fee24h = pool.fee_per_tvl_24h;
+    const volRaw = pool.volume_window ?? pool.volume_24h;
+    const vol = (volRaw != null && Number.isFinite(Number(volRaw)))
+      ? `$${Number(volRaw).toLocaleString("en-US", { maximumFractionDigits: 0 })}`
+      : "—";
+    const active = pool.active_pct;
+    const organic = pool.organic_score;
+    const tvl = pool.active_tvl;
+    const tvlStr = (tvl != null && Number.isFinite(Number(tvl)))
+      ? `$${Number(tvl).toLocaleString("en-US", { maximumFractionDigits: 0 })}`
+      : "—";
+    const yieldLine = fee24h != null
+      ? `Yield 24h: <b>${Number(fee24h).toFixed(2)}%</b>  ·  5m: ${feeTvl != null ? Number(feeTvl).toFixed(2) + "%" : "—"}`
+      : `Yield 5m: <b>${feeTvl != null ? Number(feeTvl).toFixed(2) + "%" : "—"}</b>`;
+    const inRangeStr = active != null ? `${active}%` : "—";
+    const organicStr = organic != null ? `${organic}/100` : "—";
+    return [
+      `${i + 1}. <b>${escapeHtml(pool.name || "?")}</b>`,
+      `   ${yieldLine}`,
+      `   TVL: <b>${tvlStr}</b>  ·  Vol: <b>${vol}</b>`,
+      `   In-range: <b>${inRangeStr}</b>  ·  Organic: <b>${organicStr}</b>`,
+    ].join("\n");
   });
-  const age = _latestCandidatesAt ? new Date(_latestCandidatesAt).toLocaleString("en-US", { hour12: false }) : "unknown";
-  return `Latest candidates (${_latestCandidates.length}) — updated ${age}\n\n${lines.join("\n")}`;
+  const updated = _latestCandidatesAt
+    ? new Date(_latestCandidatesAt).toLocaleString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit" })
+    : "unknown";
+  return [
+    `<i>${_latestCandidates.length} found · updated ${escapeHtml(updated)}</i>`,
+    "━━━━━━━━━━━━━━━━━━━━━━━",
+    cards.join("\n\n"),
+    "━━━━━━━━━━━━━━━━━━━━━━━",
+    "<i>/screen to refresh now</i>",
+  ].join("\n");
 }
 
 function parseConfigValue(raw) {
@@ -1272,11 +1300,12 @@ function renderSettingsMenu(page = "main") {
 
   const summary = [
     `<b>${pageTitles[page] || "⚙️ Settings"}</b>`,
-    "",
-    `Source: <b>${src.toUpperCase()}</b> | Strategy: <b>${config.strategy.strategy}</b>`,
-    `Deploy: <b>${config.management.deployAmountSol} SOL</b> | Max: <b>${config.risk.maxPositions} pos</b>`,
-    `TP: <b>${config.management.takeProfitPct}%</b> | SL: <b>${config.management.stopLossPct}%</b> | Trail: <b>${config.management.trailingTakeProfit ? "ON" : "OFF"}</b>`,
-    `Twitter: <b>${config.twitter?.enabled ? "ON" : "OFF"}</b> (${config.twitter?.mode || "local"}) | Indicators: <b>${config.indicators.enabled ? "ON" : "OFF"}</b>`,
+    "━━━━━━━━━━━━━━━━━━━━━━━",
+    `🔎 Source: <b>${src.toUpperCase()}</b>  ·  📐 Strategy: <b>${config.strategy.strategy}</b>`,
+    `💰 Deploy: <b>${config.management.deployAmountSol} SOL</b>  ·  📊 Max: <b>${config.risk.maxPositions}</b>`,
+    `📈 TP: <b>${config.management.takeProfitPct}%</b>  ·  📉 SL: <b>${config.management.stopLossPct}%</b>  ·  🎯 Trail: <b>${config.management.trailingTakeProfit ? "ON" : "OFF"}</b>`,
+    `🐦 Twitter: <b>${config.twitter?.enabled ? "ON" : "OFF"}</b> <i>(${config.twitter?.mode || "local"})</i>  ·  📊 Indicators: <b>${config.indicators.enabled ? "ON" : "OFF"}</b>`,
+    "━━━━━━━━━━━━━━━━━━━━━━━",
   ].join("\n");
 
   // ─── Nav bar ───
@@ -2215,21 +2244,53 @@ async function applyControlPanelCallback(msg) {
     try {
       const { positions, total_positions } = await getMyPositions({ force: true });
       if (!total_positions) {
-        body = "No open positions.";
+        body = "<i>No open positions.</i>";
       } else {
-        const lines = positions.map((p, i) => {
-          const pnl = (p.pnl_usd ?? 0) >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
+        // Aggregate totals while building per-card rows so the operator can
+        // glance the bottom summary instead of mental-summing every line.
+        let totValue = 0;
+        let totPnl = 0;
+        let totFees = 0;
+        let oorCount = 0;
+        const cards = positions.map((p, i) => {
+          const value = Number(p.total_value_usd) || 0;
+          const pnlNum = Number(p.pnl_usd) || 0;
+          const feesNum = Number(p.unclaimed_fees_usd) || 0;
+          totValue += value;
+          totPnl += pnlNum;
+          totFees += feesNum;
+          if (!p.in_range) oorCount += 1;
+          const pnlSign = pnlNum >= 0 ? "+" : "-";
+          const pnlStr = `${pnlSign}${cur}${Math.abs(pnlNum).toFixed(2)}`;
+          const pnlPctStr = p.pnl_pct != null
+            ? ` <i>(${pnlNum >= 0 ? "+" : "-"}${Math.abs(Number(p.pnl_pct)).toFixed(2)}%)</i>`
+            : "";
           const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
-          const oor = !p.in_range ? " ⚠️OOR" : "";
-          const yld = p.fee_per_tvl_24h != null ? ` | yield: ${p.fee_per_tvl_24h}%` : "";
-          return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd}${yld} | ${age}${oor}`;
+          const status = p.in_range ? "🟢 IN" : "⚠️ OOR";
+          const yld = p.fee_per_tvl_24h != null ? `${Number(p.fee_per_tvl_24h).toFixed(2)}%` : "—";
+          return [
+            `${i + 1}. <b>${escapeHtml(p.pair || "?")}</b>  ${status}`,
+            `   Value: <b>${cur}${value.toFixed(2)}</b>  ·  PnL: <b>${pnlStr}</b>${pnlPctStr}`,
+            `   Yield: <b>${yld}</b>  ·  Fees: <b>${cur}${feesNum.toFixed(2)}</b>  ·  age ${age}`,
+          ].join("\n");
         });
-        body = `${lines.join("\n")}\n\n<i>/close &lt;n&gt; to close · /set &lt;n&gt; &lt;note&gt;</i>`;
+        const totPnlSign = totPnl >= 0 ? "+" : "-";
+        const totPnlStr = `${totPnlSign}${cur}${Math.abs(totPnl).toFixed(2)}`;
+        const oorBadge = oorCount > 0 ? `  ·  <i>${oorCount} OOR</i>` : "";
+        body = [
+          `<i>${total_positions} active</i>${oorBadge}`,
+          "━━━━━━━━━━━━━━━━━━━━━━━",
+          cards.join("\n\n"),
+          "━━━━━━━━━━━━━━━━━━━━━━━",
+          `Total: <b>${cur}${totValue.toFixed(2)}</b>  ·  PnL: <b>${totPnlStr}</b>  ·  Fees: <b>${cur}${totFees.toFixed(2)}</b>`,
+          "",
+          "<i>/close &lt;n&gt; to close · /why &lt;n&gt; for details</i>",
+        ].join("\n");
       }
-    } catch (e) { body = `Error: ${e.message}`; }
+    } catch (e) { body = `Error: ${escapeHtml(e.message)}`; }
     await showPanelView({
       messageId,
-      title: "📊 <b>Open Positions</b>",
+      title: "📁 <b>Open Positions</b>",
       body,
       parseMode: "HTML",
     });
@@ -2279,11 +2340,13 @@ async function applyControlPanelCallback(msg) {
     await ack();
     let body;
     try { body = describeLatestCandidates(5); }
-    catch (e) { body = `Error: ${e.message}`; }
+    catch (e) { body = `Error: ${escapeHtml(e.message)}`; }
+    // describeLatestCandidates now returns HTML directly (escapes user-provided
+    // strings like pool names internally) — pass through without re-escaping.
     await showPanelView({
       messageId,
       title: "📋 <b>Latest Candidates</b>",
-      body: escapeHtml(body),
+      body,
       parseMode: "HTML",
     });
     return;
@@ -3060,7 +3123,9 @@ async function telegramHandler(msg) {
   }
 
   if (text === "/candidates") {
-    await sendMessage(describeLatestCandidates(5)).catch((err) => log("silent_warn", err.message));
+    // describeLatestCandidates returns HTML — send via sendHTML so the
+    // formatting actually renders (sendMessage is plain-text only).
+    await sendHTML(describeLatestCandidates(5)).catch((err) => log("silent_warn", err.message));
     return;
   }
 
