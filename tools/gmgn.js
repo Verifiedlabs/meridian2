@@ -326,12 +326,32 @@ async function fetchTopMeteoraDlmmPoolsForMint(mint, minTvl = 0, limit = 2) {
 async function fetchPoolDetailDirect(poolAddress) {
   // Always use Meteora's public Pool Discovery API — the server-side endpoint
   // (api.agentmeridian.xyz) returns stale/fee=0 data for some pools.
+  //
+  // Two windows: timeframe=5m gives the "right now" activity (fee, volume,
+  // volatility) which is useful as a recency signal; timeframe=24h gives
+  // the sustained yield the bot should actually filter on. Without the 24h
+  // call we were filtering on 5m fee_active_tvl_ratio which collapses to 0
+  // any time a pool has no trades in the current 5-minute slice — leading
+  // to deploys into pools that look "dead" momentarily but were actually
+  // healthy on a 24h average (e.g. SWATCH-SOL: 5m=0.0%, 24h=20.4%).
   const discoveryBase = "https://pool-discovery-api.datapi.meteora.ag";
-  const url = `${discoveryBase}/pools?page_size=1&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}&timeframe=5m`;
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return (data?.data || [])[0] ?? null;
+  const filterBy = encodeURIComponent(`pool_address=${poolAddress}`);
+  const [res5m, res24h] = await Promise.all([
+    fetch(`${discoveryBase}/pools?page_size=1&filter_by=${filterBy}&timeframe=5m`),
+    fetch(`${discoveryBase}/pools?page_size=1&filter_by=${filterBy}&timeframe=24h`),
+  ]);
+  if (!res5m.ok && !res24h.ok) return null;
+  const data5m = res5m.ok ? await res5m.json() : null;
+  const data24h = res24h.ok ? await res24h.json() : null;
+  const base = (data5m?.data || [])[0] ?? null;
+  const d24h = (data24h?.data || [])[0] ?? null;
+  if (!base) return d24h;
+  // Merge: base record carries the 5m window fields; we tack on the 24h
+  // fee/TVL ratio as fee_per_tvl_24h so downstream code can see both.
+  if (d24h && Number.isFinite(Number(d24h.fee_active_tvl_ratio))) {
+    base.fee_per_tvl_24h = Number(Number(d24h.fee_active_tvl_ratio).toFixed(4));
+  }
+  return base;
 }
 
 async function pickBestPool(pools) {
@@ -395,6 +415,11 @@ function condenseGmgnCandidate({ token, pool, poolDetail, security, info, infoAn
     // Stage 5 Pool Discovery: active_tvl, fee_active_tvl_ratio, volatility
     active_tvl: round(activeTvl),
     fee_active_tvl_ratio: feeActiveTvlRatio,
+    // 24h-windowed fee/TVL — sustained yield metric, used as the entry
+    // filter via screening.minFeePer24h (mirrors management.minFeePerTvl24h).
+    fee_per_tvl_24h: poolDetail?.fee_per_tvl_24h != null
+      ? Number(Number(poolDetail.fee_per_tvl_24h).toFixed(4))
+      : null,
     volatility: poolDetail?.volatility != null ? Number(Number(poolDetail.volatility).toFixed(2)) : null,
     // Stage 1 GMGN rank: token-level metrics
     holders: num(token.holder_count || info.holder_count),
@@ -640,6 +665,21 @@ export async function discoverGmgnPools({ limit = 10 } = {}) {
       if (!candidate.pool || !candidate.base?.mint) {
         filtered.push({ stage: 5, name: token.symbol || mint, reason: "incomplete pool mapping" });
         continue;
+      }
+      // 24h yield floor — block pools that look "dead" on a sustained basis
+      // even if Stage 4 indicators look fine. Mirrors management.minFeePerTvl24h
+      // so we don't enter pools we'd immediately try to close.
+      const minFeePer24h = Number(config.screening?.minFeePer24h);
+      if (Number.isFinite(minFeePer24h) && minFeePer24h > 0) {
+        const yield24h = candidate.fee_per_tvl_24h;
+        if (yield24h == null) {
+          filtered.push({ stage: 5, name: candidate.name, reason: `no 24h yield data (min ${minFeePer24h}%)` });
+          continue;
+        }
+        if (yield24h < minFeePer24h) {
+          filtered.push({ stage: 5, name: candidate.name, reason: `24h yield ${yield24h}% < min ${minFeePer24h}%` });
+          continue;
+        }
       }
       pools.push(candidate);
     } catch (error) {
