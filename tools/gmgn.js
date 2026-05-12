@@ -324,14 +324,30 @@ async function fetchTopMeteoraDlmmPoolsForMint(mint, minTvl = 0, limit = 2) {
 }
 
 async function fetchPoolDetailDirect(poolAddress) {
-  // Always use Meteora's public Pool Discovery API — the server-side endpoint
-  // (api.agentmeridian.xyz) returns stale/fee=0 data for some pools.
+  // Meteora Pool Discovery API. We fetch two timeframes in parallel:
+  //   - 5m : recent activity (used for fee_active_tvl_ratio recency signal)
+  //   - 24h: sustained yield, attached as fee_per_tvl_24h. This is what
+  //          the screening filter actually gates on (mirrors what the user
+  //          sees as "Claim Fee %" on the Meteora dashboard, which is the
+  //          24h-projected yield rate of the position).
   const discoveryBase = "https://pool-discovery-api.datapi.meteora.ag";
-  const url = `${discoveryBase}/pools?page_size=1&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}&timeframe=5m`;
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return (data?.data || [])[0] ?? null;
+  const filterBy = encodeURIComponent(`pool_address=${poolAddress}`);
+  const [res5m, res24h] = await Promise.all([
+    fetch(`${discoveryBase}/pools?page_size=1&filter_by=${filterBy}&timeframe=5m`),
+    fetch(`${discoveryBase}/pools?page_size=1&filter_by=${filterBy}&timeframe=24h`),
+  ]);
+  if (!res5m.ok && !res24h.ok) return null;
+  const data5m = res5m.ok ? await res5m.json() : null;
+  const data24h = res24h.ok ? await res24h.json() : null;
+  const base = (data5m?.data || [])[0] ?? null;
+  const d24h = (data24h?.data || [])[0] ?? null;
+  if (!base) return d24h;
+  // Merge: base record carries 5m window fields; tack on the 24h fee/TVL
+  // ratio so downstream code can read both.
+  if (d24h && Number.isFinite(Number(d24h.fee_active_tvl_ratio))) {
+    base.fee_per_tvl_24h = Number(Number(d24h.fee_active_tvl_ratio).toFixed(4));
+  }
+  return base;
 }
 
 async function pickBestPool(pools) {
@@ -395,6 +411,11 @@ function condenseGmgnCandidate({ token, pool, poolDetail, security, info, infoAn
     // Stage 5 Pool Discovery: active_tvl, fee_active_tvl_ratio, volatility
     active_tvl: round(activeTvl),
     fee_active_tvl_ratio: feeActiveTvlRatio,
+    // 24h-windowed fee/TVL — sustained pool yield. Used by screening.minFeePer24h
+    // and surfaced to the LLM so it can reason about sustained quality.
+    fee_per_tvl_24h: poolDetail?.fee_per_tvl_24h != null
+      ? Number(Number(poolDetail.fee_per_tvl_24h).toFixed(4))
+      : null,
     volatility: poolDetail?.volatility != null ? Number(Number(poolDetail.volatility).toFixed(2)) : null,
     // Stage 1 GMGN rank: token-level metrics
     holders: num(token.holder_count || info.holder_count),
@@ -656,6 +677,23 @@ export async function discoverGmgnPools({ limit = 10 } = {}) {
             name: candidate.name,
             reason: `5m yield ${yield5m ?? "?"}% < min ${minFeeActive}%`,
           });
+          continue;
+        }
+      }
+      // 24h fee/TVL floor — gate on sustained pool yield, the metric that
+      // best predicts the dashboard "Claim Fee %" the user actually cares
+      // about (24h-projected yield rate of the position). Mirrors
+      // management.minFeePerTvl24h so we don't enter pools we'd immediately
+      // close on the yield rule.
+      const minFeePer24h = Number(config.screening?.minFeePer24h);
+      if (Number.isFinite(minFeePer24h) && minFeePer24h > 0) {
+        const yield24h = candidate.fee_per_tvl_24h;
+        if (yield24h == null) {
+          filtered.push({ stage: 5, name: candidate.name, reason: `no 24h yield data (min ${minFeePer24h}%)` });
+          continue;
+        }
+        if (yield24h < minFeePer24h) {
+          filtered.push({ stage: 5, name: candidate.name, reason: `24h yield ${yield24h}% < min ${minFeePer24h}%` });
           continue;
         }
       }

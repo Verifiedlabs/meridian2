@@ -77,6 +77,9 @@ export const config = {
     source:            u.screeningSource    ?? "meteora", // meteora | gmgn
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
+    // 24h-window fee/TVL floor (percent). Mirrors management.minFeePerTvl24h
+    // so we don't enter pools we'd immediately close on the yield rule.
+    minFeePer24h:      u.minFeePer24h      ?? 0,
     maxVolatility:     u.maxVolatility     ?? 5.0,   // ceiling for pool.volatility — auto-evolved by lessons.js
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
@@ -438,6 +441,7 @@ export function reloadScreeningThresholds() {
     const s = config.screening;
     if (fresh.screeningSource != null) s.source = fresh.screeningSource;
     if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
+    if (fresh.minFeePer24h         != null) s.minFeePer24h         = fresh.minFeePer24h;
     if (fresh.maxVolatility        != null) s.maxVolatility        = fresh.maxVolatility;
     if (fresh.useDiscordSignals !== undefined) s.useDiscordSignals = fresh.useDiscordSignals;
     if (fresh.discordSignalMode != null) s.discordSignalMode = fresh.discordSignalMode;
