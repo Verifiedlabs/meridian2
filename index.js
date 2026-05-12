@@ -1693,9 +1693,16 @@ function buildCalendarView(target = null) {
   const cal = buildPnlCalendarFromDisk(
     year != null && month != null ? { year, month } : {},
   );
+  // Hide the Today button when the user is already viewing the current
+  // UTC month — otherwise pressing it triggers an editMessage with
+  // identical content, which Telegram rejects with "message is not
+  // modified" and the UI looks unresponsive.
+  const nowUtc = new Date();
+  const isOnCurrentMonth =
+    cal.year === nowUtc.getUTCFullYear() && cal.month === nowUtc.getUTCMonth();
   const navRow = [];
   if (cal.hasPrev) navRow.push({ text: "◀ Prev",   callback_data: `panel:calendar_nav:${cal.prevYM}` });
-  navRow.push({ text: "📅 Today", callback_data: "panel:calendar" });
+  if (!isOnCurrentMonth) navRow.push({ text: "📅 Today", callback_data: "panel:calendar" });
   if (cal.hasNext) navRow.push({ text: "Next ▶",   callback_data: `panel:calendar_nav:${cal.nextYM}` });
   const keyboard = [
     navRow,
