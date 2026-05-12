@@ -136,7 +136,6 @@ const CONFIG_VALIDATORS = {
   minBinStep:             num(1, 10000, { integer: true }),
   maxBinStep:             num(1, 10000, { integer: true }),
   minFeeActiveTvlRatio:   num(0, 100),
-  minFeePer24h:           num(0, 100),
   maxVolatility:          num(0, 1000),
   minTokenFeesSol:        num(0, 1e9),
   maxBundlePct:           num(0, 100),
@@ -341,7 +340,6 @@ const toolMap = {
       // screening
       screeningSource: ["screening", "source"],
       minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
-      minFeePer24h: ["screening", "minFeePer24h"],
       maxVolatility: ["screening", "maxVolatility"],
       excludeHighSupplyConcentration: ["screening", "excludeHighSupplyConcentration"],
       minTvl: ["screening", "minTvl"],
