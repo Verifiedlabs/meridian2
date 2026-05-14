@@ -18,13 +18,14 @@ Meridian opens, monitors, and closes concentrated-liquidity positions on Meteora
 6. [Choosing a preset](#choosing-a-preset)
 7. [Your first run](#your-first-run)
 8. [Going live](#going-live)
-9. [Telegram setup](#telegram-setup)
-10. [Common errors and how to fix them](#common-errors-and-how-to-fix-them)
-11. [REPL commands](#repl-commands)
-12. [Glossary](#glossary)
-13. [How it learns](#how-it-learns)
-14. [Hive Mind (optional)](#hive-mind-optional)
-15. [Repo layout](#repo-layout)
+9. [Maintenance — reclaiming ATA rent](#maintenance--reclaiming-ata-rent)
+10. [Telegram setup](#telegram-setup)
+11. [Common errors and how to fix them](#common-errors-and-how-to-fix-them)
+12. [REPL commands](#repl-commands)
+13. [Glossary](#glossary)
+14. [How it learns](#how-it-learns)
+15. [Hive Mind (optional)](#hive-mind-optional)
+16. [Repo layout](#repo-layout)
 
 ---
 
@@ -36,6 +37,7 @@ Meridian opens, monitors, and closes concentrated-liquidity positions on Meteora
 - **Realtime fast-close** — a WebSocket watcher reacts within seconds when price pumps far above range or trips a profit-protection rule, instead of waiting for the next 10-min management cycle.
 - **Claims fees** — when fees accrued cross your `minClaimAmount` threshold.
 - **Closes and re-deploys** — when a position hits exit criteria, closes it, optionally swaps the base token back to SOL, and feeds the result into the lessons system. Each close notification now includes the close reason.
+- **Auto-reclaims ATA rent** — after a position is closed and swapped back to SOL, the bot automatically closes the now-empty SPL token account to reclaim ~0.002 SOL in rent (configurable via `autoRevokeAtaAfterClose`).
 - **Self-protects** — circuit breaker trips on daily-loss / consecutive-loss limits and pauses new deploys until cooldown elapses; exploration budget caps over-deployment to similar pools; pool-history guard cools down pools that keep dumping you.
 - **Learns** — five tiers of self-learning: composite-scored lesson injection, operator-curated coaching memos, top-LPer auto-discovery, TP/SL self-evolve proposals (operator-approved), and pool-level guards. After 10+ closes, the **darwin tuner** auto-evolves screening thresholds based on your actual win/loss data.
 - **Talks to you** — REPL prompt, Telegram **control panel** with inline buttons, daily briefings, OOR alerts, deploy/close notifications, daily PnL calendar, postmortem flags, exposure/risk snapshot.
@@ -106,8 +108,8 @@ LLMs are accessed via **OpenRouter** by default, but you can swap any OpenAI-com
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/Verifiedlabs/meridian.git
-cd meridian
+git clone https://github.com/Verifiedlabs/meridian2.git
+cd meridian2
 npm install
 ```
 
@@ -154,7 +156,17 @@ TELEGRAM_ALLOWED_USER_IDS=<your telegram user id>
 LPAGENT_API_KEY=<your lpagent key>
 ```
 
-### 3. Pick a preset
+### 3. (Optional) Configure GMGN screener
+
+If you want to use GMGN instead of Meteora for pool discovery:
+
+```bash
+cp gmgn-config.example.json gmgn-config.json
+```
+
+Edit `gmgn-config.json` and add your GMGN API key. If you skip this step, the bot defaults to Meteora screening.
+
+### 4. Pick a preset
 
 The repo ships with four pre-tuned `user-config.json` profiles in [`presets/`](./presets/). Pick one and copy it:
 
@@ -172,7 +184,7 @@ See [Choosing a preset](#choosing-a-preset) below for help deciding.
 
 You can also start from `user-config.example.json` and tune ~80 fields manually if you know what you're doing.
 
-### 4. (Optional) Encrypt your `.env`
+### 5. (Optional) Encrypt your `.env`
 
 If you don't want plain-text secrets on disk:
 
@@ -187,7 +199,7 @@ Meridian uses **AES-256-GCM with scrypt KDF** (the new `v2:` format). Old XOR-en
 
 Keep `.env.raw` and `.envrypt` local — both are gitignored.
 
-### 5. Verify the install
+### 6. Verify the install
 
 ```bash
 npm test
@@ -205,7 +217,7 @@ The suite covers state machine transitions, safety checks, deterministic close r
 
 If any test fails, do **not** continue. Open an issue with the output.
 
-### 6. First run — DRY RUN
+### 7. First run — DRY RUN
 
 ```bash
 npm run dev
@@ -270,6 +282,23 @@ After your DRY_RUN observation period:
 7. If profitable, scale up: switch to `balanced` or `aggressive` preset
 
 ---
+
+## Maintenance — reclaiming ATA rent
+
+Over time your wallet accumulates empty SPL token accounts (one per token you've ever held). Each costs ~0.00204 SOL in rent. Meridian handles this automatically after position closes, but you can also clean up manually:
+
+```bash
+# Preview what would be closed (dry run)
+node tools/revoke-atas.js --dry
+
+# Close strictly-empty accounts only (safe — no dust burned)
+node tools/revoke-atas.js --threshold=0
+
+# Close + burn up to $0.01 of dust per account (default)
+node tools/revoke-atas.js
+```
+
+The tool skips wSOL, USDC, frozen accounts, and low-decimal balances (NFT/collectible protection). See `tools/revoke-atas.js --help` for options.
 
 ## Telegram setup
 
