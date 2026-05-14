@@ -9,7 +9,7 @@ import {
   closePosition,
   searchPools,
 } from "./dlmm.js";
-import { getWalletBalances, swapToken } from "./wallet.js";
+import { getWalletBalances, swapToken, revokeEmptyAtas } from "./wallet.js";
 import { studyTopLPers, hasRecentStudy } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, getPerformanceSummary, getPostMortemSuggestions, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
@@ -740,6 +740,20 @@ export async function executeTool(name, args) {
           } catch (e) {
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);
           }
+          // After swap-back, reclaim the now-empty ATA rent (~0.00204 SOL).
+          // Targeted to just this mint so other active positions aren't touched.
+          if (config.management.autoRevokeAtaAfterClose && result.base_mint) {
+            try {
+              const revoked = await revokeEmptyAtas({ mints: [result.base_mint] });
+              if (revoked.closed > 0) {
+                log("executor", `Reclaimed ${revoked.sol_reclaimed.toFixed(5)} SOL from ${revoked.closed} ATA(s) [${result.base_mint.slice(0, 8)}]`);
+                result.ata_reclaimed_sol = revoked.sol_reclaimed;
+                result.ata_closed_count = revoked.closed;
+              }
+            } catch (e) {
+              log("executor_warn", `Auto-revoke ATA after close failed: ${e.message}`);
+            }
+          }
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         try {
@@ -752,6 +766,12 @@ export async function executeTool(name, args) {
         } catch (e) {
           log("executor_warn", `Auto-swap after claim failed: ${e.message}`);
         }
+        // NOTE: deliberately NOT auto-revoking ATA after claim_fees.
+        // claim_fees is typically called mid-position while the position is
+        // still active — closing the ATA here would just force the next
+        // claim/withdraw to re-create it (paying rent again). ATA cleanup
+        // happens after close_position (position fully exited) or manually
+        // via `node tools/revoke-atas.js`.
       }
     }
 

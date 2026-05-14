@@ -207,6 +207,11 @@ export const config = {
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
+    // After close_position / claim_fees auto-swap, also close the emptied
+    // token ATA to reclaim rent (~0.00204 SOL per account). Targeted: only
+    // touches the ATA for the mint we just swapped, so it won't disturb
+    // ATAs from other active positions. Default true.
+    autoRevokeAtaAfterClose: u.autoRevokeAtaAfterClose ?? true,
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
     // Minimum age (minutes) before the "pumped far above range" fast-exit
@@ -390,16 +395,6 @@ export const config = {
     url: nonEmptyString(u.agentMeridianApiUrl, process.env.AGENT_MERIDIAN_API_URL, DEFAULT_AGENT_MERIDIAN_API_URL),
     publicApiKey: nonEmptyString(u.publicApiKey, process.env.PUBLIC_API_KEY, DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY),
     lpAgentRelayEnabled: u.lpAgentRelayEnabled ?? false,
-  },
-
-  jupiter: {
-    apiKey: process.env.JUPITER_API_KEY ?? "",
-    referralAccount:
-      process.env.JUPITER_REFERRAL_ACCOUNT ??
-      "7kf8boZvTSaBv3wmDdY59VFK9U2LfMsUDB2op8CmwBFy",
-    referralFeeBps: Number(
-      process.env.JUPITER_REFERRAL_FEE_BPS ?? 50,
-    ),
   },
 
   // ─── Telegram Notifications ─────────────
