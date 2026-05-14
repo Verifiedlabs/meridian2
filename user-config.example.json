@@ -49,6 +49,7 @@
 
   "minClaimAmount": 5,
   "autoSwapAfterClaim": false,
+  "autoRevokeAtaAfterClose": true,
   "outOfRangeBinsToClose": 10,
   "outOfRangeWaitMinutes": 30,
   "realtimeMonitoring": false,
