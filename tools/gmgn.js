@@ -662,24 +662,7 @@ export async function discoverGmgnPools({ limit = 10 } = {}) {
         filtered.push({ stage: 5, name: token.symbol || mint, reason: "incomplete pool mapping" });
         continue;
       }
-      // 5m fee/TVL floor — block pools that look dead at the moment of
-      // screening. The Meteora source applies minFeeActiveTvlRatio as a
-      // query filter (tools/screening.js); GMGN source has historically
-      // had no such gate, so candidates could reach the LLM with
-      // fee_active_tvl_ratio=0.0 (no trades in the current 5-min slice).
-      // Enforce the same threshold here so behavior is symmetric.
-      const minFeeActive = Number(config.screening?.minFeeActiveTvlRatio);
-      if (Number.isFinite(minFeeActive) && minFeeActive > 0) {
-        const yield5m = candidate.fee_active_tvl_ratio;
-        if (!Number.isFinite(Number(yield5m)) || Number(yield5m) < minFeeActive) {
-          filtered.push({
-            stage: 5,
-            name: candidate.name,
-            reason: `5m yield ${yield5m ?? "?"}% < min ${minFeeActive}%`,
-          });
-          continue;
-        }
-      }
+
       // 24h fee/TVL floor — gate on sustained pool yield, the metric that
       // best predicts the dashboard "Claim Fee %" the user actually cares
       // about (24h-projected yield rate of the position). Mirrors
