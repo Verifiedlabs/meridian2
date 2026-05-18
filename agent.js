@@ -163,8 +163,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       // tool — this stops models that are reluctant to use tools (e.g. Claude Haiku 4.5 in some prompts) from
       // burning all retry slots returning text answers.
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
-      const stepZeroForceTool = step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool);
-      const retryForceTool = mustUseRealTool && !sawToolCall && noToolRetryCount > 0;
+      const stepZeroForceTool = step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool || agentType === "SCREENER");
+      const retryForceTool = (mustUseRealTool && !sawToolCall && noToolRetryCount > 0) || (agentType === "SCREENER" && !sawToolCall);
       let toolChoice = (stepZeroForceTool || retryForceTool) ? "required" : "auto";
 
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -239,11 +239,13 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
         // Hermes sometimes returns null content — pop the empty message and retry once
         if (!msg.content) {
-          messages.pop(); // remove the empty assistant message
+          messages.pop();
           log("agent", "Empty response, retrying...");
           continue;
         }
-        if (mustUseRealTool && !sawToolCall) {
+        // SCREENER saying "NO DEPLOY" is a valid final answer without tool calls
+        const isScreenerSkip = agentType === "SCREENER" && /⛔\s*NO DEPLOY/i.test(msg.content);
+        if (mustUseRealTool && !sawToolCall && !isScreenerSkip) {
           noToolRetryCount += 1;
           // Capture model's reasoning before popping so we can surface it
           // if the model insists on a no-tool answer across all retries.
@@ -257,10 +259,15 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             `Rejected no-tool final answer (${noToolRetryCount}/2) — model said: ${preview || "(empty)"}`,
           );
           if (noToolRetryCount >= 2) {
-            // Honour the model's reasoned decision instead of replacing it
-            // with a generic error. Most often the model is correctly
-            // declining (e.g. "skip — candidate too risky") and the right
-            // behaviour is to let the cycle log that decision and move on.
+            // If SCREENER claims DEPLOYED without calling tools, it's hallucinating — override
+            const isHallucinatedDeploy = agentType === "SCREENER" && /🚀\s*DEPLOYED/i.test(skipText);
+            if (isHallucinatedDeploy) {
+              log("agent", "Blocked hallucinated deploy — no tool was called");
+              return {
+                content: "⛔ NO DEPLOY\n\nCycle finished with no valid entry.\n\n[Blocked: model claimed deploy without calling deploy_position tool]",
+                userMessage: goal,
+              };
+            }
             return {
               content: skipText
                 ? `[no-tool] ${skipText}`

@@ -697,6 +697,286 @@ export async function discoverGmgnPools({ limit = 10 } = {}) {
   };
 }
 
+function shouldRejectByEarlyPrefilter(token, preFilter = {}) {
+  const mint = token?.address || null;
+  const symbol = token?.symbol || mint || "unknown";
+
+  const mintIsBlacklisted = mint && (
+    preFilter.blacklistedMints?.has(mint) ||
+    (typeof preFilter.isBlacklisted === "function" && preFilter.isBlacklisted(mint))
+  );
+  if (mintIsBlacklisted) {
+    return { reject: true, reason: "blacklisted token", stage: 1, name: symbol };
+  }
+  if (mint && preFilter.occupiedMints?.has(mint)) {
+    return { reject: true, reason: "already holding this base token in another pool", stage: 1, name: symbol };
+  }
+  if (mint && typeof preFilter.isBaseMintOnCooldown === "function" && preFilter.isBaseMintOnCooldown(mint)) {
+    return { reject: true, reason: "token cooldown active", stage: 1, name: symbol };
+  }
+  return { reject: false };
+}
+
+function shouldRejectCandidateByPrefilter(candidate, preFilter = {}) {
+  const pool = candidate?.pool;
+  const mint = candidate?.base?.mint;
+  const name = candidate?.name || candidate?.base?.symbol || mint || pool || "unknown";
+
+  const mintIsBlacklisted = mint && (
+    preFilter.blacklistedMints?.has(mint) ||
+    (typeof preFilter.isBlacklisted === "function" && preFilter.isBlacklisted(mint))
+  );
+  if (mintIsBlacklisted) {
+    return { reject: true, reason: "blacklisted token", stage: 5, name };
+  }
+  if (candidate?.dev && typeof preFilter.isDevBlocked === "function" && preFilter.isDevBlocked(candidate.dev)) {
+    return { reject: true, reason: "blocked deployer", stage: 5, name };
+  }
+  if (pool && preFilter.occupiedPools?.has(pool)) {
+    return { reject: true, reason: "already have an open position in this pool", stage: 5, name };
+  }
+  if (mint && preFilter.occupiedMints?.has(mint)) {
+    return { reject: true, reason: "already holding this base token in another pool", stage: 5, name };
+  }
+  if (pool && typeof preFilter.isPoolOnCooldown === "function" && preFilter.isPoolOnCooldown(pool)) {
+    return { reject: true, reason: "pool cooldown active", stage: 5, name };
+  }
+  if (mint && typeof preFilter.isBaseMintOnCooldown === "function" && preFilter.isBaseMintOnCooldown(mint)) {
+    return { reject: true, reason: "token cooldown active", stage: 5, name };
+  }
+  if (pool && preFilter.poolHistoryGuardEnabled !== false && typeof preFilter.getPoolHistoryStats === "function") {
+    const stats = preFilter.getPoolHistoryStats(pool);
+    const minSamples = Number.isFinite(preFilter.poolHistoryMinSamples) ? preFilter.poolHistoryMinSamples : 3;
+    const maxAvgPnl = Number.isFinite(preFilter.poolHistoryMaxAvgPnl) ? preFilter.poolHistoryMaxAvgPnl : -1;
+    if (stats && stats.total_deploys >= minSamples && stats.avg_pnl_pct <= maxAvgPnl) {
+      return {
+        reject: true,
+        reason: `bad pool history (n=${stats.total_deploys}, avg PnL ${stats.avg_pnl_pct}%)`,
+        stage: 5,
+        name,
+      };
+    }
+  }
+  return { reject: false };
+}
+
+export async function discoverGmgnPoolsWithPrefilters({ limit = 10, preFilter = null } = {}) {
+  const g = config.gmgn;
+  const filtered = [];
+  const stageCounts = {};
+
+  // ── Stage 1: rank filter + early prefilter on mint ───────────────────────
+  const rankPayload = await gmgnFetch("/v1/market/rank", {
+    params: {
+      chain: "sol",
+      interval: normalizeInterval(g.interval),
+      order_by: g.orderBy || "volume",
+      direction: g.direction || "desc",
+      limit: Math.min(100, Math.max(1, Number(g.limit || 100))),
+      filters: g.filters || [],
+      platforms: g.platforms || [],
+    },
+  });
+  const ranked = unwrapList(rankPayload, ["rank", "list", "data"]);
+  const s1 = ranked.filter((token) => {
+    const check = passBasicRankFilter(token);
+    if (!check.pass) {
+      filtered.push({ stage: 1, name: token.symbol || token.address, reason: check.reasons.join(", ") });
+      return false;
+    }
+    const pre = shouldRejectByEarlyPrefilter(token, preFilter);
+    if (pre.reject) {
+      filtered.push({ stage: pre.stage, name: pre.name, reason: pre.reason });
+      return false;
+    }
+    return true;
+  }).sort((a, b) => num(b.volume) - num(a.volume))
+    .slice(0, Math.max(limit, Number(g.enrichLimit || 20)));
+  stageCounts.s1 = s1.length;
+  log("gmgn", `Stage1 rank: ${ranked.length} → ${s1.length} pass`);
+
+  // ── Stage 2: token info filter ────────────────────────────────────────────
+  const s2 = [];
+  for (const token of s1) {
+    const mint = token.address;
+    try {
+      const infoPayload = await gmgnFetch("/v1/token/info", { params: { chain: "sol", address: mint } });
+      const info = infoPayload?.data?.data || infoPayload?.data || infoPayload;
+      const infoCheck = analyzeTokenInfo(info);
+      if (!infoCheck.passed) {
+        filtered.push({ stage: 2, name: token.symbol || mint, reason: infoCheck.reasons.join(", ") });
+        continue;
+      }
+      if (info?.dev?.creator_address && typeof preFilter?.isDevBlocked === "function" && preFilter.isDevBlocked(info.dev.creator_address)) {
+        filtered.push({ stage: 2, name: token.symbol || mint, reason: "blocked deployer" });
+        continue;
+      }
+      s2.push({ token, info, infoCheck });
+    } catch (error) {
+      log("gmgn", `Stage2 skip ${token.symbol || mint}: ${error.message}`);
+      filtered.push({ stage: 2, name: token.symbol || mint, reason: error.message });
+    }
+  }
+  stageCounts.s2 = s2.length;
+  log("gmgn", `Stage2 info: ${s1.length} → ${s2.length} pass`);
+
+  // ── Stage 3: holders/traders enrichment (no hard filter) + Meteora pool ──
+  const s3 = [];
+  const minTvl = num(g.minTvl ?? config.screening.minTvl ?? 0);
+  for (const { token, info, infoCheck } of s2) {
+    const mint = token.address;
+    try {
+      const [holdersPayload, tradersPayload] = await Promise.all([
+        gmgnFetch("/v1/market/token_top_holders", {
+          params: { chain: "sol", address: mint, limit: g.holdersLimit || 100, order_by: "amount_percentage", direction: "desc" },
+        }),
+        gmgnFetch("/v1/market/token_top_traders", {
+          params: { chain: "sol", address: mint, limit: 50, cost: 20_000_000_000_000, tag: "renowned" },
+        }),
+      ]);
+
+      const holders = unwrapList(holdersPayload, ["holders", "data", "list"]);
+      const traders = unwrapList(tradersPayload, ["holders", "data", "list"]);
+      const holdersCheck = analyzeHoldersAndTraders(holders, traders, token, info);
+      if (!holdersCheck.passed) {
+        filtered.push({ stage: 3, name: token.symbol || mint, reason: holdersCheck.reasons.join(", ") });
+        continue;
+      }
+
+      const pools = await fetchTopMeteoraDlmmPoolsForMint(mint, minTvl, 3);
+      if (!pools.length) {
+        filtered.push({ stage: 3, name: token.symbol || mint, reason: "no Meteora DLMM SOL pool" });
+        continue;
+      }
+      const { pool, detail } = await pickBestPool(pools);
+      if (!pool) {
+        filtered.push({ stage: 3, name: token.symbol || mint, reason: "unable to select DLMM pool" });
+        continue;
+      }
+
+      const poolAddress = pool.address || pool.pool_address;
+      if (poolAddress && preFilter?.occupiedPools?.has(poolAddress)) {
+        filtered.push({ stage: 3, name: token.symbol || mint, reason: "already have an open position in this pool" });
+        continue;
+      }
+      if (poolAddress && typeof preFilter?.isPoolOnCooldown === "function" && preFilter.isPoolOnCooldown(poolAddress)) {
+        filtered.push({ stage: 3, name: token.symbol || mint, reason: "pool cooldown active" });
+        continue;
+      }
+      if (
+        poolAddress &&
+        preFilter?.poolHistoryGuardEnabled !== false &&
+        typeof preFilter?.getPoolHistoryStats === "function"
+      ) {
+        const stats = preFilter.getPoolHistoryStats(poolAddress);
+        const minSamples = Number.isFinite(preFilter.poolHistoryMinSamples) ? preFilter.poolHistoryMinSamples : 3;
+        const maxAvgPnl = Number.isFinite(preFilter.poolHistoryMaxAvgPnl) ? preFilter.poolHistoryMaxAvgPnl : -1;
+        if (stats && stats.total_deploys >= minSamples && stats.avg_pnl_pct <= maxAvgPnl) {
+          filtered.push({
+            stage: 3,
+            name: token.symbol || mint,
+            reason: `bad pool history (n=${stats.total_deploys}, avg PnL ${stats.avg_pnl_pct}%)`,
+          });
+          continue;
+        }
+      }
+
+      s3.push({ token, info, infoCheck, holdersCheck, pool, poolDetail: detail });
+    } catch (error) {
+      log("gmgn", `Stage3 skip ${token.symbol || mint}: ${error.message}`);
+      filtered.push({ stage: 3, name: token.symbol || mint, reason: error.message });
+    }
+  }
+  stageCounts.s3 = s3.length;
+  log("gmgn", `Stage3 pool: ${s2.length} → ${s3.length} pass`);
+
+  // ── Stage 4: optional chart-indicator filter ──────────────────────────────
+  const s4 = [];
+  const indicatorEnabled = g.indicatorFilter !== false;
+  const indicatorInterval = g.indicatorInterval || "15_MINUTE";
+  const indicatorRules = g.indicatorRules || {};
+  for (const row of s3) {
+    const mint = row.token.address;
+    try {
+      let indicatorCheck = { passed: true, reasons: [], signal: null };
+      if (indicatorEnabled) {
+        try {
+          const indicator = await fetchChartIndicatorsForMint({
+            mint,
+            interval: indicatorInterval,
+            marketCap: row.token.market_cap,
+            forceFresh: true,
+          });
+          indicatorCheck = checkBounceSetup(indicator, indicatorRules);
+        } catch {
+          indicatorCheck = { passed: true, reasons: ["indicator unavailable"], signal: null };
+        }
+      }
+      if (!indicatorCheck.passed) {
+        filtered.push({ stage: 4, name: row.token.symbol || mint, reason: indicatorCheck.reasons.join(", ") });
+        continue;
+      }
+      s4.push({ ...row, indicatorSignal: indicatorCheck.signal });
+    } catch (error) {
+      log("gmgn", `Stage4 skip ${row.token.symbol || mint}: ${error.message}`);
+      filtered.push({ stage: 4, name: row.token.symbol || mint, reason: error.message });
+    }
+  }
+  stageCounts.s4 = s4.length;
+  log("gmgn", `Stage4 indicators: ${s3.length} → ${s4.length} pass`);
+
+  // ── Stage 5: condense final candidates ────────────────────────────────────
+  const pools = [];
+  for (const { token, info, infoCheck, holdersCheck, pool, poolDetail, indicatorSignal } of s4) {
+    const mint = token.address;
+    try {
+      const security = info.security || {};
+      const candidate = condenseGmgnCandidate({ token, pool, poolDetail, security, info, infoAnalysis: infoCheck, holdersAnalysis: holdersCheck, indicatorSignal });
+      if (!candidate.pool || !candidate.base?.mint) {
+        filtered.push({ stage: 5, name: token.symbol || mint, reason: "incomplete pool mapping" });
+        continue;
+      }
+
+      const pre = shouldRejectCandidateByPrefilter(candidate, preFilter);
+      if (pre.reject) {
+        filtered.push({ stage: pre.stage, name: pre.name, reason: pre.reason });
+        continue;
+      }
+
+      // 24h fee/TVL floor — gate on sustained pool yield, the metric that
+      // best predicts the dashboard "Claim Fee %" the user actually cares
+      // about (24h-projected yield rate of the position). Mirrors
+      // management.minFeePerTvl24h so we don't enter pools we'd immediately
+      // close on the yield rule.
+      const minFeePer24h = Number(config.screening?.minFeePer24h);
+      if (Number.isFinite(minFeePer24h) && minFeePer24h > 0) {
+        const yield24h = candidate.fee_per_tvl_24h;
+        if (yield24h == null) {
+          filtered.push({ stage: 5, name: candidate.name, reason: `no 24h yield data (min ${minFeePer24h}%)` });
+          continue;
+        }
+        if (yield24h < minFeePer24h) {
+          filtered.push({ stage: 5, name: candidate.name, reason: `24h yield ${yield24h}% < min ${minFeePer24h}%` });
+          continue;
+        }
+      }
+      pools.push(candidate);
+    } catch (error) {
+      log("gmgn", `Stage5 skip ${token.symbol || mint}: ${error.message}`);
+      filtered.push({ stage: 5, name: token.symbol || mint, reason: error.message });
+    }
+  }
+  stageCounts.s5 = pools.length;
+  log("gmgn", `Stage5 final: ${s4.length} → ${pools.length} candidates`);
+
+  return {
+    total: ranked.length,
+    stage_counts: stageCounts,
+    pools,
+    filtered_examples: filtered,
+  };
+}
+
 export function formatGmgnCandidateForPrompt(p) {
   const sym = p.name || p.base?.symbol || "?";
   const launchpad = p.launchpad || "unknown";

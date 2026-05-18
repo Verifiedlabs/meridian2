@@ -92,7 +92,7 @@ export const INTENT_TOOLS = {
   memory:      new Set(["get_pool_memory", "add_pool_note", "list_blacklist", "add_to_blacklist", "remove_from_blacklist"]),
   smartwallet: new Set(["add_smart_wallet", "remove_smart_wallet", "list_smart_wallets", "check_smart_wallets_on_pool"]),
   study:       new Set(["study_top_lpers", "get_top_lpers", "get_pool_detail", "search_pools", "get_token_info", "discover_pools", "add_smart_wallet", "list_smart_wallets"]),
-  performance: new Set(["get_performance_history", "get_performance_summary", "get_postmortem_suggestions", "get_my_positions", "get_position_pnl"]),
+  performance: new Set(["get_performance_history", "get_performance_summary", "get_postmortem_suggestions", "get_zapout_telemetry", "get_my_positions", "get_position_pnl"]),
   lessons:     new Set(["add_lesson", "pin_lesson", "unpin_lesson", "list_lessons", "clear_lessons"]),
 };
 

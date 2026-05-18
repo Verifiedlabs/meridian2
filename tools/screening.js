@@ -4,7 +4,7 @@ import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown, getPoolHistoryStats } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
-import { discoverGmgnPools } from "./gmgn.js";
+import { discoverGmgnPoolsWithPrefilters } from "./gmgn.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -278,39 +278,41 @@ export async function getTopCandidates({ limit = 10, screeningOverrides = null }
   if (!["meteora", "gmgn"].includes(source)) {
     throw new Error(`Invalid screeningSource: ${config.screening.source}. Use meteora or gmgn.`);
   }
-  // GMGN path filters on different metrics (gmgn-specific) so exploration
-  // overrides are only honored on the Meteora discovery path. This is a
-  // pragmatic limitation — GMGN exploration would need separate tuning.
-  const discovery = source === "gmgn"
-    ? await discoverGmgnPools({ limit: Math.max(limit, config.gmgn.enrichLimit || 20) })
-    : await discoverPools({ page_size: 50, screeningOverrides });
-  let { pools } = discovery;
-  const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
 
-  // Token blacklist + dev blocklist (Meteora path runs these inside discoverPools; GMGN path does not)
-  if (source === "gmgn") {
-    const before = pools.length;
-    pools = pools.filter((p) => {
-      if (isBlacklisted(p.base?.mint)) {
-        log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)})`);
-        pushFilteredReason(filteredOut, p, "blacklisted token");
-        return false;
-      }
-      if (p.dev && isDevBlocked(p.dev)) {
-        log("dev_blocklist", `Filtered blocked deployer ${p.dev?.slice(0, 8)} token ${p.base?.symbol}`);
-        pushFilteredReason(filteredOut, p, "blocked deployer");
-        return false;
-      }
-      return true;
-    });
-    if (pools.length < before) log("blacklist", `GMGN: filtered ${before - pools.length} blacklisted/blocked pool(s)`);
-  }
-
-  // Exclude pools where the wallet already has an open position
+  // Build wallet-state prefilters once so both discovery and final eligibility
+  // use the same occupancy snapshot.
   const { getMyPositions } = await import("./dlmm.js");
   const { positions } = await getMyPositions();
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
+
+  const gmgnPreFilter = {
+    isBlacklisted,
+    isDevBlocked,
+    occupiedPools,
+    occupiedMints,
+    isPoolOnCooldown,
+    isBaseMintOnCooldown,
+    getPoolHistoryStats,
+    poolHistoryGuardEnabled: config.screening.poolHistoryGuardEnabled,
+    poolHistoryMinSamples: config.screening.poolHistoryMinSamples,
+    poolHistoryMaxAvgPnl: config.screening.poolHistoryMaxAvgPnl,
+  };
+  // GMGN path filters on different metrics (gmgn-specific) so exploration
+  // overrides are only honored on the Meteora discovery path. This is a
+  // pragmatic limitation — GMGN exploration would need separate tuning.
+  const discovery = source === "gmgn"
+    ? await discoverGmgnPoolsWithPrefilters({
+      limit: Math.max(limit, config.gmgn.enrichLimit || 20),
+      preFilter: gmgnPreFilter,
+    })
+    : await discoverPools({ page_size: 50, screeningOverrides });
+  let { pools } = discovery;
+  const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
+
+  // GMGN discovery now receives the exact same blacklist/dev/occupancy/cooldown
+  // prefilters upstream, so this stage only keeps a final safety gate shared
+  // across both sources.
 
   const eligible = pools
     .filter((p) => {
