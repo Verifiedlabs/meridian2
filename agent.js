@@ -243,7 +243,6 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           log("agent", "Empty response, retrying...");
           continue;
         }
-        // SCREENER saying "NO DEPLOY" is a valid final answer without tool calls
         const isScreenerSkip = agentType === "SCREENER" && /⛔\s*NO DEPLOY/i.test(msg.content);
         if (mustUseRealTool && !sawToolCall && !isScreenerSkip) {
           noToolRetryCount += 1;

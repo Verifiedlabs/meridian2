@@ -12,6 +12,7 @@
 import fs from "fs";
 import { writeJsonAtomicSync } from "./fs-utils.js";
 import { log } from "./logger.js";
+import { recordValidationTrend } from "./decision-log.js";
 
 const WEIGHTS_FILE = "./signal-weights.json";
 
@@ -287,7 +288,14 @@ export function recalculateWeights(perfData, cfg = {}) {
     ? `Recalculated: ${changes.length} weight(s) adjusted from ${recent.length} records`
     : `Recalculated: no changes needed (${recent.length} records, ${ranked.length} signals evaluated)`);
 
-  return { changes, weights };
+  // Record validation trend for D3 trend tracking
+  try {
+    recordValidationTrend(validation, weights);
+  } catch (err) {
+    log("signal_weights_warn", `Failed to record validation trend: ${err.message}`);
+  }
+
+  return { changes, weights, validation };
 }
 
 // ─── Lift Computation ────────────────────────────────────────────

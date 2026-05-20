@@ -26,13 +26,11 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
+import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { watchPosition, unwatchPosition } from "../src/realtime-watcher.js";
 import { getAndClearStagedSignals, computeStudyWinRate } from "../signal-tracker.js";
 import { getStudyCacheData } from "./study.js";
-import { shouldUseLpAgentRelay as shouldUseLpAgentRelayConfig, shouldUseZapOutRelay } from "../src/relay-policy.js";
-import { recordNativeZapOutFail, recordNativeZapOutSuccess } from "../src/zapout-telemetry.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -48,7 +46,6 @@ let _deriveBinArrayBitmapExtension = null;
 let _isOverflowDefaultBinArrayBitmap = null;
 let _BIN_ARRAY_FEE = null;
 let _BIN_ARRAY_BITMAP_FEE = null;
-let _deployInFlight = null;
 
 async function getDLMM() {
   if (!_DLMM) {
@@ -109,60 +106,11 @@ function getMeridianHeaders() {
 }
 
 function shouldUseLpAgentRelay() {
-  return shouldUseLpAgentRelayConfig(config.api);
+  return !!config.api.lpAgentRelayEnabled;
 }
 
 function shouldUseLpAgentRelayForDeploy() {
   return false;
-}
-
-export async function runNativeZapOutSwap(baseMint, deps = {}, context = {}) {
-  const mint = normalizeMint(baseMint);
-  const getBalances = deps.getWalletBalances || getWalletBalances;
-  const swap = deps.swapToken || swapToken;
-  try {
-    const balances = await getBalances({});
-    const token = balances.tokens?.find((t) => t.mint === mint);
-    if (!token || !Number.isFinite(token.balance) || token.balance <= 0 || (token.usd ?? 0) < 0.10) {
-      return { attempted: false, swapped: false, reason: "no swappable balance" };
-    }
-
-    log("close", `Native zap-out swap: ${token.symbol || mint.slice(0, 8)} (${token.balance}) -> SOL`);
-    const swapResult = await swap({
-      input_mint: mint,
-      output_mint: "SOL",
-      amount: token.balance,
-    });
-    if (swapResult?.error) throw new Error(swapResult.error);
-
-    const out = {
-      attempted: true,
-      swapped: true,
-      symbol: token.symbol || null,
-      amount_in: token.balance,
-      amount_out: swapResult?.amount_out ?? null,
-      tx: swapResult?.tx ?? null,
-    };
-    recordNativeZapOutSuccess({
-      position: context.position_address || null,
-      pool: context.pool_address || null,
-      reason: context.reason || null,
-      base_mint: mint,
-      tx: out.tx || null,
-    });
-    return out;
-  } catch (error) {
-    const message = String(error?.message || error);
-    log("close_warn", `Native zap-out swap failed: ${message}`);
-    recordNativeZapOutFail({
-      position: context.position_address || null,
-      pool: context.pool_address || null,
-      reason: context.reason || null,
-      base_mint: mint,
-      error: message,
-    });
-    return { attempted: true, swapped: false, error: message };
-  }
 }
 
 async function meridianJson(pathname, options = {}) {
@@ -638,110 +586,6 @@ export async function getActiveBin({ pool_address }) {
   };
 }
 
-export function resolveDeployBinOffsets({
-  activeBinId,
-  activePrice,
-  actualBinStep,
-  binsBelow,
-  binsAbove = 0,
-  downsidePctInput = null,
-  upsidePctInput = null,
-  getBinIdFromPrice,
-}) {
-  let activeBinsBelow = Number(binsBelow);
-  let activeBinsAbove = Number(binsAbove);
-
-  if (!Number.isFinite(activeBinsBelow) || activeBinsBelow < 0) {
-    throw new Error(`Invalid bins_below: ${binsBelow}. Use a non-negative number.`);
-  }
-  if (!Number.isFinite(activeBinsAbove) || activeBinsAbove < 0) {
-    throw new Error(`Invalid bins_above: ${binsAbove}. Use a non-negative number.`);
-  }
-
-  activeBinsBelow = Math.floor(activeBinsBelow);
-  activeBinsAbove = Math.floor(activeBinsAbove);
-
-  const hasPercentOverride = downsidePctInput != null || upsidePctInput != null;
-  if (!hasPercentOverride) {
-    return { activeBinsBelow, activeBinsAbove };
-  }
-
-  const downsidePct = Math.max(0, Number(downsidePctInput ?? 0));
-  const upsidePct = Math.max(0, Number(upsidePctInput ?? 0));
-
-  if (!Number.isFinite(downsidePct) || !Number.isFinite(upsidePct)) {
-    throw new Error("downside_pct and upside_pct must be valid numbers.");
-  }
-  if (downsidePct >= 100) {
-    throw new Error("downside_pct must be less than 100.");
-  }
-
-  if (downsidePct <= 0 && upsidePct <= 0) {
-    return { activeBinsBelow, activeBinsAbove };
-  }
-
-  if (!Number.isFinite(activePrice) || activePrice <= 0) {
-    throw new Error(`Invalid active price ${activePrice} while applying downside/upside range override.`);
-  }
-
-  const lowerTargetPrice = activePrice * (1 - downsidePct / 100);
-  const upperTargetPrice = activePrice * (1 + upsidePct / 100);
-  const lowerBinId = getBinIdFromPrice(lowerTargetPrice, actualBinStep, true);
-  const upperBinId = getBinIdFromPrice(upperTargetPrice, actualBinStep, false);
-
-  activeBinsBelow = Math.max(0, activeBinId - lowerBinId);
-  activeBinsAbove = Math.max(0, upperBinId - activeBinId);
-
-  return { activeBinsBelow, activeBinsAbove };
-}
-
-export function buildDeployBinRange({
-  activeBinId,
-  activeBinsBelow,
-  activeBinsAbove,
-  isSingleSidedSol,
-}) {
-  let below = Number(activeBinsBelow);
-  let above = Number(activeBinsAbove);
-
-  if (!Number.isFinite(below) || below < 0) {
-    throw new Error(`Invalid resolved bins_below: ${activeBinsBelow}`);
-  }
-  if (!Number.isFinite(above) || above < 0) {
-    throw new Error(`Invalid resolved bins_above: ${activeBinsAbove}`);
-  }
-
-  below = Math.floor(below);
-  above = Math.floor(above);
-
-  if (isSingleSidedSol) {
-    above = 0;
-  }
-
-  const totalBins = below + above;
-  if (totalBins <= 0) {
-    throw new Error("Invalid zero-width bin range. Set bins_below > 0 or provide a non-zero downside/upside range.");
-  }
-
-  const minBinId = activeBinId - below;
-  const maxBinId = isSingleSidedSol ? activeBinId : activeBinId + above;
-  if (minBinId > maxBinId) {
-    throw new Error(`Invalid bin range: ${minBinId} -> ${maxBinId}`);
-  }
-  if (isSingleSidedSol && maxBinId !== activeBinId) {
-    throw new Error(`Single-side SOL deploy must end at the SDK active bin. Expected ${activeBinId}, got ${maxBinId}.`);
-  }
-
-  return {
-    activeBinsBelow: below,
-    activeBinsAbove: above,
-    totalBins,
-    isWideRange: totalBins > 69,
-    minBinId,
-    maxBinId,
-  };
-}
-
 // ─── Deploy Position ───────────────────────────────────────────
 export async function deployPosition({
   pool_address,
@@ -763,35 +607,6 @@ export async function deployPosition({
   initial_value_usd,
 }) {
   pool_address = normalizeMint(pool_address);
-  const existingDeploy = _deployInFlight;
-  if (existingDeploy) {
-    const samePool = existingDeploy.pool === pool_address;
-    const runningForMs = Math.max(0, Date.now() - existingDeploy.startedAt);
-    const waitMsg = samePool
-      ? `Deploy already running for ${pool_address.slice(0, 8)} (${runningForMs}ms) — skipping duplicate request`
-      : `Deploy already running for ${existingDeploy.pool.slice(0, 8)} (${runningForMs}ms) — deploys are serialized`;
-    log("deploy", waitMsg);
-    return {
-      success: false,
-      error: samePool
-        ? "Deploy already in progress for this pool. Wait for confirmation before retrying."
-        : "Another deploy is already in progress. Wait for it to finish before starting a new deploy.",
-      in_flight: {
-        pool: existingDeploy.pool,
-        same_pool: samePool,
-        running_for_ms: runningForMs,
-      },
-    };
-  }
-
-  const deployLockToken = Symbol(`deploy:${pool_address}`);
-  _deployInFlight = {
-    token: deployLockToken,
-    pool: pool_address,
-    startedAt: Date.now(),
-  };
-
-  try {
   // Retrieve and consume the screening-time signal snapshot so it can be
   // attached to the tracked position. Returns null if Darwin staging is
   // disabled or this pool wasn't staged (e.g. manual deploy outside the
@@ -811,7 +626,7 @@ export async function deployPosition({
     }
   }
   const activeStrategy = strategy || config.strategy.strategy;
-  let activeBinsBelow = bins_below ?? config.strategy.minBinsBelow;
+  let activeBinsBelow = bins_below ?? config.strategy.binsBelow;
   let activeBinsAbove = bins_above ?? 0;
 
   if (isPoolOnCooldown(pool_address)) {
@@ -830,16 +645,25 @@ export async function deployPosition({
   const actualBinStep = pool.lbPair.binStep;
   const activePrice = Number(getPriceOfBinByBinId(activeBin.binId, actualBinStep).toString());
 
-  ({ activeBinsBelow, activeBinsAbove } = resolveDeployBinOffsets({
-    activeBinId: activeBin.binId,
-    activePrice,
-    actualBinStep,
-    binsBelow: activeBinsBelow,
-    binsAbove: activeBinsAbove,
-    downsidePctInput: downside_pct,
-    upsidePctInput: upside_pct,
-    getBinIdFromPrice,
-  }));
+  if (downside_pct != null || upside_pct != null) {
+    const downsidePct = Math.max(0, Number(downside_pct ?? 0));
+    const upsidePct = Math.max(0, Number(upside_pct ?? 0));
+
+    if (!Number.isFinite(downsidePct) || !Number.isFinite(upsidePct)) {
+      throw new Error("downside_pct and upside_pct must be valid numbers.");
+    }
+    if (downsidePct >= 100) {
+      throw new Error("downside_pct must be less than 100.");
+    }
+
+    const lowerTargetPrice = activePrice * (1 - downsidePct / 100);
+    const upperTargetPrice = activePrice * (1 + upsidePct / 100);
+    const lowerBinId = getBinIdFromPrice(lowerTargetPrice, actualBinStep, true);
+    const upperBinId = getBinIdFromPrice(upperTargetPrice, actualBinStep, false);
+
+    activeBinsBelow = Math.max(0, activeBin.binId - lowerBinId);
+    activeBinsAbove = Math.max(0, upperBinId - activeBin.binId);
+  }
 
   if (process.env.DRY_RUN === "true") {
     const totalBins = activeBinsBelow + activeBinsAbove;
@@ -885,21 +709,22 @@ export async function deployPosition({
       "Single-side SOL deploy cannot use bins_above or upside_pct. Use amount_y with bins_below only; the upper bin is the SDK active bin.",
     );
   }
-  const {
-    activeBinsBelow: normalizedBinsBelow,
-    activeBinsAbove: normalizedBinsAbove,
-    totalBins,
-    isWideRange,
-    minBinId,
-    maxBinId,
-  } = buildDeployBinRange({
-    activeBinId: activeBin.binId,
-    activeBinsBelow,
-    activeBinsAbove,
-    isSingleSidedSol,
-  });
-  activeBinsBelow = normalizedBinsBelow;
-  activeBinsAbove = normalizedBinsAbove;
+  if (isSingleSidedSol) {
+    activeBinsAbove = 0;
+  }
+  const totalBins = activeBinsBelow + activeBinsAbove;
+  const isWideRange = totalBins > 69;
+  const minBinId = activeBin.binId - activeBinsBelow;
+  const maxBinId = isSingleSidedSol ? activeBin.binId : activeBin.binId + activeBinsAbove;
+
+  if (minBinId > maxBinId) {
+    throw new Error(`Invalid bin range: ${minBinId} -> ${maxBinId}`);
+  }
+  if (isSingleSidedSol && maxBinId !== activeBin.binId) {
+    throw new Error(
+      `Single-side SOL deploy must end at the SDK active bin. Expected ${activeBin.binId}, got ${maxBinId}.`,
+    );
+  }
 
   await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
 
@@ -1208,11 +1033,6 @@ export async function deployPosition({
   } catch (error) {
     log("deploy_error", error.message);
     return { success: false, error: error.message };
-  }
-  } finally {
-    if (_deployInFlight?.token === deployLockToken) {
-      _deployInFlight = null;
-    }
   }
 }
 
@@ -1769,7 +1589,7 @@ export async function closePosition({ position_address, reason }) {
     const wallet = getWallet();
     const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
     const poolMeta = await getPoolMetadata(poolAddress);
-    if (shouldUseZapOutRelay(config.api)) {
+    if (shouldUseLpAgentRelay()) {
       let relaySubmitted = false;
       try {
         const pool = await getPool(poolAddress);
@@ -2139,13 +1959,6 @@ export async function closePosition({ position_address, reason }) {
       .catch((err) => log("realtime_warn", `unwatchPosition failed: ${err.message}`));
     recordClose(position_address, reason || "agent decision");
 
-    const baseMint = pool.lbPair.tokenXMint.toString();
-    const nativeZapOut = await runNativeZapOutSwap(baseMint, {}, {
-      position_address: position_address,
-      pool_address: poolAddress,
-      reason: reason || "agent decision",
-    });
-
     // Record performance for learning
     if (tracked) {
       const deployedAt = new Date(tracked.deployed_at).getTime();
@@ -2270,25 +2083,19 @@ export async function closePosition({ position_address, reason }) {
         },
       });
 
-        return {
-          success: true,
-          position: position_address,
-          pool: poolAddress,
-          pool_name: tracked.pool_name || poolMeta.name || null,
+      return {
+        success: true,
+        position: position_address,
+        pool: poolAddress,
+        pool_name: tracked.pool_name || poolMeta.name || null,
         claim_txs: claimTxHashes,
         close_txs: closeTxHashes,
-          txs: txHashes,
-          pnl_usd: pnlUsd,
-          pnl_pct: pnlPct,
-          base_mint: baseMint,
-          native_zapout: nativeZapOut,
-          auto_swapped: nativeZapOut.swapped === true,
-          auto_swap_note: nativeZapOut.swapped === true
-            ? "Base token already swapped to SOL by close_position native zap-out. Do NOT call swap_token again."
-            : undefined,
-          sol_received: nativeZapOut.amount_out ?? undefined,
-        };
-      }
+        txs: txHashes,
+        pnl_usd: pnlUsd,
+        pnl_pct: pnlPct,
+        base_mint: pool.lbPair.tokenXMint.toString(),
+      };
+    }
 
     appendDecision({
       type: "close",
@@ -2309,13 +2116,7 @@ export async function closePosition({ position_address, reason }) {
       claim_txs: claimTxHashes,
       close_txs: closeTxHashes,
       txs: txHashes,
-      base_mint: baseMint,
-      native_zapout: nativeZapOut,
-      auto_swapped: nativeZapOut.swapped === true,
-      auto_swap_note: nativeZapOut.swapped === true
-        ? "Base token already swapped to SOL by close_position native zap-out. Do NOT call swap_token again."
-        : undefined,
-      sol_received: nativeZapOut.amount_out ?? undefined,
+      base_mint: pool.lbPair.tokenXMint.toString(),
     };
   } catch (error) {
     log("close_error", error.message);

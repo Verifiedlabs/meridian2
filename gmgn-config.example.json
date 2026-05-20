@@ -1,20 +1,28 @@
 {
   "apiKey": "",
   "baseUrl": "https://openapi.gmgn.ai",
-  "interval": "5m",
-  "orderBy": "default",
+  "interval": "30m",
+  "orderBy": "volume",
   "direction": "desc",
-  "limit": 100,
+  "limit": 50,
   "enrichLimit": 20,
   "requestDelayMs": 2500,
   "maxRetries": 2,
-  "filters": ["renounced", "frozen", "not_wash_trading"],
-  "platforms": ["Pump.fun", "meteora_virtual_curve", "pool_meteora"],
+  "filters": [
+    "renounced",
+    "frozen",
+    "not_wash_trading"
+  ],
+  "platforms": [
+    "Pump.fun",
+    "meteora_virtual_curve",
+    "pool_meteora"
+  ],
   "minMcap": 150000,
   "maxMcap": 10000000,
-  "minVolume": 1000,
-  "minHolders": 1000,
-  "minTokenAgeHours": 2,
+  "minVolume": 2000,
+  "minHolders": 300,
+  "minTokenAgeHours": 1,
   "maxTokenAgeHours": 168,
   "minSmartDegenCount": 1,
   "requireKol": true,
@@ -23,7 +31,7 @@
   "athFilterPct": null,
   "maxRugRatio": 0.3,
   "maxTop10HolderRate": 0.5,
-  "maxBundlerRate": 0.5,
+  "maxBundlerRate": 30,
   "maxRatTraderRate": 0.2,
   "maxFreshWalletRate": 0.2,
   "maxDevTeamHoldRate": 0.02,
@@ -31,22 +39,32 @@
   "maxSniperCount": 20,
   "maxSniperHoldRate": 0.3,
   "holdersLimit": 100,
-  "preferredKolNames": ["OGAntD", "Loopierr", "Cooker.hl | Kms.eth | 版本之子 | Cooker", "RC", "gake"],
+  "preferredKolNames": [
+    "OGAntD",
+    "Loopierr",
+    "Cooker.hl | Kms.eth | 版本之子 | Cooker",
+    "RC",
+    "gake"
+  ],
   "preferredKolMinHoldPct": 1,
-  "dumpKolNames": ["Yenni", "Marcell"],
+  "dumpKolNames": [
+    "Yenni",
+    "Marcell"
+  ],
   "dumpKolMinHoldPct": 0.5,
-  "klineResolution": "5m",
+  "klineResolution": "15m",
   "klineLookbackMinutes": 60,
   "rejectSingleVolumeSpike": true,
   "maxSingleCandleVolumeShare": 0.7,
   "indicatorFilter": true,
-  "indicatorInterval": "5_MINUTE",
+  "indicatorInterval": "15_MINUTE",
   "indicatorRules": {
     "requireBullishSupertrend": true,
-    "rejectAlreadyAtBottom": true,
+    "rejectAlreadyAtBottom": false,
     "requireAboveSupertrend": false,
     "minRsi": null,
     "maxRsi": null,
     "requireBbPosition": null
-  }
+  },
+  "_lastAgentTune": "2026-04-29T10:23:36.460Z"
 }

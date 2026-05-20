@@ -28,7 +28,6 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { execSync, spawn } from "child_process";
 import { writeJsonAtomicSync } from "../fs-utils.js";
-import { getZapOutTelemetrySummary, recordNativeZapOutFallbackUsed } from "../src/zapout-telemetry.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
@@ -159,9 +158,6 @@ const CONFIG_VALIDATORS = {
   maxTokenAgeHours:       num(0, 1e6, { allowNull: true }),
   athFilterPct:           num(-100, 0, { allowNull: true }),
   dropOkxRugpull:         bool(),
-  poolHistoryGuardEnabled: bool(),
-  poolHistoryMinSamples:   num(0, 1e6, { integer: true }),
-  poolHistoryMaxAvgPnl:    num(-1000, 1000),
   timeframe:              oneOf(["1m", "5m", "15m", "30m", "1h", "4h", "12h", "24h"]),
   category:               oneOf(["trending", "newest", "top", "rising", "all"]),
   screeningSource:        oneOf(["meteora", "gmgn"]),
@@ -187,6 +183,8 @@ const CONFIG_VALIDATORS = {
   repeatDeployCooldownMinFeeEarnedPct: num(0, 1000),
   minVolumeToRebalance:   num(0, 1e12),
   autoSwapAfterClaim:     bool(),
+  autoSwapAfterClose:     bool(),
+  autoSwapMinUsd:         num(0, 10),
   solMode:                bool(),
   minAgeBeforeYieldCheck: num(0, 100000),
   minFeePerTvl24h:        num(0, 100),
@@ -307,7 +305,6 @@ const toolMap = {
     return result || { empty: true, message: "Not enough closed positions yet (need >= 5) for meaningful suggestions" };
   },
   get_recent_decisions: ({ limit } = {}) => ({ decisions: getRecentDecisions(limit || 6) }),
-  get_zapout_telemetry: getZapOutTelemetrySummary,
   add_strategy:        addStrategy,
   list_strategies:     listStrategies,
   get_strategy:        getStrategy,
@@ -389,13 +386,12 @@ const toolMap = {
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
       athFilterPct:     ["screening", "athFilterPct"],
       dropOkxRugpull:   ["screening", "dropOkxRugpull"],
-      poolHistoryGuardEnabled: ["screening", "poolHistoryGuardEnabled"],
-      poolHistoryMinSamples:   ["screening", "poolHistoryMinSamples"],
-      poolHistoryMaxAvgPnl:    ["screening", "poolHistoryMaxAvgPnl"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
+      autoSwapAfterClose: ["management", "autoSwapAfterClose"],
+      autoSwapMinUsd: ["management", "autoSwapMinUsd"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
       minAgeBeforeOORExit:   ["management", "minAgeBeforeOORExit"],
@@ -732,36 +728,43 @@ export async function executeTool(name, args) {
           const poolAddr = result.pool || args.pool_address;
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
-        if (result.base_mint) {
-          // Auto-swap base token back to SOL unless user said to hold or close_position
-          // already performed native zap-out swap.
-          if (!args.skip_swap && !result.auto_swapped) {
-            try {
-              const balances = await getWalletBalances({});
-              const token = balances.tokens?.find(t => t.mint === result.base_mint);
-              if (token && token.usd >= 0.10) {
-                recordNativeZapOutFallbackUsed({
-                  position: result.position || args.position_address || null,
-                  pool: result.pool || args.pool_address || null,
-                  reason: args.reason || null,
-                  base_mint: result.base_mint,
-                });
-                log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-                const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
-                // Tell the model the swap already happened so it doesn't call swap_token again
-                result.auto_swapped = true;
-                result.auto_swap_note = `Base token already auto-swapped back to SOL (${token.symbol || result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
-                if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
-              }
-            } catch (e) {
-              log("executor_warn", `Auto-swap after close failed: ${e.message}`);
-            }
-          }
+        // Auto-swap base token back to SOL unless user said to hold
+        if (!args.skip_swap && result.base_mint && config.management.autoSwapAfterClose !== false) {
+          try {
+            // Wait for wallet balance to update after close
+            await new Promise(r => setTimeout(r, 2000));
 
-          // After swap-back (native zap-out or executor autoswap), reclaim the
-          // now-empty ATA rent (~0.00204 SOL). Targeted to just this mint so
-          // other active positions aren't touched.
-          if (config.management.autoRevokeAtaAfterClose) {
+            let token = null;
+            let balances = await getWalletBalances({});
+            token = balances.tokens?.find(t => t.mint === result.base_mint);
+
+            // Retry once if token not found (API lag)
+            if (!token) {
+              log("executor", `Token ${result.base_mint.slice(0, 8)} not found in balances, retrying in 2s...`);
+              await new Promise(r => setTimeout(r, 2000));
+              balances = await getWalletBalances({});
+              token = balances.tokens?.find(t => t.mint === result.base_mint);
+            }
+
+            const minUsd = config.management.autoSwapMinUsd ?? 0.10;
+            if (token && token.usd >= minUsd) {
+              log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
+              const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+              // Tell the model the swap already happened so it doesn't call swap_token again
+              result.auto_swapped = true;
+              result.auto_swap_note = `Base token already auto-swapped back to SOL (${token.symbol || result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
+              if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
+            } else if (!token) {
+              log("executor_warn", `Auto-swap skipped: token ${result.base_mint.slice(0, 8)} not found in wallet balances after retry`);
+            } else {
+              log("executor", `Skipping auto-swap for ${token?.symbol || result.base_mint.slice(0, 8)}: $${token?.usd?.toFixed(2) || "0"} < $${minUsd} threshold`);
+            }
+          } catch (e) {
+            log("executor_warn", `Auto-swap after close failed: ${e.message}`);
+          }
+          // After swap-back, reclaim the now-empty ATA rent (~0.00204 SOL).
+          // Targeted to just this mint so other active positions aren't touched.
+          if (config.management.autoRevokeAtaAfterClose && result.base_mint) {
             try {
               const revoked = await revokeEmptyAtas({ mints: [result.base_mint] });
               if (revoked.closed > 0) {

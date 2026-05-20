@@ -45,7 +45,7 @@ import { getTwitterSentiment } from "./tools/twitter.js";
 import { stageSignals, computeHiveConsensus } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, getSharedLessons, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
-import { appendDecision, getDecisionsByPosition } from "./decision-log.js";
+import { appendDecision, getDecisionsByPosition, getValidationTrendSummary } from "./decision-log.js";
 import {
   stripThink,
   sanitizeUntrustedPromptText,
@@ -66,11 +66,6 @@ import {
   shutdownRealtimeWatcher,
   getWatcherStats,
 } from "./src/realtime-watcher.js";
-import {
-  shouldTriggerStopLossFromBins,
-  shouldBypassStopLossConfirmationOnEmergencyOor,
-  evaluateWsStopLossConfirmation,
-} from "./src/realtime-stoploss.js";
 import {
   isScreeningPaused as isScreeningPausedByBreaker,
   getStatus as getBreakerStatus,
@@ -133,95 +128,15 @@ let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
-const _fastCloseAttempts = new Map(); // positionAddress -> last fast-close attempt ms
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
-const _wsStopLossConfirmTimers = new Map();
-const _wsStopLossPending = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
 const TRAILING_DROP_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_DROP_CONFIRM_TOLERANCE_PCT = 1.0;
-const WS_STOPLOSS_CONFIRM_REQUIRED = 2;
-const WS_STOPLOSS_CONFIRM_INTERVAL_MS = 2_500;
-const WS_STOPLOSS_CONFIRM_MAX_ATTEMPTS = 4;
 
 function shouldUsePnlRecheck() {
   return !config.api.lpAgentRelayEnabled;
-}
-
-async function fastClosePositionNow({
-  positionAddress,
-  reason,
-  pair,
-  contextLabel,
-  poolAddress = null,
-  activeBin = null,
-  lower = null,
-  upper = null,
-}) {
-  clearPendingWsStopLossConfirmation(positionAddress);
-
-  const last = _fastCloseAttempts.get(positionAddress) || 0;
-  if (Date.now() - last < 90_000) return { skipped: true, deduped: true };
-
-  try {
-    const accInfo = await getConnection().getAccountInfo(new PublicKey(positionAddress), "confirmed");
-    if (!accInfo || accInfo.owner.toString() !== DLMM_PROGRAM_ID) {
-      log("realtime", `Position ${positionAddress.slice(0, 8)} already closed on-chain — skipping`);
-      return { skipped: true, alreadyClosed: true };
-    }
-  } catch (err) {
-    // Non-fatal: if ownership check fails, proceed and rely on closePosition safety catches.
-    log("realtime_warn", `${contextLabel} ownership check failed for ${positionAddress.slice(0, 8)}: ${err.message}`);
-  }
-
-  _fastCloseAttempts.set(positionAddress, Date.now());
-  const poolText = poolAddress ? ` pool=${poolAddress.slice(0, 8)}` : "";
-  const rangeText =
-    activeBin != null && lower != null && upper != null
-      ? ` active=${activeBin} range=[${lower},${upper}]`
-      : "";
-  log("realtime", `${contextLabel} ${positionAddress.slice(0, 8)}${poolText} reason=${reason}${rangeText}`);
-
-  try {
-    // Route through executor so close_position keeps its operational side effects:
-    // - action logging (logAction)
-    // - notifyClose
-    // - auto-swap base token back to SOL
-    // - ATA rent revoke pass
-    const result = await executeTool("close_position", {
-      position_address: positionAddress,
-      reason,
-      pool_address: poolAddress || undefined,
-    });
-    if (result?.success) {
-      return { success: true, result };
-    }
-    if (result?.skipped) {
-      log("realtime", `${contextLabel} deduped for ${positionAddress.slice(0, 8)} — another attempt in flight`);
-      return { skipped: true, deduped: true };
-    }
-    if (result?.error) {
-      if (/AccountOwnedByWrongProgram|"Custom":\s*3007|0xbbf/.test(String(result.error))) {
-        log("realtime", `Position ${positionAddress.slice(0, 8)} was already closed (safety catch) — no-op`);
-        return { skipped: true, alreadyClosed: true };
-      }
-      log("realtime_warn", `${contextLabel} returned failure for ${positionAddress.slice(0, 8)}: ${result.error}`);
-      return { success: false, error: result.error };
-    }
-    return { success: false, error: "unknown fast-close result" };
-  } catch (err) {
-    const msg = String(err?.message || err);
-    if (/AccountOwnedByWrongProgram|"Custom":\s*3007|0xbbf/.test(msg)) {
-      log("realtime", `Position ${positionAddress.slice(0, 8)} was already closed (safety catch) — no-op`);
-      return { skipped: true, alreadyClosed: true };
-    }
-    log("realtime_error", `${contextLabel} closePosition failed for ${positionAddress.slice(0, 8)}: ${msg}`);
-    return { success: false, error: msg };
-  } finally {
-    setTimeout(() => _fastCloseAttempts.delete(positionAddress), 90_000);
-  }
 }
 
 function schedulePeakConfirmation(positionAddress) {
@@ -265,88 +180,6 @@ function scheduleTrailingDropConfirmation(positionAddress) {
   }, TRAILING_DROP_CONFIRM_DELAY_MS);
 
   _trailingDropConfirmTimers.set(positionAddress, timer);
-}
-
-function clearPendingWsStopLossConfirmation(positionAddress) {
-  if (!positionAddress) return;
-  const timer = _wsStopLossConfirmTimers.get(positionAddress);
-  if (timer) clearTimeout(timer);
-  _wsStopLossConfirmTimers.delete(positionAddress);
-  _wsStopLossPending.delete(positionAddress);
-}
-
-function scheduleWsStopLossConfirmation(positionAddress) {
-  if (!positionAddress || _wsStopLossConfirmTimers.has(positionAddress)) return;
-
-  const timer = setTimeout(async () => {
-    _wsStopLossConfirmTimers.delete(positionAddress);
-
-    const pending = _wsStopLossPending.get(positionAddress);
-    if (!pending) return;
-
-    pending.attempts = (pending.attempts || 0) + 1;
-    if (pending.attempts > WS_STOPLOSS_CONFIRM_MAX_ATTEMPTS) {
-      log("realtime", `[WS] Drop pending stop-loss for ${positionAddress.slice(0, 8)} — confirmation timeout`);
-      clearPendingWsStopLossConfirmation(positionAddress);
-      return;
-    }
-
-    try {
-      const result = await getMyPositions({ force: true, silent: true }).catch((err) => {
-        log("silent_warn", err.message);
-        return null;
-      });
-      const position = result?.positions?.find((p) => p.position === positionAddress);
-      if (!position) {
-        clearPendingWsStopLossConfirmation(positionAddress);
-        return;
-      }
-
-      const check = evaluateWsStopLossConfirmation({
-        stopLossPct: pending.stopLossPct,
-        currentPnlPct: position.pnl_pct,
-        confirmationsPassed: pending.confirmationsPassed,
-        requiredConfirmations: WS_STOPLOSS_CONFIRM_REQUIRED,
-      });
-
-      if (check.reset) {
-        log(
-          "realtime",
-          `[WS] Cancel pending stop-loss ${positionAddress.slice(0, 8)} — live pnl ${fmtPct(position.pnl_pct)} recovered above ${fmtPct(pending.stopLossPct)}`,
-        );
-        clearPendingWsStopLossConfirmation(positionAddress);
-        return;
-      }
-
-      pending.confirmationsPassed = check.nextConfirmationsPassed;
-      pending.lastPnlPct = position.pnl_pct;
-      pending.poolAddress = position.pool || pending.poolAddress;
-      pending.pair = position.pair || pending.pair;
-      _wsStopLossPending.set(positionAddress, pending);
-
-      if (!check.confirmed) {
-        scheduleWsStopLossConfirmation(positionAddress);
-        return;
-      }
-
-      clearPendingWsStopLossConfirmation(positionAddress);
-      await fastClosePositionNow({
-        positionAddress,
-        reason: `realtime-ws-bin-confirmed: pnl ${fmtPct(position.pnl_pct)} <= ${fmtPct(pending.stopLossPct)} (${pending.confirmationsPassed}/${WS_STOPLOSS_CONFIRM_REQUIRED})`,
-        pair: pending.pair,
-        poolAddress: pending.poolAddress,
-        activeBin: pending.activeBin,
-        lower: pending.lower,
-        upper: pending.upper,
-        contextLabel: "[WS] Confirmed-fast-close",
-      });
-    } catch (error) {
-      log("realtime_warn", `[WS] Stop-loss confirmation failed for ${positionAddress.slice(0, 8)}: ${error.message}`);
-      scheduleWsStopLossConfirmation(positionAddress);
-    }
-  }, WS_STOPLOSS_CONFIRM_INTERVAL_MS);
-
-  _wsStopLossConfirmTimers.set(positionAddress, timer);
 }
 
 async function runBriefing() {
@@ -585,11 +418,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
   let prePositions, preBalance;
   let liveMessage = null;
   let screenReport = null;
-  const cycleStartedAt = Date.now();
-  const cycleSource = String(config.screening.source || "meteora").toLowerCase();
-  let cycleScreenedTotal = null;
-  let cycleReconCount = 0;
-  let cyclePassingCount = 0;
   // Exploration mode: a fraction of cycles bypass Darwin weights + relax
   // thresholds so the bot keeps probing pools just outside its learned
   // comfort zone. Decided after pre-checks; readable from the finally
@@ -606,11 +434,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
         actor: "SCREENER",
         summary: "Screening skipped",
         reason: `Max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`,
-        metrics: {
-          source: cycleSource,
-          open_positions: prePositions.total_positions,
-          max_positions: config.risk.maxPositions,
-        },
       });
       _screeningBusy = false;
       drainTelegramQueue().catch((err) => log("silent_warn", err.message));
@@ -626,11 +449,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
         actor: "SCREENER",
         summary: "Screening skipped",
         reason: `Insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired})`,
-        metrics: {
-          source: cycleSource,
-          wallet_sol: Number(preBalance.sol.toFixed(6)),
-          min_required_sol: Number(minRequired.toFixed(6)),
-        },
       });
       _screeningBusy = false;
       drainTelegramQueue().catch((err) => log("silent_warn", err.message));
@@ -650,11 +468,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
         actor: "SCREENER",
         summary: "Screening skipped",
         reason: `Circuit breaker: ${bs.reason}`,
-        metrics: {
-          source: cycleSource,
-          breaker_reason: bs.reason || null,
-          breaker_resumes_at: bs.willResumeAt || null,
-        },
       });
       _screeningBusy = false;
       drainTelegramQueue().catch((err) => log("silent_warn", err.message));
@@ -706,14 +519,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
       log("cron", `🔍 EXPLORATION MODE — relaxed thresholds: maxVolatility ${cur.maxVolatility}→${screeningOverrides.maxVolatility}, minOrganic ${cur.minOrganic}→${screeningOverrides.minOrganic}`);
     }
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
-    const topCandidates = await getTopCandidates({ limit: 10, screeningOverrides }).catch((e) => ({ _error: e.message }));
+    const topCandidates = await getTopCandidates({ limit: 10, screeningOverrides, explorationMode }).catch((e) => ({ _error: e.message }));
     if (topCandidates?._error) {
       screenReport = `Screening failed: ${topCandidates._error}`;
       return screenReport;
     }
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
-    cycleScreenedTotal = Number(topCandidates?.total_screened ?? topCandidates?.total ?? candidates.length);
-    cycleReconCount = candidates.length;
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
     const gmgnStageCounts = topCandidates?.stage_counts ?? null;
     const gmgnAllFiltered = topCandidates?.all_filtered ?? [];
@@ -763,7 +574,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
       }
       return true;
     });
-    cyclePassingCount = passing.length;
 
     if (passing.length === 0) {
       const combined = filteredOut.length > 0 ? filteredOut : earlyFilteredExamples;
@@ -782,14 +592,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
         actor: "SCREENER",
         summary: "No candidates available",
         reason: funnelBlock || combinedExamples || "All candidates filtered before deploy",
-        metrics: {
-          source: cycleSource,
-          screened_total: Number.isFinite(cycleScreenedTotal) ? cycleScreenedTotal : null,
-          candidates_reconned: cycleReconCount,
-          candidates_passing: cyclePassingCount,
-          filtered_count: combined.length,
-          duration_ms: Date.now() - cycleStartedAt,
-        },
         rejected: combined.slice(0, 5).map((entry) => `${entry.name}: ${entry.reason}`),
       });
       return screenReport;
@@ -908,6 +710,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const explorationBanner = explorationMode
       ? `\n🔍 EXPLORATION CYCLE — thresholds relaxed; treat learned Darwin weights as advisory only and prioritize candidates that look promising on first principles even if they sit outside the usual comfort zone.\n`
       : "";
+    
+    // Log exploration mode for GMGN path specifically
+    if (explorationMode && config.screening.source === "gmgn") {
+      log("cron", `🔍 GMGN EXPLORATION MODE — using relaxed thresholds from gmgn-config.json exploration section`);
+    }
     const { content } = await agentLoop(`
 SCREENING CYCLE${explorationBanner}
 ${strategyBlock}
@@ -984,40 +791,16 @@ IMPORTANT:
     const funnelAppend = buildGmgnFunnelReport(gmgnStageCounts, gmgnAllFiltered, { fromStage: 2 });
     screenReport = funnelAppend ? `${content}\n\n─────────────\n${funnelAppend}` : content;
     if (/⛔\s*NO DEPLOY/i.test(content)) {
-      const llmRejected = passing
-        .slice(0, 5)
-        .map(({ pool }) => `${pool.name || pool.pool}: not selected by LLM`);
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: "LLM chose no deploy",
         reason: stripThink(content).slice(0, 500),
-        metrics: {
-          source: cycleSource,
-          screened_total: Number.isFinite(cycleScreenedTotal) ? cycleScreenedTotal : null,
-          candidates_reconned: cycleReconCount,
-          candidates_passing: cyclePassingCount,
-          duration_ms: Date.now() - cycleStartedAt,
-        },
-        rejected: llmRejected,
       });
     }
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
-    appendDecision({
-      type: "screening_error",
-      actor: "SCREENER",
-      summary: "Screening cycle failed",
-      reason: error.message,
-      metrics: {
-        source: cycleSource,
-        screened_total: Number.isFinite(cycleScreenedTotal) ? cycleScreenedTotal : null,
-        candidates_reconned: cycleReconCount,
-        candidates_passing: cyclePassingCount,
-        duration_ms: Date.now() - cycleStartedAt,
-      },
-    });
   } finally {
     _screeningBusy = false;
     drainTelegramQueue().catch((err) => log("silent_warn", err.message));
@@ -1089,13 +872,10 @@ Summarize the current portfolio health, total fees earned, and performance of al
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
 
-  // Lightweight 10s PnL poller — updates trailing TP state between management cycles, no LLM
+  // Lightweight 30s PnL poller — updates trailing TP state between management cycles, no LLM
   let _pnlPollBusy = false;
-  const pnlPollIntervalMs = 10_000;
   const pnlPollInterval = setInterval(async () => {
-    // Do not block risk polling on management/screening cycles:
-    // STOP_LOSS fast-close must stay responsive during long LLM work.
-    if (_pnlPollBusy) return;
+    if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
     _pnlPollBusy = true;
     try {
       const result = await getMyPositions({ force: true, silent: true }).catch((err) => { log("silent_warn", err.message); return null; });
@@ -1117,20 +897,6 @@ Summarize the current portfolio health, total fees earned, and performance of al
             }
             continue;
           }
-
-          // Emergency STOP_LOSS fast-path from JS exit engine:
-          // bypass management trigger cooldown and close immediately.
-          if (exit.action === "STOP_LOSS") {
-            await fastClosePositionNow({
-              positionAddress: p.position,
-              reason: `realtime: ${exit.reason}`,
-              pair: p.pair,
-              poolAddress: p.pool,
-              contextLabel: "[PnL poll] Fast-close",
-            });
-            break;
-          }
-
           const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
@@ -1144,19 +910,6 @@ Summarize the current portfolio health, total fees earned, and performance of al
         }
         const closeRule = getDeterministicCloseRule(p, config.management);
         if (closeRule) {
-          // Emergency SL fast-path: bypass poll-triggered management cooldown
-          // and close immediately to reduce overshoot during sharp drops.
-          if (closeRule.action === "CLOSE" && closeRule.rule === 1) {
-            await fastClosePositionNow({
-              positionAddress: p.position,
-              reason: `realtime: ${closeRule.reason}`,
-              pair: p.pair,
-              poolAddress: p.pool,
-              contextLabel: "[PnL poll] Fast-close",
-            });
-            break;
-          }
-
           const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
@@ -1172,7 +925,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
     } finally {
       _pnlPollBusy = false;
     }
-  }, pnlPollIntervalMs);
+  }, 30_000);
 
   _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
   // Store interval ref so stopCronJobs can clear it
@@ -1188,7 +941,6 @@ Summarize the current portfolio health, total fees earned, and performance of al
       debounceMs: config.management.realtimeRefetchDebounceMs ?? 3000,
       oorThrottleMs: (config.management.realtimeOorThrottleSec ?? 60) * 1000,
       onOor: handleRealtimeOor,
-      onPoolUpdate: handleRealtimePoolUpdate,
     });
     // Reconcile against currently open positions so we re-subscribe
     // after process restart.
@@ -1204,7 +956,14 @@ Summarize the current portfolio health, total fees earned, and performance of al
   }
 }
 
+// Throttle map: positionAddress -> lastCloseAttemptMs
+const _realtimeCloseAttempts = new Map();
+
 async function handleRealtimeOor({ positionAddress, poolAddress, activeBin, lower, upper, minutesOOR }) {
+  // Avoid double-firing close while a previous attempt is in-flight.
+  const last = _realtimeCloseAttempts.get(positionAddress) || 0;
+  if (Date.now() - last < 90_000) return;
+
   // Re-fetch positions to get fresh PnL/fee data for deterministic rule eval.
   const fresh = await getMyPositions({ force: true, silent: true }).catch((err) => { log("silent_warn", err.message); return null; });
   const pos = fresh?.positions?.find((p) => p.position === positionAddress);
@@ -1217,130 +976,59 @@ async function handleRealtimeOor({ positionAddress, poolAddress, activeBin, lowe
     return;
   }
 
-  await fastClosePositionNow({
-    positionAddress,
-    reason: `realtime: ${rule.reason}`,
-    contextLabel: "Fast-close",
-    poolAddress,
-    activeBin,
-    lower,
-    upper,
-  });
-}
-
-async function handleRealtimePoolUpdate({ poolAddress, activeBin, positions }) {
-  if (!Array.isArray(positions) || positions.length === 0) return;
-
-  // Tick-level fast path: approximate drawdown directly from WS active-bin
-  // movement so stop-loss can fire without waiting for a fresh positions
-  // snapshot round-trip.
-  const stopLossPct = Number(config.management?.stopLossPct);
-  const fastPathTriggered = new Set();
-
-  for (const watched of positions) {
-    if (!watched?.positionAddress) continue;
-    const tracked = getTrackedPosition(watched.positionAddress);
-    if (!tracked || tracked.closed) continue;
-
-    const stopLossCheck = shouldTriggerStopLossFromBins({
-      deployBin: tracked.active_bin_at_deploy,
-      activeBin,
-      binStep: tracked.bin_step,
-      stopLossPct,
-    });
-    if (!stopLossCheck.trigger) continue;
-
-    const emergencyOor = shouldBypassStopLossConfirmationOnEmergencyOor({
-      isOor: watched.isOor,
-      activeBin,
-      lower: watched.lower,
-      upper: watched.upper,
-      emergencyBins: config.management?.outOfRangeBinsToClose,
-    });
-
-    if (emergencyOor) {
-      fastPathTriggered.add(watched.positionAddress);
-      await fastClosePositionNow({
-        positionAddress: watched.positionAddress,
-        reason: `realtime-ws-bin-emergency: est move ${fmtPct(stopLossCheck.estimatedPct)} <= ${fmtPct(stopLossPct)} and OOR`,
-        poolAddress: tracked.pool || poolAddress,
-        activeBin,
-        lower: watched.lower,
-        upper: watched.upper,
-        contextLabel: "[WS] Tick-fast-close",
-      });
-      continue;
+  // Guard against race with management cron: a parallel close may have already
+  // closed this position on-chain. In that case the account gets rent-reclaimed
+  // and becomes owned by the System Program — any further closePosition call
+  // will fail tx simulation with AnchorError 3007 (AccountOwnedByWrongProgram).
+  try {
+    const accInfo = await getConnection().getAccountInfo(new PublicKey(positionAddress), "confirmed");
+    if (!accInfo || accInfo.owner.toString() !== DLMM_PROGRAM_ID) {
+      log("realtime", `Position ${positionAddress.slice(0, 8)} already closed on-chain — skipping`);
+      return;
     }
-
-    if (!_wsStopLossPending.has(watched.positionAddress)) {
-      _wsStopLossPending.set(watched.positionAddress, {
-        stopLossPct,
-        estimatedPct: stopLossCheck.estimatedPct,
-        confirmationsPassed: 0,
-        attempts: 0,
-        poolAddress: tracked.pool || poolAddress,
-        activeBin,
-        lower: watched.lower,
-        upper: watched.upper,
-        pair: tracked.pair || null,
-      });
-      log(
-        "realtime",
-        `[WS] Queue pending stop-loss ${watched.positionAddress.slice(0, 8)} est=${fmtPct(stopLossCheck.estimatedPct)} threshold=${fmtPct(stopLossPct)}`,
-      );
-    } else {
-      const pending = _wsStopLossPending.get(watched.positionAddress);
-      pending.estimatedPct = Math.min(Number(pending.estimatedPct ?? 0), Number(stopLossCheck.estimatedPct ?? 0));
-      pending.activeBin = activeBin;
-      pending.lower = watched.lower;
-      pending.upper = watched.upper;
-      _wsStopLossPending.set(watched.positionAddress, pending);
-    }
-
-    scheduleWsStopLossConfirmation(watched.positionAddress);
+  } catch (err) {
+    // Non-fatal: if ownership check fails, proceed and rely on the safety catch below.
+    log("realtime_warn", `Ownership check failed for ${positionAddress.slice(0, 8)}: ${err.message}`);
   }
 
-  // Evaluate live PnL exits on WS updates so STOP_LOSS doesn't wait for the
-  // periodic poll loop. This is debounced by realtime-watcher per pool.
-  const fresh = await getMyPositions({ force: true, silent: true }).catch((err) => { log("silent_warn", err.message); return null; });
-  if (!fresh?.positions?.length) return;
-
-  const liveByAddress = new Map(fresh.positions.map((p) => [p.position, p]));
-
-  for (const watched of positions) {
-    if (fastPathTriggered.has(watched.positionAddress)) continue;
-
-    const pos = liveByAddress.get(watched.positionAddress);
-    if (!pos) continue;
-
-    const exit = updatePnlAndCheckExits(pos.position, pos, config.management);
-    if (exit?.action === "STOP_LOSS") {
-      await fastClosePositionNow({
-        positionAddress: pos.position,
-        reason: `realtime-ws: ${exit.reason}`,
-        pair: pos.pair,
-        poolAddress: pos.pool || poolAddress,
-        activeBin,
-        lower: watched.lower,
-        upper: watched.upper,
-        contextLabel: "[WS] Fast-close",
-      });
-      continue;
+  _realtimeCloseAttempts.set(positionAddress, Date.now());
+  log(
+    "realtime",
+    `Fast-close ${positionAddress.slice(0, 8)} pool=${poolAddress.slice(0, 8)} reason=${rule.reason} active=${activeBin} range=[${lower},${upper}]`,
+  );
+  try {
+    const result = await closePosition({ position_address: positionAddress, reason: `realtime: ${rule.reason}` });
+    // Fast-close bypasses the executor, so notifyClose was never called for
+    // this path — that's why profit closes triggered by price pumping above
+    // range never showed up in Telegram. Emit the same notification the
+    // executor would have fired for an LLM-initiated close.
+    if (result?.success) {
+      notifyClose({
+        pair: result.pool_name || positionAddress.slice(0, 8),
+        pnlUsd: result.pnl_usd ?? 0,
+        pnlPct: result.pnl_pct ?? 0,
+        reason: rule.reason,
+      }).catch((err) => log("notify_warn", err.message));
+    } else if (result?.skipped) {
+      // Another caller (management cron or /close) already holds the close
+      // mutex for this position — expected dedupe, not a failure.
+      log("realtime", `Fast-close deduped for ${positionAddress.slice(0, 8)} — another attempt in flight`);
+    } else if (result?.error) {
+      log("realtime_warn", `Fast-close returned failure for ${positionAddress.slice(0, 8)}: ${result.error}`);
     }
-
-    const closeRule = getDeterministicCloseRule(pos, config.management);
-    if (closeRule?.action === "CLOSE" && closeRule.rule === 1) {
-      await fastClosePositionNow({
-        positionAddress: pos.position,
-        reason: `realtime-ws: ${closeRule.reason}`,
-        pair: pos.pair,
-        poolAddress: pos.pool || poolAddress,
-        activeBin,
-        lower: watched.lower,
-        upper: watched.upper,
-        contextLabel: "[WS] Fast-close",
-      });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    // Error 3007 (AccountOwnedByWrongProgram / 0xbbf) = position already closed by another flow.
+    // Treat as a no-op instead of a crash — stale realtime events are expected when a manager
+    // cron or manual /close beats the WS watcher to the punch.
+    if (/AccountOwnedByWrongProgram|"Custom":\s*3007|0xbbf/.test(msg)) {
+      log("realtime", `Position ${positionAddress.slice(0, 8)} was already closed (safety catch) — no-op`);
+    } else {
+      log("realtime_error", `closePosition failed for ${positionAddress.slice(0, 8)}: ${msg}`);
     }
+  } finally {
+    // Don't clear the throttle until next minute — protects against retry storm.
+    setTimeout(() => _realtimeCloseAttempts.delete(positionAddress), 90_000);
   }
 }
 
@@ -1507,6 +1195,8 @@ function settingValue(key) {
     lpAgentRelayEnabled: config.api.lpAgentRelayEnabled,
     chartIndicatorsEnabled: config.indicators.enabled,
     trailingTakeProfit: config.management.trailingTakeProfit,
+    autoSwapAfterClose: config.management.autoSwapAfterClose,
+    autoSwapMinUsd: config.management.autoSwapMinUsd,
     useDiscordSignals: config.screening.useDiscordSignals,
     blockPvpSymbols: config.screening.blockPvpSymbols,
     screeningSource: config.screening.source,
@@ -1542,9 +1232,6 @@ function settingValue(key) {
     minMcap: config.screening.minMcap,
     minFeeActiveTvlRatio: config.screening.minFeeActiveTvlRatio,
     minFeePer24h: config.screening.minFeePer24h,
-    poolHistoryGuardEnabled: config.screening.poolHistoryGuardEnabled,
-    poolHistoryMinSamples: config.screening.poolHistoryMinSamples,
-    poolHistoryMaxAvgPnl: config.screening.poolHistoryMaxAvgPnl,
     minTokenFeesSol: config.screening.minTokenFeesSol,
     minBinStep: config.screening.minBinStep,
     maxBinStep: config.screening.maxBinStep,
@@ -1698,6 +1385,8 @@ function renderSettingsMenu(page = "main") {
       [toggleButton("trailingTakeProfit", "🎯 Trailing TP")],
       [inputButton("trailingTriggerPct", "Trigger %", { digits: 1 })[0], inputButton("trailingDropPct", "Drop %", { digits: 1 })[0]],
       [inputButton("minBinsBelow", "📏 Min Range Bins")[0], inputButton("maxBinsBelow", "📏 Max Range Bins")[0]],
+      [toggleButton("autoSwapAfterClose", "🔄 Auto-Swap After Close")],
+      [inputButton("autoSwapMinUsd", "Min USD for Swap", { digits: 2 })[0]],
     ];
 
   } else if (page === "filter" && isGmgn) {
@@ -1723,8 +1412,6 @@ function renderSettingsMenu(page = "main") {
       [toggleButton("backtestEnabled", "📊 Backtest"), toggleButton("backtestGateEnabled", "🚪 Gate")],
       [inputButton("backtestWindowHours", "⏳ Window (h)")[0], inputButton("backtestMinProjectedYield", "Min Proj %", { digits: 1 })[0]],
       [inputButton("backtestMinInRangeFraction", "Min In-Range", { digits: 2 })[0], inputButton("minFeePer24h", "Min 24h Yield", { digits: 1 })[0]],
-      [toggleButton("poolHistoryGuardEnabled", "🧠 Pool Guard")],
-      [inputButton("poolHistoryMinSamples", "Pool Min Samples")[0], inputButton("poolHistoryMaxAvgPnl", "Pool Max Avg %", { digits: 2 })[0]],
     ];
 
   } else if (page === "filter") {
@@ -1745,8 +1432,6 @@ function renderSettingsMenu(page = "main") {
       [toggleButton("backtestEnabled", "📊 Backtest"), toggleButton("backtestGateEnabled", "🚪 Gate")],
       [inputButton("backtestWindowHours", "⏳ Window (h)")[0], inputButton("backtestMinProjectedYield", "Min Proj %", { digits: 1 })[0]],
       [inputButton("backtestMinInRangeFraction", "Min In-Range", { digits: 2 })[0], inputButton("minFeePer24h", "Min 24h Yield", { digits: 1 })[0]],
-      [toggleButton("poolHistoryGuardEnabled", "🧠 Pool Guard")],
-      [inputButton("poolHistoryMinSamples", "Pool Min Samples")[0], inputButton("poolHistoryMaxAvgPnl", "Pool Max Avg %", { digits: 2 })[0]],
     ];
 
   } else if (page === "indicators" && isGmgn) {
@@ -2961,7 +2646,7 @@ async function applySettingsMenuCallback(msg) {
     const inputPage = ["gmgnPreferredKolNames", "gmgnPreferredKolMinHoldPct", "gmgnDumpKolNames", "gmgnDumpKolMinHoldPct"].includes(inputKey) ? "kol"
       : ["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours", "minBinsBelow", "maxBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(inputKey) ? "filter"
       : ["useDiscordSignals", "blockPvpSymbols", "screeningSource", "gmgnRequireKol"].includes(inputKey) ? "filter"
-      : inputKey.startsWith("backtest") || ["minFeePer24h", "poolHistoryMinSamples", "poolHistoryMaxAvgPnl"].includes(inputKey) ? "filter"
+      : inputKey.startsWith("backtest") || inputKey === "minFeePer24h" ? "filter"
       : inputKey.startsWith("indicator") || inputKey === "chartIndicatorsEnabled" || inputKey === "rsiLength" || inputKey === "requireAllIntervals" ? "indicators"
       : inputKey.startsWith("gmgn") && !["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours"].includes(inputKey) ? "indicators"
       : ["solMode", "lpAgentRelayEnabled", "hiveMindEnabled", "twitterEnabled", "twitterMode"].includes(inputKey) ? "main"
@@ -3046,8 +2731,8 @@ async function applySettingsMenuCallback(msg) {
   page = key.startsWith("telegramMute") ? "notif"
     : ["gmgnPreferredKolNames", "gmgnPreferredKolMinHoldPct", "gmgnDumpKolNames", "gmgnDumpKolMinHoldPct", "gmgnRequireKol", "gmgnMinKolCount"].includes(key) ? "kol"
     : ["gmgnMinVolume", "gmgnMaxBundlerRate", "gmgnMinTokenAgeHours", "gmgnMaxTokenAgeHours", "gmgnMinTotalFeeSol", "gmgnMinHolders", "gmgnInterval"].includes(key) ? "filter"
-    : ["useDiscordSignals", "blockPvpSymbols", "managementIntervalMin", "screeningIntervalMin", "strategy", "poolHistoryGuardEnabled"].includes(key) ? "filter"
-    : ["minTvl", "maxTvl", "minVolume", "minOrganic", "minHolders", "minMcap", "minFeeActiveTvlRatio", "minFeePer24h", "minTokenFeesSol", "minBinStep", "maxBinStep", "poolHistoryMinSamples", "poolHistoryMaxAvgPnl"].includes(key) ? "filter"
+    : ["useDiscordSignals", "blockPvpSymbols", "managementIntervalMin", "screeningIntervalMin", "strategy"].includes(key) ? "filter"
+    : ["minTvl", "maxTvl", "minVolume", "minOrganic", "minHolders", "minMcap", "minFeeActiveTvlRatio", "minFeePer24h", "minTokenFeesSol", "minBinStep", "maxBinStep"].includes(key) ? "filter"
     : key.startsWith("backtest") ? "filter"
     : ["gmgnIndicatorFilter", "gmgnIndicatorInterval", "gmgnRequireBullishSt", "gmgnRejectAtBottom", "gmgnRequireAboveSt", "gmgnMinRsi", "gmgnMaxRsi"].includes(key) ? "indicators"
     : key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals" ? "indicators"
@@ -3242,6 +2927,12 @@ async function telegramHandler(msg) {
     const body = buildPostmortemMessage();
     const ok = await sendHTML(body).catch((err) => { log("silent_warn", err.message); return null; });
     if (!ok) await sendMessage(body.replace(/<[^>]+>/g, "")).catch((err) => log("silent_warn", err.message));
+    return;
+  }
+
+  if (text === "/trends") {
+    const body = getValidationTrendSummary();
+    await sendMessage(body).catch((err) => log("silent_warn", err.message));
     return;
   }
 

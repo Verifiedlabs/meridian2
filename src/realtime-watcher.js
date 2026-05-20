@@ -27,7 +27,6 @@ import { markOutOfRange, markInRange, minutesOutOfRange } from "../state.js";
 
 let _connection = null;
 let _onOor = null;
-let _onPoolUpdate = null;
 let _getActiveBinFn = null;
 let _enabled = false;
 let _debounceMs = 3_000;
@@ -50,7 +49,6 @@ const watchers = new Map();
  * @param {import("@solana/web3.js").Connection} opts.connection — the same Connection used elsewhere; its WS endpoint is auto-derived from the HTTP URL.
  * @param {(arg: { pool_address: string }) => Promise<{ binId: number }>} opts.getActiveBin — function returning the current active bin for a pool. Re-uses the project's existing cache.
  * @param {(event: { positionAddress: string, poolAddress: string, activeBin: number, lower: number, upper: number, minutesOOR: number }) => Promise<void>} opts.onOor — callback fired when a position is detected OOR (subject to throttle).
- * @param {(event: { poolAddress: string, activeBin: number, positions: Array<{ positionAddress: string, lower: number, upper: number, isOor: boolean, minutesOOR: number }> }) => Promise<void>} [opts.onPoolUpdate] — callback fired after each debounced active-bin refresh so app layer can react even when a position is still in-range.
  * @param {boolean} opts.enabled — gate flag from config.
  * @param {number} [opts.debounceMs] — minimum gap between active-bin refetches per pool.
  * @param {number} [opts.oorThrottleMs] — minimum gap between onOor fires per position.
@@ -59,7 +57,6 @@ export function initRealtimeWatcher({
   connection,
   getActiveBin,
   onOor,
-  onPoolUpdate,
   enabled,
   debounceMs = 3_000,
   oorThrottleMs = 60_000,
@@ -67,7 +64,6 @@ export function initRealtimeWatcher({
   _connection = connection;
   _getActiveBinFn = getActiveBin;
   _onOor = onOor;
-  _onPoolUpdate = onPoolUpdate;
   _enabled = !!enabled;
   _debounceMs = Math.max(500, Number(debounceMs) || 3_000);
   _oorThrottleMs = Math.max(5_000, Number(oorThrottleMs) || 60_000);
@@ -186,7 +182,7 @@ export function getWatcherStats() {
  * Tear down all subscriptions. Call on graceful shutdown.
  */
 export async function shutdownRealtimeWatcher() {
-  for (const [, entry] of watchers) {
+  for (const [poolAddress, entry] of watchers) {
     if (entry.subId != null && _connection) {
       try {
         await _connection.removeAccountChangeListener(entry.subId);
@@ -207,15 +203,15 @@ function scheduleRefetch(poolAddress) {
     entry.pendingRefetch = true;
     return;
   }
-
-  refetchAndCheck(poolAddress).catch((err) => {
-    log("realtime_error", `refetch loop failed pool=${poolAddress.slice(0, 8)}: ${err.message}`);
-  });
-
-  entry.debounceTimer = setTimeout(() => {
+  entry.debounceTimer = setTimeout(async () => {
     entry.debounceTimer = null;
-    if (entry.pendingRefetch && watchers.has(poolAddress)) {
-      entry.pendingRefetch = false;
+    const wasPending = entry.pendingRefetch;
+    entry.pendingRefetch = false;
+    await refetchAndCheck(poolAddress).catch((err) => {
+      log("realtime_error", `refetch loop failed pool=${poolAddress.slice(0, 8)}: ${err.message}`);
+    });
+    if (wasPending && watchers.has(poolAddress)) {
+      // Another change arrived during debounce — chain one more pass.
       scheduleRefetch(poolAddress);
     }
   }, _debounceMs);
@@ -239,38 +235,18 @@ async function refetchAndCheck(poolAddress) {
     return;
   }
 
-  const poolPositions = [];
-
   for (const [positionAddress, range] of entry.positions) {
     const isOor = activeBin < range.lower || activeBin > range.upper;
-    let minutesOOR = 0;
-
     if (!isOor) {
       markInRange(positionAddress);
-      poolPositions.push({
-        positionAddress,
-        lower: range.lower,
-        upper: range.upper,
-        isOor: false,
-        minutesOOR,
-      });
       continue;
     }
-
     markOutOfRange(positionAddress);
-    minutesOOR = minutesOutOfRange(positionAddress);
-    poolPositions.push({
-      positionAddress,
-      lower: range.lower,
-      upper: range.upper,
-      isOor: true,
-      minutesOOR,
-    });
-
     const lastFire = entry.lastOorFire.get(positionAddress) || 0;
     if (Date.now() - lastFire < _oorThrottleMs) continue;
     entry.lastOorFire.set(positionAddress, Date.now());
 
+    const minutesOOR = minutesOutOfRange(positionAddress);
     log(
       "realtime",
       `OOR detected position=${positionAddress.slice(0, 8)} pool=${poolAddress.slice(0, 8)} active=${activeBin} range=[${range.lower},${range.upper}] minutesOOR=${minutesOOR}`,
@@ -289,18 +265,6 @@ async function refetchAndCheck(poolAddress) {
       } catch (err) {
         log("realtime_error", `onOor handler threw: ${err.message}`);
       }
-    }
-  }
-
-  if (_onPoolUpdate && poolPositions.length > 0) {
-    try {
-      await _onPoolUpdate({
-        poolAddress,
-        activeBin,
-        positions: poolPositions,
-      });
-    } catch (err) {
-      log("realtime_error", `onPoolUpdate handler threw: ${err.message}`);
     }
   }
 }

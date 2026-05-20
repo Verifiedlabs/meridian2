@@ -207,6 +207,8 @@ export const config = {
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
+    autoSwapAfterClose:    u.autoSwapAfterClose    ?? true,
+    autoSwapMinUsd:        u.autoSwapMinUsd        ?? 0.10,
     // After close_position / claim_fees auto-swap, also close the emptied
     // token ATA to reclaim rent (~0.00204 SOL per account). Targeted: only
     // touches the ATA for the mint we just swapped, so it won't disturb
@@ -395,7 +397,6 @@ export const config = {
     url: nonEmptyString(u.agentMeridianApiUrl, process.env.AGENT_MERIDIAN_API_URL, DEFAULT_AGENT_MERIDIAN_API_URL),
     publicApiKey: nonEmptyString(u.publicApiKey, process.env.PUBLIC_API_KEY, DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY),
     lpAgentRelayEnabled: u.lpAgentRelayEnabled ?? false,
-    zapOutRelayEnabled: u.zapOutRelayEnabled ?? false,
   },
 
   // ─── Telegram Notifications ─────────────
@@ -493,9 +494,6 @@ export function reloadScreeningThresholds() {
     if (fresh.maxTokenAgeHours  !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
     if (fresh.athFilterPct      !== undefined) s.athFilterPct     = fresh.athFilterPct;
     if (fresh.dropOkxRugpull    !== undefined) s.dropOkxRugpull   = fresh.dropOkxRugpull;
-    if (fresh.poolHistoryGuardEnabled !== undefined) s.poolHistoryGuardEnabled = fresh.poolHistoryGuardEnabled;
-    if (fresh.poolHistoryMinSamples   != null) s.poolHistoryMinSamples = fresh.poolHistoryMinSamples;
-    if (fresh.poolHistoryMaxAvgPnl    != null) s.poolHistoryMaxAvgPnl  = fresh.poolHistoryMaxAvgPnl;
     if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;
