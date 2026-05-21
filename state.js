@@ -245,11 +245,43 @@ export function setPositionExploration(position_address, exploration) {
   return true;
 }
 
+// BUG-9 (Audit 5/21): TTL for pending peak/trailing state. Without this,
+// a bot crash between queueXxxConfirmation() and resolvePendingXxx() leaves
+// pending fields stuck forever. Confirmation timer is 15s; 5min is well
+// past any plausible recovery window so anything older is definitely stale.
+const PENDING_CONFIRMATION_TTL_MS = 5 * 60_000;
+
+function clearStalePending(pos) {
+  if (!pos) return false;
+  const now = Date.now();
+  let changed = false;
+  if (pos.pending_peak_started_at) {
+    const started = new Date(pos.pending_peak_started_at).getTime();
+    if (Number.isFinite(started) && now - started > PENDING_CONFIRMATION_TTL_MS) {
+      pos.pending_peak_pnl_pct = null;
+      pos.pending_peak_started_at = null;
+      changed = true;
+    }
+  }
+  if (pos.pending_trailing_started_at) {
+    const started = new Date(pos.pending_trailing_started_at).getTime();
+    if (Number.isFinite(started) && now - started > PENDING_CONFIRMATION_TTL_MS) {
+      pos.pending_trailing_peak_pnl_pct = null;
+      pos.pending_trailing_current_pnl_pct = null;
+      pos.pending_trailing_drop_pct = null;
+      pos.pending_trailing_started_at = null;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 export function queuePeakConfirmation(position_address, candidatePnlPct, options = {}) {
   if (candidatePnlPct == null) return false;
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return false;
+  clearStalePending(pos);
 
   const currentPeak = pos.peak_pnl_pct ?? 0;
   if (candidatePnlPct <= currentPeak) return false;
@@ -305,6 +337,7 @@ export function queueTrailingDropConfirmation(position_address, peakPnlPct, curr
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return false;
+  clearStalePending(pos);
 
   const changed =
     pos.pending_trailing_current_pnl_pct == null ||
