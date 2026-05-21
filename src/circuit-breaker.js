@@ -68,7 +68,14 @@ function rollDailyWindow(now) {
   if (!start || now - start >= DAY_MS) {
     s.dailyPnlSol = 0;
     s.dailyWindowStart = new Date(now).toISOString();
+    // BUG-3 (Audit 5/21): persist the rolled window. Otherwise getStatus()
+    // can mutate state in-memory after 24h idle but never write to disk;
+    // a crash before next recordClose() reloads stale dailyPnlSol from
+    // the file and the breaker mis-trips on stale loss totals.
+    save();
+    return true;
   }
+  return false;
 }
 
 function getCfg() {
