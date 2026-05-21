@@ -1592,7 +1592,15 @@ export async function claimFees({ position_address }) {
     } catch (err) {
       log("claim_warn", `Failed to fetch claimed fees USD: ${err.message}`);
     }
-    recordClaim(position_address, claimedFeesUsd);
+    // BUG-47 (Audit 5/21): isolate state.json write failure from on-chain
+    // claim success. The tx already landed; if recordClaim throws (disk
+    // full, lock contention) we still return success to the caller but
+    // log loudly so the operator can reconcile state.json manually.
+    try {
+      recordClaim(position_address, claimedFeesUsd);
+    } catch (err) {
+      log("claim_error", `recordClaim failed for ${position_address} (tx ${txHashes[0]}): ${err.message}`);
+    }
 
     return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
   } catch (error) {
