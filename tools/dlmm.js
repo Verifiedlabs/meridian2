@@ -402,6 +402,11 @@ function getDlmmProgramId() {
 // manifests as a flurry of "Transaction simulation failed" errors once the
 // first close lands and rent-reclaims the position account.
 const _closeInFlight = new Set();
+// BUG-46 (Audit 5/21): same pattern for claim_fees. Without this, parallel
+// callers (LLM emitting two claim_fees tool calls, realtime watcher race
+// with management cron) can each invoke claimSwapFee on the same position;
+// the second call burns gas to claim zero fees.
+const _claimInFlight = new Set();
 
 /**
  * Returns true when the given position account no longer exists or is no
@@ -1525,8 +1530,15 @@ export async function claimFees({ position_address }) {
     return { dry_run: true, would_claim: position_address, message: "DRY RUN — no transaction sent" };
   }
 
+  // BUG-46: serialize concurrent claim_fees calls for the same position
+  if (_claimInFlight.has(position_address)) {
+    return { success: false, error: "Claim already in flight for this position — refusing duplicate" };
+  }
+  _claimInFlight.add(position_address);
+
   const tracked = getTrackedPosition(position_address);
   if (tracked?.closed) {
+    _claimInFlight.delete(position_address);
     return { success: false, error: "Position already closed — fees were claimed during close" };
   }
 
@@ -1586,6 +1598,8 @@ export async function claimFees({ position_address }) {
   } catch (error) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
+  } finally {
+    _claimInFlight.delete(position_address);
   }
 }
 
