@@ -325,9 +325,22 @@ export async function swapToken({
   input_mint,
   output_mint,
   amount,
+  slippageBps,
 }) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
+
+  // BUG-32 (Audit 5/21): cap slippage. Without slippageBps Jupiter Ultra
+  // auto-mode can let through 5-15% slippage on illiquid memecoins,
+  // bleeding value on every auto-swap after close. Default to the user's
+  // closeSlippageBps so post-close swaps inherit the same cap.
+  const effectiveSlippageBps = (() => {
+    const n = Number(slippageBps);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+    const cfg = Number(config?.management?.closeSlippageBps);
+    if (Number.isFinite(cfg) && cfg > 0) return Math.floor(cfg);
+    return 1000; // hard fallback: 10%
+  })();
 
   if (process.env.DRY_RUN === "true") {
     return {
@@ -356,6 +369,7 @@ export async function swapToken({
       outputMint: output_mint,
       amount: amountStr,
       taker: wallet.publicKey.toString(),
+      slippageBps: String(effectiveSlippageBps),
     });
     const _m = _routeMeta();
     if (_m) {
