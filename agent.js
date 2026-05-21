@@ -291,8 +291,16 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       }
       sawToolCall = true;
 
-      // Execute each tool call in parallel
-      const toolResults = await Promise.all(msg.tool_calls.map(async (toolCall) => {
+      // BUG-16/17 fix (Audit 5/21):
+      //  - Write tools (deploy/close/swap) MUST run sequentially so the
+      //    `firedOnce` once-per-session guard actually blocks duplicates.
+      //    Promise.all parallelism races the check-then-set, allowing the
+      //    LLM (or prompt-injection) to fire two deploy_position calls in
+      //    the same tool_calls array and double-spend.
+      //  - Read tools stay parallel for speed.
+      //  - allSettled so one tool throwing doesn't drop sibling results
+      //    (otherwise on-chain state diverges from LLM context).
+      const runOne = async (toolCall) => {
         const functionName = toolCall.function.name.replace(/<.*$/, "").trim();
         const rawArgs = toolCall.function.arguments;
         let functionArgs;
@@ -312,6 +320,16 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
               log("warn", `Repaired malformed JSON args for ${functionName}`);
             } catch (parseError) {
               log("error", `Failed to parse args for ${functionName}: ${parseError.message}`);
+              // BUG-20: never execute write tools with empty args from a parse failure
+              if (ONCE_PER_SESSION.has(functionName)) {
+                return {
+                  role: "tool",
+                  tool_call_id: toolCall.id,
+                  content: JSON.stringify({
+                    error: `malformed args, refusing to execute write tool ${functionName}`,
+                  }),
+                };
+              }
               functionArgs = {};
             }
           }
@@ -354,7 +372,59 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           tool_call_id: toolCall.id,
           content: JSON.stringify(result),
         };
-      }));
+      };
+
+      // Partition by function name. We can't read functionArgs yet without
+      // executing parse logic, but the function NAME on the tool call is
+      // enough to know if it's a write tool.
+      const writeCalls = [];
+      const readCalls = [];
+      for (const tc of msg.tool_calls) {
+        const fn = tc.function.name.replace(/<.*$/, "").trim();
+        if (ONCE_PER_SESSION.has(fn)) writeCalls.push(tc);
+        else readCalls.push(tc);
+      }
+
+      // Sequential write-tool execution. Maintain index alignment with
+      // original msg.tool_calls so we can re-order results into the same
+      // slot order the LLM expects.
+      const indexed = msg.tool_calls.map((tc, i) => ({ tc, i }));
+      const settledByIndex = new Array(msg.tool_calls.length);
+
+      // Run reads in parallel.
+      const readPromises = indexed
+        .filter(({ tc }) => !ONCE_PER_SESSION.has(tc.function.name.replace(/<.*$/, "").trim()))
+        .map(async ({ tc, i }) => {
+          try {
+            settledByIndex[i] = await runOne(tc);
+          } catch (err) {
+            settledByIndex[i] = {
+              role: "tool",
+              tool_call_id: tc.id,
+              content: JSON.stringify({ error: err?.message || String(err) }),
+            };
+          }
+        });
+
+      // Run writes sequentially after kicking reads.
+      const writeRun = (async () => {
+        for (const { tc, i } of indexed) {
+          if (!ONCE_PER_SESSION.has(tc.function.name.replace(/<.*$/, "").trim())) continue;
+          try {
+            settledByIndex[i] = await runOne(tc);
+          } catch (err) {
+            settledByIndex[i] = {
+              role: "tool",
+              tool_call_id: tc.id,
+              content: JSON.stringify({ error: err?.message || String(err) }),
+            };
+          }
+        }
+      })();
+
+      await Promise.all([...readPromises, writeRun]);
+
+      const toolResults = settledByIndex.filter(Boolean);
 
       messages.push(...toolResults);
     } catch (error) {
