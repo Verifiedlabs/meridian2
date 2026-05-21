@@ -78,16 +78,24 @@ export async function recordPerformance(perf) {
   return withJsonLock(LESSONS_FILE, async () => {
   const data = load();
 
-  // Guard against unit-mixed records where a SOL-sized final value is
-  // accidentally written into a USD field (e.g. final_value_usd = 2 for a 2 SOL close).
+  // BUG-10 (Audit 5/21): replace magic-number heuristic with ratio.
+  // Old gate (initial_value_usd >= 20 AND amount_sol >= 0.25) excluded
+  // micro-live preset (0.05 SOL/pos) entirely. Real bug we're catching:
+  // a SOL-sized number (e.g. 2) accidentally landed in final_value_usd
+  // when actual USD should be ~SOL_PRICE × amount_sol (e.g. $400 for 2 SOL).
+  // Ratio test: if final_value_usd / amount_sol is ~1 (looks like SOL),
+  // it's almost certainly a unit-mix bug — flag it.
+  const ratio = (Number.isFinite(perf.final_value_usd) && Number.isFinite(perf.amount_sol) && perf.amount_sol > 0)
+    ? perf.final_value_usd / perf.amount_sol
+    : null;
   const suspiciousUnitMix =
     Number.isFinite(perf.initial_value_usd) &&
     Number.isFinite(perf.final_value_usd) &&
     Number.isFinite(perf.amount_sol) &&
-    perf.initial_value_usd >= 20 &&
-    perf.amount_sol >= 0.25 &&
+    perf.initial_value_usd >= 5 &&
     perf.final_value_usd > 0 &&
-    perf.final_value_usd <= perf.amount_sol * 2;
+    ratio != null &&
+    ratio < 5; // looks like SOL not USD given SOL ≈ $100-300
 
   if (suspiciousUnitMix) {
     log("lessons_warn", `Skipped suspicious performance record for ${perf.pool_name || perf.pool}: initial=${perf.initial_value_usd}, final=${perf.final_value_usd}, amount_sol=${perf.amount_sol}`);
