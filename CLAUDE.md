@@ -348,13 +348,13 @@ Priority sekarang:
 
 ### Status — Session 2026-05-21 (Phase 0+1+2+3 SELESAI)
 
-**25 bugs fixed across 22 commits, 276/276 tests passing setelah tiap commit.**
+**26 bugs fixed across 24 commits, 276/276 tests passing setelah tiap commit.**
 
-✅ **FIXED:** BUG-1, 2, 3, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47
+✅ **FIXED:** BUG-1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47
 
 ✅ **VERIFIED NOT A BUG:** BUG-29 (`_positionsInflight = null` already in finally @ tools/dlmm.js:1436), BUG-7 (no missed cycle — event during await falls into fast path), BUG-18 + BUG-30 (sync code can't interleave in single-threaded JS, no race)
 
-⏸ **DEFERRED:** BUG-8 (WS heartbeat — needs design call for per-pool baseline event rate), BUG-43 (O(N) iteration — LOW, "degrades slowly")
+⏸ **DEFERRED:** BUG-43 (O(N) iteration — LOW, "degrades slowly", premature optimization)
 
 ⏭ **SKIP (intentional):** BUG-33 (referral injection per owner instruction)
 
