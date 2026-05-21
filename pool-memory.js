@@ -304,45 +304,59 @@ export function getPoolMemory({ pool_address }) {
  * Keeps last 48 snapshots per pool (~4h at 5min intervals).
  */
 export function recordPositionSnapshot(poolAddress, snapshot) {
-  if (!poolAddress) return;
+  return recordPositionSnapshots([{ poolAddress, snapshot }]);
+}
+
+/**
+ * BUG-44 (Audit 5/21): batched variant. Per-position writes used to fire
+ * N read-modify-write cycles per management tick (one per open position),
+ * which both inflates pool-memory.json size growth and creates avoidable
+ * race windows with recordPoolDeploy. This batches all snapshots into a
+ * single load/save.
+ */
+export function recordPositionSnapshots(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return;
   const db = load();
-
-  if (!db[poolAddress]) {
-    db[poolAddress] = {
-      name: snapshot.pair || poolAddress.slice(0, 8),
-      base_mint: null,
-      deploys: [],
-      total_deploys: 0,
-      avg_pnl_pct: 0,
-      win_rate: 0,
-      adjusted_win_rate: 0,
-      adjusted_win_rate_sample_count: 0,
-      last_deployed_at: null,
-      last_outcome: null,
-      notes: [],
-      snapshots: [],
-    };
+  for (const { poolAddress, snapshot } of entries) {
+    if (!poolAddress || !snapshot) continue;
+    if (!db[poolAddress]) {
+      db[poolAddress] = {
+        name: snapshot.pair || poolAddress.slice(0, 8),
+        base_mint: null,
+        deploys: [],
+        total_deploys: 0,
+        avg_pnl_pct: 0,
+        win_rate: 0,
+        adjusted_win_rate: 0,
+        adjusted_win_rate_sample_count: 0,
+        last_deployed_at: null,
+        last_outcome: null,
+        notes: [],
+        snapshots: [],
+      };
+    }
+    if (!db[poolAddress].snapshots) db[poolAddress].snapshots = [];
+    db[poolAddress].snapshots.push({
+      ts: new Date().toISOString(),
+      position: snapshot.position,
+      pnl_pct: snapshot.pnl_pct ?? null,
+      pnl_usd: snapshot.pnl_usd ?? null,
+      in_range: snapshot.in_range ?? null,
+      unclaimed_fees_usd: snapshot.unclaimed_fees_usd ?? null,
+      minutes_out_of_range: snapshot.minutes_out_of_range ?? null,
+      age_minutes: snapshot.age_minutes ?? null,
+    });
+    if (db[poolAddress].snapshots.length > 48) {
+      db[poolAddress].snapshots = db[poolAddress].snapshots.slice(-48);
+    }
   }
-
-  if (!db[poolAddress].snapshots) db[poolAddress].snapshots = [];
-
-  db[poolAddress].snapshots.push({
-    ts: new Date().toISOString(),
-    position: snapshot.position,
-    pnl_pct: snapshot.pnl_pct ?? null,
-    pnl_usd: snapshot.pnl_usd ?? null,
-    in_range: snapshot.in_range ?? null,
-    unclaimed_fees_usd: snapshot.unclaimed_fees_usd ?? null,
-    minutes_out_of_range: snapshot.minutes_out_of_range ?? null,
-    age_minutes: snapshot.age_minutes ?? null,
-  });
-
-  // Keep last 48 snapshots (~4h at 5min intervals)
-  if (db[poolAddress].snapshots.length > 48) {
-    db[poolAddress].snapshots = db[poolAddress].snapshots.slice(-48);
-  }
-
   save(db);
+}
+
+function _legacyRecordPositionSnapshot_unused(poolAddress, snapshot) {
+  // Removed in BUG-44 fix — kept only as a marker for code archaeology.
+  // Logic is now in recordPositionSnapshots() above.
+  void poolAddress; void snapshot;
 }
 
 /**

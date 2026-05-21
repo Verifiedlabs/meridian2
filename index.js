@@ -38,7 +38,7 @@ import {
 import { generateBriefing, buildPnlCalendarFromDisk } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, setPositionExploration, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
+import { recordPositionSnapshot, recordPositionSnapshots, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { getTwitterSentiment } from "./tools/twitter.js";
@@ -274,11 +274,12 @@ export async function runManagementCycle({ silent = false } = {}) {
       return mgmtReport;
     }
 
-    // Snapshot + load pool memory
-    const positionData = positions.map((p) => {
-      recordPositionSnapshot(p.pool, p);
-      return { ...p, recall: recallForPool(p.pool) };
-    });
+    // BUG-44 (Audit 5/21): batch snapshots into one disk write per cycle
+    // instead of N writes (one per position). Cuts pool-memory.json file
+    // growth and removes a race window with recordPoolDeploy.
+    const snapshotEntries = positions.map((p) => ({ poolAddress: p.pool, snapshot: p }));
+    recordPositionSnapshots(snapshotEntries);
+    const positionData = positions.map((p) => ({ ...p, recall: recallForPool(p.pool) }));
 
     // JS trailing TP check
     const exitMap = new Map();
