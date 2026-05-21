@@ -3729,15 +3729,26 @@ Commands:
     if (!isNaN(pick) && pick >= 1 && pick <= latest.length) {
       await runBusy(async () => {
         const pool = latest[pick - 1];
-        console.log(`\nDeploying ${DEPLOY} SOL into ${pool.name}...\n`);
-        const { content: reply } = await agentLoop(
-          `Deploy ${DEPLOY} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
-          config.llm.maxSteps,
-          [],
-          "SCREENER"
-        );
-        console.log(`\n${reply}\n`);
-        launchCron();
+        // BUG-49 (Audit 5/21): TTY-mode SCREENER deploy must also gate on
+        // _screeningBusy so a manual pick can't race a cron screening cycle.
+        if (_screeningBusy) {
+          console.log("Screening cycle already running — please wait or retry shortly.");
+          return;
+        }
+        _screeningBusy = true;
+        try {
+          console.log(`\nDeploying ${DEPLOY} SOL into ${pool.name}...\n`);
+          const { content: reply } = await agentLoop(
+            `Deploy ${DEPLOY} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+            config.llm.maxSteps,
+            [],
+            "SCREENER"
+          );
+          console.log(`\n${reply}\n`);
+          launchCron();
+        } finally {
+          _screeningBusy = false;
+        }
       });
       return;
     }
@@ -3745,15 +3756,24 @@ Commands:
     // ── auto: agent picks and deploys ───────
     if (input.toLowerCase() === "auto") {
       await runBusy(async () => {
-        console.log("\nAgent is picking and deploying...\n");
-        const { content: reply } = await agentLoop(
-          `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${DEPLOY} SOL. Execute now, don't ask.`,
-          config.llm.maxSteps,
-          [],
-          "SCREENER"
-        );
-        console.log(`\n${reply}\n`);
-        launchCron();
+        if (_screeningBusy) {
+          console.log("Screening cycle already running — please wait or retry shortly.");
+          return;
+        }
+        _screeningBusy = true;
+        try {
+          console.log("\nAgent is picking and deploying...\n");
+          const { content: reply } = await agentLoop(
+            `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${DEPLOY} SOL. Execute now, don't ask.`,
+            config.llm.maxSteps,
+            [],
+            "SCREENER"
+          );
+          console.log(`\n${reply}\n`);
+          launchCron();
+        } finally {
+          _screeningBusy = false;
+        }
       });
       return;
     }
