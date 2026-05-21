@@ -3906,6 +3906,17 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
   maybeRunMissedBriefing().catch((err) => log("silent_warn", err.message));
   startPolling(telegramHandler);
   (async () => {
+    // BUG-48 (Audit 5/21): startup IIFE used to bypass _screeningBusy and
+    // run agentLoop in parallel with the management→screening cron, so two
+    // SCREENER agents could race to deploy the same candidate. Each loop
+    // has its own `firedOnce` Set, so BUG-16's single-loop guard didn't
+    // catch it. Acquire the flag for the duration of the startup check
+    // exactly like runScreeningCycle does.
+    if (_screeningBusy) {
+      log("startup", "Startup screening skipped — another screening cycle already running");
+      return;
+    }
+    _screeningBusy = true;
     try {
       const startupStep3 = process.env.DRY_RUN === "true"
         ? `3. Ignore wallet SOL threshold in dry run: get_top_candidates then simulate deploy ${DEPLOY} SOL.`
@@ -3916,6 +3927,8 @@ STARTUP CHECK
       `, config.llm.maxSteps, [], "SCREENER");
     } catch (e) {
       log("startup_error", e.message);
+    } finally {
+      _screeningBusy = false;
     }
   })();
 }
