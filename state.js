@@ -554,6 +554,33 @@ export function syncOpenPositions(active_addresses) {
   const activeSet = new Set(active_addresses);
   let changed = false;
 
+  // BUG-1 (Audit 5/21): defend against partial-RPC false-close.
+  // If getMyPositions returns a partial list (Meteora API hiccup, paginate
+  // failure), the missing positions look "closed" here and get marked
+  // closed=true silently — phantom-close. Real position stays open
+  // on-chain, recordPerformance is never called, lessons.json misses data.
+  //
+  // Heuristic: count local positions that are open AND past the grace
+  // window. If ALL of them are missing from active_addresses, or fewer
+  // than half match, we're almost certainly seeing a partial result. Skip.
+  let openEligible = 0;
+  let matchedEligible = 0;
+  for (const posId in state.positions) {
+    const pos = state.positions[posId];
+    if (pos.closed) continue;
+    const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
+    if (Date.now() - deployedAt < SYNC_GRACE_MS) continue;
+    openEligible += 1;
+    if (activeSet.has(posId)) matchedEligible += 1;
+  }
+  if (openEligible >= 2 && matchedEligible / openEligible < 0.5) {
+    log(
+      "state_warn",
+      `syncOpenPositions: only ${matchedEligible}/${openEligible} eligible positions matched on-chain — refusing to auto-close (likely partial RPC result)`,
+    );
+    return;
+  }
+
   for (const posId in state.positions) {
     const pos = state.positions[posId];
     if (pos.closed || activeSet.has(posId)) continue;
