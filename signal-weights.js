@@ -10,7 +10,7 @@
  */
 
 import fs from "fs";
-import { writeJsonAtomicSync } from "./fs-utils.js";
+import { writeJsonAtomicSync, loadJsonOrThrow, withJsonLock } from "./fs-utils.js";
 import { log } from "./logger.js";
 import { recordValidationTrend } from "./decision-log.js";
 
@@ -69,15 +69,19 @@ export function loadWeights() {
     return initial;
   }
   try {
-    return JSON.parse(fs.readFileSync(WEIGHTS_FILE, "utf8"));
-  } catch (err) {
-    log("signal_weights_error", `Failed to read signal-weights.json: ${err.message}`);
+    const parsed = loadJsonOrThrow(WEIGHTS_FILE);
     return {
-      weights: { ...DEFAULT_WEIGHTS },
-      last_recalc: null,
-      recalc_count: 0,
-      history: [],
+      weights: { ...DEFAULT_WEIGHTS, ...(parsed.weights || {}) },
+      last_recalc: parsed.last_recalc || null,
+      recalc_count: parsed.recalc_count || 0,
+      history: parsed.history || [],
+      ...parsed,
     };
+  } catch (err) {
+    // Corrupt JSON: backup already taken by loadJsonOrThrow. Don't silently
+    // wipe Darwin tuning history (BUG-38). Operator must inspect manually.
+    log("signal_weights_error", `signal-weights.json corrupt: ${err.message}`);
+    throw err;
   }
 }
 
@@ -170,7 +174,8 @@ export function assessTrainHoldoutConsistency(train, holdout, minSamples = 10) {
  * @param {Object} cfg      - Live config object (reads cfg.darwin for tuning)
  * @returns {{ changes: Array, weights: Object, validation?: Object }}
  */
-export function recalculateWeights(perfData, cfg = {}) {
+export async function recalculateWeights(perfData, cfg = {}) {
+  return withJsonLock(WEIGHTS_FILE, async () => {
   const darwin = cfg.darwin || {};
   const windowDays    = darwin.windowDays    ?? 60;
   const minSamples    = darwin.minSamples    ?? 10;
@@ -296,6 +301,7 @@ export function recalculateWeights(perfData, cfg = {}) {
   }
 
   return { changes, weights, validation };
+  });
 }
 
 // ─── Lift Computation ────────────────────────────────────────────

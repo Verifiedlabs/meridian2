@@ -6,7 +6,7 @@
  */
 
 import fs from "fs";
-import { writeJsonAtomicSync } from "./fs-utils.js";
+import { writeJsonAtomicSync, loadJsonOrThrow } from "./fs-utils.js";
 import { log } from "./logger.js";
 import { config } from "./config.js";
 
@@ -25,11 +25,12 @@ function sanitizeStoredNote(text, maxLen = MAX_NOTE_LENGTH) {
 }
 
 function load() {
-  if (!fs.existsSync(POOL_MEMORY_FILE)) return {};
   try {
-    return JSON.parse(fs.readFileSync(POOL_MEMORY_FILE, "utf8"));
-  } catch {
-    return {};
+    return loadJsonOrThrow(POOL_MEMORY_FILE, {});
+  } catch (err) {
+    // Corrupt JSON: backup created. Don't silently wipe pool history (BUG-40).
+    log("pool_memory_error", `pool-memory.json corrupt: ${err.message}`);
+    throw err;
   }
 }
 

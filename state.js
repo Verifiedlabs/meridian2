@@ -9,7 +9,7 @@
  */
 
 import fs from "fs";
-import { writeJsonAtomicSync } from "./fs-utils.js";
+import { writeJsonAtomicSync, loadJsonOrThrow } from "./fs-utils.js";
 import { log } from "./logger.js";
 import { getEffectiveTrailingParams } from "./src/adaptive-trailing.js";
 
@@ -30,14 +30,19 @@ function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
 }
 
 function load() {
-  if (!fs.existsSync(STATE_FILE)) {
-    return { positions: {}, recentEvents: [], lastUpdated: null };
-  }
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const parsed = loadJsonOrThrow(STATE_FILE, { positions: {}, recentEvents: [], lastUpdated: null });
+    return {
+      positions: parsed.positions || {},
+      recentEvents: parsed.recentEvents || [],
+      lastUpdated: parsed.lastUpdated || null,
+      ...parsed,
+    };
   } catch (err) {
-    log("state_error", `Failed to read state.json: ${err.message}`);
-    return { positions: {}, lastUpdated: null };
+    // Corrupt JSON: backup file already created by loadJsonOrThrow.
+    // Re-throw — don't silently wipe history. (BUG-12, BUG-24 pattern)
+    log("state_error", `state.json corrupt: ${err.message}`);
+    throw err;
   }
 }
 

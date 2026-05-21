@@ -19,7 +19,7 @@
  */
 
 import fs from "fs";
-import { writeJsonAtomicSync } from "../fs-utils.js";
+import { writeJsonAtomicSync, loadJsonOrThrow } from "../fs-utils.js";
 import { log } from "../logger.js";
 import { config } from "../config.js";
 
@@ -44,11 +44,12 @@ function load() {
     return _state;
   }
   try {
-    const parsed = JSON.parse(fs.readFileSync(FILE, "utf8"));
+    const parsed = loadJsonOrThrow(FILE);
     _state = { ...DEFAULT_STATE, ...parsed, recentCloses: parsed.recentCloses || [] };
   } catch (err) {
-    log("circuit_breaker_error", `Failed to load ${FILE}: ${err.message} — starting fresh`);
-    _state = { ...DEFAULT_STATE, recentCloses: [] };
+    // Corrupt JSON: backup created. Don't silently wipe breaker history.
+    log("circuit_breaker_error", `${FILE} corrupt: ${err.message}`);
+    throw err;
   }
   return _state;
 }

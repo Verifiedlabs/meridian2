@@ -9,7 +9,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { writeJsonAtomicSync } from "./fs-utils.js";
+import { writeJsonAtomicSync, loadJsonOrThrow, withJsonLock } from "./fs-utils.js";
 import { log } from "./logger.js";
 import { getSharedLessonsForPrompt, pushHiveLesson, pushHivePerformanceEvent } from "./hivemind.js";
 
@@ -33,13 +33,16 @@ function sanitizeLessonText(text, maxLen = MAX_MANUAL_LESSON_LENGTH) {
 }
 
 function load() {
-  if (!fs.existsSync(LESSONS_FILE)) {
-    return { lessons: [], performance: [] };
-  }
   try {
-    return JSON.parse(fs.readFileSync(LESSONS_FILE, "utf8"));
-  } catch {
-    return { lessons: [], performance: [] };
+    const parsed = loadJsonOrThrow(LESSONS_FILE, { lessons: [], performance: [] });
+    return {
+      lessons: parsed.lessons || [],
+      performance: parsed.performance || [],
+      ...parsed,
+    };
+  } catch (err) {
+    log("lessons_error", `lessons.json corrupt: ${err.message}`);
+    throw err;
   }
 }
 
@@ -72,6 +75,7 @@ function save(data) {
  * @param {string} perf.close_reason   - Why it was closed
  */
 export async function recordPerformance(perf) {
+  return withJsonLock(LESSONS_FILE, async () => {
   const data = load();
 
   // Guard against unit-mixed records where a SOL-sized final value is
@@ -189,7 +193,7 @@ export async function recordPerformance(perf) {
     // Darwinian signal weight recalculation
     if (config.darwin?.enabled) {
       const { recalculateWeights } = await import("./signal-weights.js");
-      const wResult = recalculateWeights(data.performance, config);
+      const wResult = await recalculateWeights(data.performance, config);
       if (wResult.changes.length > 0) {
         log("evolve", `Darwin: adjusted ${wResult.changes.length} signal weight(s)`);
       } else if (wResult.validation && !wResult.validation.commit) {
@@ -274,6 +278,7 @@ export async function recordPerformance(perf) {
   } catch (err) {
     log("silent_warn", `Circuit breaker recordClose failed: ${err.message}`);
   }
+  });
 }
 
 /**
