@@ -31,6 +31,10 @@ let _getActiveBinFn = null;
 let _enabled = false;
 let _debounceMs = 3_000;
 let _oorThrottleMs = 60_000;
+// BUG-8 (Audit 5/21): heartbeat detects dead WS subscriptions.
+let _heartbeatIntervalMs = 5 * 60_000;
+let _staleSubscriptionMs = 15 * 60_000;
+let _heartbeatTimer = null;
 
 // poolAddress -> {
 //   subId: number,
@@ -60,6 +64,8 @@ export function initRealtimeWatcher({
   enabled,
   debounceMs = 3_000,
   oorThrottleMs = 60_000,
+  heartbeatIntervalMs = 5 * 60_000,
+  staleSubscriptionMs = 15 * 60_000,
 }) {
   _connection = connection;
   _getActiveBinFn = getActiveBin;
@@ -67,9 +73,12 @@ export function initRealtimeWatcher({
   _enabled = !!enabled;
   _debounceMs = Math.max(500, Number(debounceMs) || 3_000);
   _oorThrottleMs = Math.max(5_000, Number(oorThrottleMs) || 60_000);
+  _heartbeatIntervalMs = Math.max(60_000, Number(heartbeatIntervalMs) || 5 * 60_000);
+  _staleSubscriptionMs = Math.max(2 * 60_000, Number(staleSubscriptionMs) || 15 * 60_000);
 
   if (_enabled) {
-    log("realtime", `Initialised — debounce=${_debounceMs}ms throttle=${_oorThrottleMs}ms`);
+    log("realtime", `Initialised — debounce=${_debounceMs}ms throttle=${_oorThrottleMs}ms heartbeat=${_heartbeatIntervalMs}ms`);
+    startHeartbeat();
   }
 }
 
@@ -93,12 +102,19 @@ export async function watchPosition({ positionAddress, poolAddress, lowerBin, up
       debounceTimer: null,
       pendingRefetch: false,
       lastOorFire: new Map(),
+      // BUG-8 (Audit 5/21): track last WS event so heartbeat can detect
+      // dead subscriptions (Helius hiccup, no auto-reconnect) and re-sub.
+      lastEventAt: Date.now(),
+      subscribedAt: Date.now(),
     };
     watchers.set(poolAddress, entry);
     try {
       entry.subId = _connection.onAccountChange(
         new PublicKey(poolAddress),
-        () => scheduleRefetch(poolAddress),
+        () => {
+          entry.lastEventAt = Date.now();
+          scheduleRefetch(poolAddress);
+        },
         { commitment: "processed" },
       );
       log("realtime", `WS subscribed pool=${poolAddress.slice(0, 8)} sub=${entry.subId}`);
@@ -182,6 +198,10 @@ export function getWatcherStats() {
  * Tear down all subscriptions. Call on graceful shutdown.
  */
 export async function shutdownRealtimeWatcher() {
+  if (_heartbeatTimer) {
+    clearInterval(_heartbeatTimer);
+    _heartbeatTimer = null;
+  }
   for (const [poolAddress, entry] of watchers) {
     if (entry.subId != null && _connection) {
       try {
@@ -195,6 +215,51 @@ export async function shutdownRealtimeWatcher() {
 }
 
 // ─── Internals ────────────────────────────────────────────────────
+
+// BUG-8 (Audit 5/21): periodic heartbeat detects dead WS subscriptions
+// (Helius hiccup with no auto-reconnect) and re-subscribes the pool.
+function startHeartbeat() {
+  if (_heartbeatTimer) clearInterval(_heartbeatTimer);
+  _heartbeatTimer = setInterval(() => {
+    runHeartbeat().catch((err) => {
+      log("realtime_warn", `Heartbeat sweep failed: ${err.message}`);
+    });
+  }, _heartbeatIntervalMs);
+  // Don't keep the event loop alive solely for the heartbeat.
+  if (_heartbeatTimer.unref) _heartbeatTimer.unref();
+}
+
+async function runHeartbeat() {
+  if (!_enabled || !_connection || watchers.size === 0) return;
+  const now = Date.now();
+  for (const [poolAddress, entry] of watchers) {
+    // Grace period after subscribe — fresh subs naturally have no events.
+    if (now - entry.subscribedAt < _staleSubscriptionMs) continue;
+    if (now - entry.lastEventAt < _staleSubscriptionMs) continue;
+    log(
+      "realtime_warn",
+      `Pool ${poolAddress.slice(0, 8)} has had no WS event in ${Math.round((now - entry.lastEventAt) / 60_000)}min — re-subscribing`,
+    );
+    try {
+      if (entry.subId != null) {
+        try { await _connection.removeAccountChangeListener(entry.subId); } catch {}
+      }
+      entry.subId = _connection.onAccountChange(
+        new PublicKey(poolAddress),
+        () => {
+          entry.lastEventAt = Date.now();
+          scheduleRefetch(poolAddress);
+        },
+        { commitment: "processed" },
+      );
+      entry.subscribedAt = now;
+      entry.lastEventAt = now;
+      log("realtime", `Re-subscribed pool=${poolAddress.slice(0, 8)} sub=${entry.subId}`);
+    } catch (err) {
+      log("realtime_error", `Re-subscribe failed pool=${poolAddress.slice(0, 8)}: ${err.message}`);
+    }
+  }
+}
 
 function scheduleRefetch(poolAddress) {
   const entry = watchers.get(poolAddress);
