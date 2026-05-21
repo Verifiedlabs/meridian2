@@ -194,6 +194,23 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             attempt -= 1;
             continue;
           }
+          // BUG-21 (Audit 5/21): retry transient network errors. Without
+          // this, a single ECONNRESET / "fetch failed" / timeout to
+          // OpenRouter aborts the whole agent loop and surfaces as a
+          // failed turn to the user, even though the next request would
+          // succeed instantly.
+          const transientNetwork =
+            error?.code === "ECONNRESET" ||
+            error?.code === "ETIMEDOUT" ||
+            error?.code === "UND_ERR_SOCKET" ||
+            String(error?.message || "").includes("fetch failed") ||
+            String(error?.message || "").includes("network timeout");
+          if (transientNetwork && attempt < 2) {
+            const wait = (attempt + 1) * 2000;
+            log("agent", `Network error (${error?.code || error?.message}) — retrying in ${wait / 1000}s`);
+            await new Promise((r) => setTimeout(r, wait));
+            continue;
+          }
           throw error;
         }
         if (response.choices?.length) break;
