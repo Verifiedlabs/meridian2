@@ -348,7 +348,7 @@ Priority sekarang:
 
 ### Status — Session 2026-05-21 (Phase 0+1+2+3 SELESAI)
 
-**28 bugs fixed across 28 commits, 276/276 tests passing setelah tiap commit.**
+**42 bugs fixed across 30 fix commits (+ 4 doc commits), 276/276 tests passing setelah tiap commit.**
 
 ✅ **FIXED:** BUG-1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, **48**, **49** (post-restart findings: BUG-48 startup IIFE bypassed `_screeningBusy`, BUG-49 Telegram SCREENER-role bypassed `_screeningBusy` — both could race with cron-triggered screening and double-deploy via separate `firedOnce` Sets)
 
