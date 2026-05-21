@@ -135,6 +135,36 @@ const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
 const TRAILING_DROP_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_DROP_CONFIRM_TOLERANCE_PCT = 1.0;
 
+// BUG-19 (Audit 5/21): coalesce concurrent confirmation fetches.
+// During pump moments multiple peak/trailing-drop timers can fire within
+// the same second, each independently calling getMyPositions({force:true})
+// → 5+ Meteora/Helius requests at once → rate-limit + partial results
+// (which then triggers BUG-1's syncOpenPositions false-close path).
+// Single-flight coalescer keeps cache fresh ≤2s and shares one inflight
+// fetch across all confirm callers.
+let _confirmFetchInflight = null;
+let _confirmFetchAt = 0;
+const CONFIRM_FETCH_TTL_MS = 2_000;
+async function getCoalescedPositionsForConfirm() {
+  if (Date.now() - _confirmFetchAt < CONFIRM_FETCH_TTL_MS && !_confirmFetchInflight) {
+    // Recent fetch is fresh enough — let getMyPositions's own cache return it
+    return getMyPositions({ silent: true }).catch((err) => { log("silent_warn", err.message); return null; });
+  }
+  if (_confirmFetchInflight) return _confirmFetchInflight;
+  _confirmFetchInflight = (async () => {
+    try {
+      return await getMyPositions({ force: true, silent: true });
+    } catch (err) {
+      log("silent_warn", err.message);
+      return null;
+    } finally {
+      _confirmFetchAt = Date.now();
+      _confirmFetchInflight = null;
+    }
+  })();
+  return _confirmFetchInflight;
+}
+
 function shouldUsePnlRecheck() {
   return !config.api.lpAgentRelayEnabled;
 }
@@ -145,7 +175,7 @@ function schedulePeakConfirmation(positionAddress) {
   const timer = setTimeout(async () => {
     _peakConfirmTimers.delete(positionAddress);
     try {
-      const result = await getMyPositions({ force: true, silent: true }).catch((err) => { log("silent_warn", err.message); return null; });
+      const result = await getCoalescedPositionsForConfirm();
       const position = result?.positions?.find((p) => p.position === positionAddress);
       resolvePendingPeak(positionAddress, position?.pnl_pct ?? null, TRAILING_PEAK_CONFIRM_TOLERANCE);
     } catch (error) {
@@ -162,7 +192,7 @@ function scheduleTrailingDropConfirmation(positionAddress) {
   const timer = setTimeout(async () => {
     _trailingDropConfirmTimers.delete(positionAddress);
     try {
-      const result = await getMyPositions({ force: true, silent: true }).catch((err) => { log("silent_warn", err.message); return null; });
+      const result = await getCoalescedPositionsForConfirm();
       const position = result?.positions?.find((p) => p.position === positionAddress);
       const resolved = resolvePendingTrailingDrop(
         positionAddress,
