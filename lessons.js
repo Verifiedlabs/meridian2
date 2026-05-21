@@ -17,7 +17,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
 
 const LESSONS_FILE = "./lessons.json";
-const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
+// BUG-11 (Audit 5/21): renamed from MIN_EVOLVE_POSITIONS for clarity.
+// This is for *lesson derivation* triggering — different concept from
+// `config.darwin.minSamples` which gates Darwin signal weight recalc.
+// Kept the old name as alias so external test imports don't break.
+const LESSON_DERIVATION_MIN_RECORDS = 5;
+const MIN_EVOLVE_POSITIONS = LESSON_DERIVATION_MIN_RECORDS;
 const MAX_CHANGE_PER_STEP  = 0.20; // never shift a threshold more than 20% at once
 const MAX_MANUAL_LESSON_LENGTH = 400;
 
@@ -189,8 +194,13 @@ export async function recordPerformance(perf) {
     });
   }
 
-  // Evolve thresholds every 5 closed positions
-  if (data.performance.length % MIN_EVOLVE_POSITIONS === 0) {
+  // BUG-27 (Audit 5/21): use last-evolved tracking instead of modulo so a
+  // skipped record (e.g. suspiciousUnitMix gate) doesn't permanently shift
+  // the trigger phase and cause us to evolve every (5n+offset) records
+  // until next reset. The `_lastEvolveAt` counter is persisted to lessons.json.
+  const lastEvolveAt = Number(data._lastEvolveAt ?? 0);
+  if (data.performance.length - lastEvolveAt >= LESSON_DERIVATION_MIN_RECORDS) {
+    data._lastEvolveAt = data.performance.length;
     const { config, reloadScreeningThresholds } = await import("./config.js");
     const result = evolveThresholds(data.performance, config);
     if (result?.changes && Object.keys(result.changes).length > 0) {
