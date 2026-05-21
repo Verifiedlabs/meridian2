@@ -1289,8 +1289,15 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
 
     // Fetch bin data (lowerBinId, upperBinId, poolActiveBinId) for all pools in parallel
     // Needed for rules 3 & 4 (active_bin vs upper_bin comparison)
+    // BUG-31 (Audit 5/21): cap concurrency to 4 so 8+ open pools don't burst
+    // the Meteora PnL API and produce partial results that trigger BUG-1.
     const binDataByPool = {};
-    const pnlMaps = await Promise.all(pools.map(pool => fetchDlmmPnlForPool(pool.poolAddress, walletAddress)));
+    const { pmap } = await import("./pmap.js");
+    const pnlMaps = await pmap(
+      pools,
+      (pool) => fetchDlmmPnlForPool(pool.poolAddress, walletAddress),
+      4,
+    );
     pools.forEach((pool, i) => { binDataByPool[pool.poolAddress] = pnlMaps[i]; });
     const lpAgentByPosition = await fetchLpAgentOpenPositions(walletAddress);
 

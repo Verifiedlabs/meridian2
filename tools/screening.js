@@ -382,14 +382,19 @@ export async function getTopCandidates({ limit = 10, screeningOverrides = null, 
   if (btCfg?.enabled && eligible.length > 0) {
     const { runYieldBacktest, evaluateBacktestGate } = await import("./backtest.js");
     const { computeBinsBelow } = await import("../src/format.js");
-    const results = await Promise.all(
-      eligible.map((p) =>
+    const { pmap } = await import("./pmap.js");
+    // BUG-22 (Audit 5/21): cap concurrency at 5 so fanning out 50+ pools
+    // doesn't burst the Meteora chart API and blanket-fail the gate via
+    // rate-limit (everything fails open and the bot deploys to anything).
+    const results = await pmap(
+      eligible,
+      (p) =>
         runYieldBacktest({
           poolAddress: p.pool,
           binsBelow:   computeBinsBelow(p.volatility),
           cfg:         btCfg,
         }).catch((e) => ({ ok: false, reason: `exception: ${e.message}` })),
-      ),
+      5,
     );
     for (let i = 0; i < eligible.length; i++) {
       eligible[i].backtest = results[i];
