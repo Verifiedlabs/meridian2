@@ -92,7 +92,8 @@ export async function getWalletBalances() {
 
   try {
     const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
-    const res = await fetch(url);
+    const { fetchWithTimeout } = await import("../fs-utils.js");
+    const res = await fetchWithTimeout(url, {}, 12_000);
 
     if (!res.ok) {
       // 401/403 → key invalid; fall through to RPC fallback so the bot can still operate
@@ -366,9 +367,9 @@ export async function swapToken({
     const orderUrl = `${JUPITER_SWAP_V2_API}/order?${search.toString()}`;
     const jupiterApiKey = getJupiterApiKey();
 
-    const orderRes = await fetch(orderUrl, {
+    const orderRes = await (await import("../fs-utils.js")).fetchWithTimeout(orderUrl, {
       headers: jupiterApiKey ? { "x-api-key": jupiterApiKey } : {},
-    });
+    }, 15_000);
     if (!orderRes.ok) {
       const body = await orderRes.text();
       throw new Error(`Swap V2 order failed: ${orderRes.status} ${body}`);
@@ -387,14 +388,14 @@ export async function swapToken({
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
 
     // ─── Execute ───────────────────────────────────────────────
-    const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
+    const execRes = await (await import("../fs-utils.js")).fetchWithTimeout(`${JUPITER_SWAP_V2_API}/execute`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         ...(jupiterApiKey ? { "x-api-key": jupiterApiKey } : {}),
       },
       body: JSON.stringify({ signedTransaction: signedTx, requestId }),
-    });
+    }, 25_000);
     if (!execRes.ok) {
       throw new Error(`Swap V2 execute failed: ${execRes.status} ${await execRes.text()}`);
     }

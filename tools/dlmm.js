@@ -26,7 +26,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { normalizeMint } from "./wallet.js";
+import { normalizeMint, getWalletBalances, swapToken, revokeEmptyAtas } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { watchPosition, unwatchPosition } from "../src/realtime-watcher.js";
 import { getAndClearStagedSignals, computeStudyWinRate } from "../signal-tracker.js";
@@ -548,7 +548,7 @@ async function getPoolMetadata(poolAddress) {
   }
 
   try {
-    const res = await fetch(`https://dlmm.datapi.meteora.ag/pools/${key}`);
+    const res = await meridianFetchWithTimeout(`https://dlmm.datapi.meteora.ag/pools/${key}`, {}, 10_000);
     if (!res.ok) {
       throw new Error(`Pool metadata API ${res.status}`);
     }
@@ -1076,7 +1076,7 @@ async function fetchLpAgentOpenPositions(walletAddress) {
 async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
   const url = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${walletAddress}&status=open&pageSize=100&page=1`;
   try {
-    const res = await fetch(url);
+    const res = await meridianFetchWithTimeout(url, {}, 12_000);
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       log("pnl_api", `HTTP ${res.status} for pool ${poolAddress.slice(0, 8)}: ${body.slice(0, 120)}`);
@@ -1280,7 +1280,7 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
     // Detailed range data stays on Meteora PnL API; value/PnL can be overridden by LPAgent below.
     if (!silent) log("positions", "Fetching portfolio via Meteora portfolio API...");
     const portfolioUrl = `https://dlmm.datapi.meteora.ag/portfolio/open?user=${walletAddress}`;
-    const res = await fetch(portfolioUrl);
+    const res = await meridianFetchWithTimeout(portfolioUrl, {}, 15_000);
     if (!res.ok) throw new Error(`Portfolio API ${res.status}: ${await res.text().catch(() => "")}`);
     const portfolio = await res.json();
 
@@ -1491,7 +1491,7 @@ export async function getWalletPositions({ wallet_address }) {
 // ─── Search Pools by Query ─────────────────────────────────────
 export async function searchPools({ query, limit = 10 }) {
   const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(query)}`;
-  const res = await fetch(url);
+  const res = await meridianFetchWithTimeout(url, {}, 10_000);
   if (!res.ok) throw new Error(`Pool search API error: ${res.status} ${res.statusText}`);
   const data = await res.json();
   const pools = (Array.isArray(data) ? data : data.data || []).slice(0, limit);
@@ -1710,8 +1710,8 @@ export async function closePosition({ position_address, reason }) {
           try {
             const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
             for (let attempt = 0; attempt < 6; attempt++) {
-              const res = await fetch(closedUrl);
-              if (res.ok) {
+              const res = await meridianFetchWithTimeout(closedUrl, {}, 8_000).catch(() => null);
+              if (res && res.ok) {
                 const data = await res.json();
                 const posEntry = (data.positions || []).find((entry) => entry.positionAddress === position_address);
                 if (posEntry) {
@@ -1987,8 +1987,8 @@ export async function closePosition({ position_address, reason }) {
       try {
         const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
         for (let attempt = 0; attempt < 6; attempt++) {
-          const res = await fetch(closedUrl);
-          if (res.ok) {
+          const res = await meridianFetchWithTimeout(closedUrl, {}, 8_000).catch(() => null);
+          if (res && res.ok) {
             const data = await res.json();
             const posEntry = (data.positions || []).find(p => p.positionAddress === position_address);
             if (posEntry) {
@@ -2083,6 +2083,55 @@ export async function closePosition({ position_address, reason }) {
         },
       });
 
+      // Auto-swap base token back to SOL after close
+      const baseMint = pool.lbPair.tokenXMint.toString();
+      let autoSwapped = false;
+      let autoSwapNote = null;
+      let solReceived = null;
+
+      if (config.management.autoSwapAfterClose !== false) {
+        try {
+          await new Promise(r => setTimeout(r, 2000));
+
+          let token = null;
+          let balances = await getWalletBalances({});
+          token = balances.tokens?.find(t => t.mint === baseMint);
+
+          if (!token) {
+            log("close", `Token ${baseMint.slice(0, 8)} not found in balances, retrying in 2s...`);
+            await new Promise(r => setTimeout(r, 2000));
+            balances = await getWalletBalances({});
+            token = balances.tokens?.find(t => t.mint === baseMint);
+          }
+
+          const minUsd = config.management.autoSwapMinUsd ?? 0.10;
+          if (token && token.usd >= minUsd) {
+            log("close", `Auto-swapping ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
+            const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
+            autoSwapped = true;
+            autoSwapNote = `Base token already auto-swapped back to SOL (${token.symbol || baseMint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
+            if (swapResult?.amount_out) solReceived = swapResult.amount_out;
+          } else if (!token) {
+            log("close_warn", `Auto-swap skipped: token ${baseMint.slice(0, 8)} not found in wallet balances after retry`);
+          } else {
+            log("close", `Skipping auto-swap for ${token?.symbol || baseMint.slice(0, 8)}: $${token?.usd?.toFixed(2) || "0"} < $${minUsd} threshold`);
+          }
+
+          if (config.management.autoRevokeAtaAfterClose && baseMint) {
+            try {
+              const revoked = await revokeEmptyAtas({ mints: [baseMint] });
+              if (revoked.closed > 0) {
+                log("close", `Reclaimed ${revoked.sol_reclaimed.toFixed(5)} SOL from ${revoked.closed} ATA(s) [${baseMint.slice(0, 8)}]`);
+              }
+            } catch (e) {
+              log("close_warn", `ATA revoke failed: ${e.message}`);
+            }
+          }
+        } catch (e) {
+          log("close_warn", `Auto-swap after close failed: ${e.message}`);
+        }
+      }
+
       return {
         success: true,
         position: position_address,
@@ -2093,7 +2142,10 @@ export async function closePosition({ position_address, reason }) {
         txs: txHashes,
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
-        base_mint: pool.lbPair.tokenXMint.toString(),
+        base_mint: baseMint,
+        auto_swapped: autoSwapped,
+        auto_swap_note: autoSwapNote,
+        sol_received: solReceived,
       };
     }
 
@@ -2108,6 +2160,55 @@ export async function closePosition({ position_address, reason }) {
       metrics: {},
     });
 
+    // Auto-swap base token back to SOL after close (same logic as above)
+    const baseMint = pool.lbPair.tokenXMint.toString();
+    let autoSwapped = false;
+    let autoSwapNote = null;
+    let solReceived = null;
+
+    if (config.management.autoSwapAfterClose !== false) {
+      try {
+        await new Promise(r => setTimeout(r, 2000));
+
+        let token = null;
+        let balances = await getWalletBalances({});
+        token = balances.tokens?.find(t => t.mint === baseMint);
+
+        if (!token) {
+          log("close", `Token ${baseMint.slice(0, 8)} not found in balances, retrying in 2s...`);
+          await new Promise(r => setTimeout(r, 2000));
+          balances = await getWalletBalances({});
+          token = balances.tokens?.find(t => t.mint === baseMint);
+        }
+
+        const minUsd = config.management.autoSwapMinUsd ?? 0.10;
+        if (token && token.usd >= minUsd) {
+          log("close", `Auto-swapping ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
+          const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
+          autoSwapped = true;
+          autoSwapNote = `Base token already auto-swapped back to SOL (${token.symbol || baseMint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
+          if (swapResult?.amount_out) solReceived = swapResult.amount_out;
+        } else if (!token) {
+          log("close_warn", `Auto-swap skipped: token ${baseMint.slice(0, 8)} not found in wallet balances after retry`);
+        } else {
+          log("close", `Skipping auto-swap for ${token?.symbol || baseMint.slice(0, 8)}: $${token?.usd?.toFixed(2) || "0"} < $${minUsd} threshold`);
+        }
+
+        if (config.management.autoRevokeAtaAfterClose && baseMint) {
+          try {
+            const revoked = await revokeEmptyAtas({ mints: [baseMint] });
+            if (revoked.closed > 0) {
+              log("close", `Reclaimed ${revoked.sol_reclaimed.toFixed(5)} SOL from ${revoked.closed} ATA(s) [${baseMint.slice(0, 8)}]`);
+            }
+          } catch (e) {
+            log("close_warn", `ATA revoke failed: ${e.message}`);
+          }
+        }
+      } catch (e) {
+        log("close_warn", `Auto-swap after close failed: ${e.message}`);
+      }
+    }
+
     return {
       success: true,
       position: position_address,
@@ -2116,7 +2217,10 @@ export async function closePosition({ position_address, reason }) {
       claim_txs: claimTxHashes,
       close_txs: closeTxHashes,
       txs: txHashes,
-      base_mint: pool.lbPair.tokenXMint.toString(),
+      base_mint: baseMint,
+      auto_swapped: autoSwapped,
+      auto_swap_note: autoSwapNote,
+      sol_received: solReceived,
     };
   } catch (error) {
     log("close_error", error.message);
