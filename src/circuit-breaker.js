@@ -121,16 +121,21 @@ export function recordClose(entry, now = Date.now()) {
   s.dailyPnlSol = Math.round((s.dailyPnlSol + pnlSol) * 1e6) / 1e6;
 
   if (!s.tripped) {
+    // BUG-13 (Audit 5/21): when both streak and daily-loss conditions
+    // breach in the same call, combine reasons so post-mortem reflects
+    // the full picture instead of only the first match.
+    const reasons = [];
     const losses = s.recentCloses.filter((c) => (c.pnl_sol ?? 0) < 0).length;
     if (s.recentCloses.length >= cfg.streakWindow && losses >= cfg.streakThreshold) {
+      reasons.push(`losing streak ${losses}/${s.recentCloses.length} recent closes`);
+    }
+    if (s.dailyPnlSol <= -cfg.maxDailyLossSol) {
+      reasons.push(`daily loss ${s.dailyPnlSol.toFixed(3)} SOL ≤ -${cfg.maxDailyLossSol}`);
+    }
+    if (reasons.length > 0) {
       s.tripped = true;
       s.trippedAt = new Date(now).toISOString();
-      s.reason = `losing streak ${losses}/${s.recentCloses.length} recent closes`;
-      log("circuit_breaker", `🛑 TRIPPED: ${s.reason}`);
-    } else if (s.dailyPnlSol <= -cfg.maxDailyLossSol) {
-      s.tripped = true;
-      s.trippedAt = new Date(now).toISOString();
-      s.reason = `daily loss ${s.dailyPnlSol.toFixed(3)} SOL ≤ -${cfg.maxDailyLossSol}`;
+      s.reason = reasons.join(" + ");
       log("circuit_breaker", `🛑 TRIPPED: ${s.reason}`);
     }
   }
