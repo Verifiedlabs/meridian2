@@ -3579,15 +3579,34 @@ async function telegramHandler(msg) {
     const isDeployRequest = !hasCloseIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b/i.test(text);
     const agentRole = isDeployRequest ? "SCREENER" : "GENERAL";
     const agentModel = agentRole === "SCREENER" ? config.llm.screeningModel : config.llm.generalModel;
+
+    // BUG-49 (Audit 5/21): Telegram-triggered deploys would bypass
+    // _screeningBusy and could race with the management→screening cron.
+    // Two SCREENER agentLoops running in parallel each hold their own
+    // `firedOnce` Set, so BUG-16's single-loop guard doesn't catch the
+    // double-deploy. Acquire _screeningBusy for the duration of any
+    // SCREENER-role call from Telegram.
+    const acquireScreening = agentRole === "SCREENER";
+    if (acquireScreening) {
+      if (_screeningBusy) {
+        await sendMessage("Screening cycle already running — please wait or retry shortly.").catch(() => {});
+        return;
+      }
+      _screeningBusy = true;
+    }
     liveMessage = await createLiveMessage("🤖 Live Update", `Request: ${text.slice(0, 240)}`);
-    const { content } = await agentLoop(text, config.llm.maxSteps, sessionHistory, agentRole, agentModel, null, {
-      interactive: true,
-      onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
-      onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
-    });
-    appendHistory(text, content);
-    if (liveMessage) await liveMessage.finalize(stripThink(content));
-    else await sendMessage(stripThink(content));
+    try {
+      const { content } = await agentLoop(text, config.llm.maxSteps, sessionHistory, agentRole, agentModel, null, {
+        interactive: true,
+        onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
+        onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+      });
+      appendHistory(text, content);
+      if (liveMessage) await liveMessage.finalize(stripThink(content));
+      else await sendMessage(stripThink(content));
+    } finally {
+      if (acquireScreening) _screeningBusy = false;
+    }
   } catch (e) {
     if (liveMessage) await liveMessage.fail(e.message).catch((err) => log("silent_warn", err.message));
     else await sendMessage(`Error: ${e.message}`).catch((err) => log("silent_warn", err.message));
