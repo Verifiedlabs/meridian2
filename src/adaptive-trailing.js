@@ -39,10 +39,26 @@ export function getEffectiveTrailingParams(pos, mgmtConfig) {
   const multiplier  = Number(mgmtConfig?.trailingVolMultiplier ?? 0);
   const pivot       = Number(mgmtConfig?.trailingVolPivot ?? 2.5);
   const volMaxScale = Number(mgmtConfig?.trailingVolMaxScale ?? 5.0);
-  const minTrigger  = Number(mgmtConfig?.trailingMinTriggerPct ?? -Infinity);
-  const maxTrigger  = Number(mgmtConfig?.trailingMaxTriggerPct ?? Infinity);
-  const minDrop     = Number(mgmtConfig?.trailingMinDropPct    ?? -Infinity);
-  const maxDrop     = Number(mgmtConfig?.trailingMaxDropPct    ?? Infinity);
+
+  // BUG-2 (Audit 5/21): when `trailingMinTriggerPct` is unset, the previous
+  // -Infinity floor allowed safeScale=0.05 to drag baseTrigger × 0.05 down
+  // to ~0.4% in low-vol pools — fast-firing TP at almost nothing. Use a
+  // conservative floor of max(baseTrigger × 0.3, 1.5%) so the trailing
+  // band can't collapse beyond meaningful drift.
+  const cfgMinTrigger = Number(mgmtConfig?.trailingMinTriggerPct);
+  const cfgMaxTrigger = Number(mgmtConfig?.trailingMaxTriggerPct);
+  const cfgMinDrop    = Number(mgmtConfig?.trailingMinDropPct);
+  const cfgMaxDrop    = Number(mgmtConfig?.trailingMaxDropPct);
+  const fallbackMinTrigger = Number.isFinite(baseTrigger)
+    ? Math.max(baseTrigger * 0.3, 1.5)
+    : 1.5;
+  const fallbackMinDrop = Number.isFinite(baseDrop)
+    ? Math.max(baseDrop * 0.3, 0.5)
+    : 0.5;
+  const minTrigger = Number.isFinite(cfgMinTrigger) ? cfgMinTrigger : fallbackMinTrigger;
+  const maxTrigger = Number.isFinite(cfgMaxTrigger) ? cfgMaxTrigger : Infinity;
+  const minDrop    = Number.isFinite(cfgMinDrop)    ? cfgMinDrop    : fallbackMinDrop;
+  const maxDrop    = Number.isFinite(cfgMaxDrop)    ? cfgMaxDrop    : Infinity;
 
   const volatility = pos?.volatility != null && Number.isFinite(Number(pos.volatility))
     ? Number(pos.volatility)
