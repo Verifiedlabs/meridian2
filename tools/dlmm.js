@@ -1552,7 +1552,28 @@ export async function claimFees({ position_address }) {
     }
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
     _positionsCacheAt = 0; // invalidate cache after claim
-    recordClaim(position_address);
+
+    // BUG-45 (Audit 5/21): pass real fees_usd to recordClaim. Without this,
+    // total_fees_claimed_usd silently stays at 0 and LLM thinks the position
+    // generated zero yield, triggering premature closes.
+    let claimedFeesUsd = 0;
+    try {
+      const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=open&pageSize=100&page=1`;
+      const res = await meridianFetchWithTimeout(closedUrl, {}, 8_000).catch(() => null);
+      if (res && res.ok) {
+        const data = await res.json();
+        const posEntry = (data.positions || []).find((p) => p.positionAddress === position_address);
+        if (posEntry) {
+          const apiTotal = parseFloat(posEntry.allTimeFees?.total?.usd || 0);
+          const priorTotal = tracked?.total_fees_claimed_usd || 0;
+          const delta = apiTotal - priorTotal;
+          claimedFeesUsd = Number.isFinite(delta) && delta > 0 ? delta : 0;
+        }
+      }
+    } catch (err) {
+      log("claim_warn", `Failed to fetch claimed fees USD: ${err.message}`);
+    }
+    recordClaim(position_address, claimedFeesUsd);
 
     return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
   } catch (error) {
