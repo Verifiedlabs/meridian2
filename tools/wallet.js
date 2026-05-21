@@ -18,6 +18,21 @@ import { config } from "../config.js";
 import { getConnection } from "../rpc.js";
 
 let _wallet = null;
+// BUG-35 (Audit 5/21): cache token decimals. Mint decimals never change,
+// so fetching them per swap is wasted RPC. Old code also fell back to
+// `?? 9` on lookup failure — disastrous for 6-decimal tokens (USDC etc.):
+// silent 1000× amount inflation. Throw instead.
+const _decimalsCache = new Map();
+async function getMintDecimals(connection, mint) {
+  if (_decimalsCache.has(mint)) return _decimalsCache.get(mint);
+  const info = await connection.getParsedAccountInfo(new PublicKey(mint));
+  const d = info?.value?.data?.parsed?.info?.decimals;
+  if (!Number.isFinite(d)) {
+    throw new Error(`Decimal lookup failed for mint ${mint} — refusing swap with unknown decimals`);
+  }
+  _decimalsCache.set(mint, d);
+  return d;
+}
 
 function getWallet() {
   if (!_wallet) {
@@ -358,8 +373,7 @@ export async function swapToken({
     // ─── Convert to smallest unit ──────────────────────────────
     let decimals = 9; // SOL default
     if (input_mint !== config.tokens.SOL) {
-      const mintInfo = await connection.getParsedAccountInfo(new PublicKey(input_mint));
-      decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
+      decimals = await getMintDecimals(connection, input_mint);
     }
     const amountStr = Math.floor(amount * Math.pow(10, decimals)).toString();
 
