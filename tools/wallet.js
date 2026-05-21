@@ -433,6 +433,32 @@ export async function swapToken({
       throw new Error(`Swap failed on-chain: code=${result.code}`);
     }
 
+    // BUG-36 (Audit 5/21): verify tx actually landed on-chain. Jupiter's
+    // status field can lag — "Success" doesn't always mean confirmed.
+    // confirmTransaction blocks until the signature is finalized or errors.
+    try {
+      const confirmation = await connection.confirmTransaction(result.signature, "confirmed");
+      if (confirmation?.value?.err) {
+        throw new Error(`Swap on-chain confirmation failed: ${JSON.stringify(confirmation.value.err)}`);
+      }
+    } catch (err) {
+      // Don't mask the original swap result if confirmation just times out;
+      // log a warning so the operator knows the swap is in-flight.
+      log("swap_warn", `On-chain confirmation incomplete for ${result.signature}: ${err.message}`);
+    }
+
+    // BUG-37 (Audit 5/21): warn if actual output deviates substantially
+    // from the quoted output. Catches MEV sandwiches and abnormal slippage
+    // that fall outside the slippageBps cap (e.g. partial fills, hops).
+    const quotedOut = Number(order?.outAmount ?? order?.outputAmount ?? 0);
+    const actualOut = Number(result?.outputAmountResult ?? 0);
+    if (Number.isFinite(quotedOut) && quotedOut > 0 && Number.isFinite(actualOut) && actualOut > 0) {
+      const deviation = (quotedOut - actualOut) / quotedOut;
+      if (deviation > 0.10) {
+        log("swap_warn", `Swap output deviated ${(deviation * 100).toFixed(1)}% below quote (quoted=${quotedOut}, actual=${actualOut}, tx=${result.signature})`);
+      }
+    }
+
     log("swap", `SUCCESS tx: ${result.signature}`);
 
     return {
