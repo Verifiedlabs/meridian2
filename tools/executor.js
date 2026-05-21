@@ -728,8 +728,8 @@ export async function executeTool(name, args) {
           const poolAddr = result.pool || args.pool_address;
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
-        // Auto-swap base token back to SOL unless user said to hold
-        if (!args.skip_swap && result.base_mint && config.management.autoSwapAfterClose !== false) {
+        // Auto-swap base token back to SOL unless user said to hold or already swapped by dlmm.js
+        if (!args.skip_swap && result.base_mint && config.management.autoSwapAfterClose !== false && !result.auto_swapped) {
           try {
             // Wait for wallet balance to update after close
             await new Promise(r => setTimeout(r, 2000));
@@ -885,8 +885,10 @@ export async function runSafetyChecks(name, args) {
       }
 
       // Check amount limits
-      const amountY = args.amount_y ?? args.amount_sol ?? 0;
-      if (amountY <= 0) {
+      // BUG-15 (Audit 5/21): coerce to Number. A string "0.5" passes
+      // `<= 0` via string comparison and corrupts downstream math.
+      const amountY = Number(args.amount_y ?? args.amount_sol ?? 0);
+      if (!Number.isFinite(amountY) || amountY <= 0) {
         return {
           pass: false,
           reason: `Must provide a positive SOL amount (amount_y).`,
