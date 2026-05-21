@@ -412,6 +412,13 @@ function derivLesson(perf, mgmtConfig = null) {
 export function evolveThresholds(perfData, config) {
   if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
 
+  // BUG-25 (Audit 5/21): exclude exploration deploys from threshold evolution.
+  // Exploration mode bypasses Darwin weights and relaxes thresholds by design,
+  // so feeding those outcomes back into evolveThresholds biases the floor
+  // toward whatever-loosens-works. Use only normal-mode closes.
+  const normalPerf = perfData.filter((p) => !p?.exploration);
+  if (normalPerf.length < MIN_EVOLVE_POSITIONS) return null;
+
   // Loser cutoff: respect the user's actual stop-loss threshold so we
   // count true SL events (and worse) as losers. Falls back to -5% for
   // legacy configs without management.stopLossPct. We add a small +1
@@ -422,8 +429,8 @@ export function evolveThresholds(perfData, config) {
     : -5;
   const loserCutoff = Math.min(-5, slPct + 1);
 
-  const winners = perfData.filter((p) => p.pnl_pct > 0);
-  const losers  = perfData.filter((p) => p.pnl_pct < loserCutoff);
+  const winners = normalPerf.filter((p) => p.pnl_pct > 0);
+  const losers  = normalPerf.filter((p) => p.pnl_pct < loserCutoff);
 
   // Need at least some signal in both directions before adjusting
   const hasSignal = winners.length >= 2 || losers.length >= 2;
@@ -535,12 +542,19 @@ export function evolveThresholds(perfData, config) {
   if (Object.keys(changes).length === 0) return { changes: {}, rationale: {} };
 
   // ── Persist changes to user-config.json ───────────────────────
+  // BUG-26 (Audit 5/21): write under nested `screening` key so the config
+  // loader (which reads cfg.screening.maxVolatility) actually picks up
+  // evolved values. Flat top-level keys created shadow duplicates that
+  // shadowed nothing on load.
   let userConfig = {};
   if (fs.existsSync(USER_CONFIG_PATH)) {
     try { userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8")); } catch { /* ignore */ }
   }
 
-  Object.assign(userConfig, changes);
+  if (!userConfig.screening || typeof userConfig.screening !== "object") {
+    userConfig.screening = {};
+  }
+  Object.assign(userConfig.screening, changes);
   userConfig._lastEvolved = new Date().toISOString();
   userConfig._positionsAtEvolution = perfData.length;
 

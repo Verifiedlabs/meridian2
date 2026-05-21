@@ -275,7 +275,12 @@ export async function recalculateWeights(perfData, cfg = {}) {
   // Persist
   data.weights = weights;
   data.last_recalc = new Date().toISOString();
-  data.recalc_count = (data.recalc_count || 0) + 1;
+  // BUG-42 (Audit 5/21): only count recalc when something actually changed.
+  // Previously incremented on every call so recalc_count overstated activity
+  // and made it impossible to tell from logs whether Darwin was learning.
+  if (changes.length > 0) {
+    data.recalc_count = (data.recalc_count || 0) + 1;
+  }
   if (!data.history) data.history = [];
   if (changes.length > 0) {
     data.history.push({
@@ -322,7 +327,10 @@ function computeNumericLift(signal, wins, losses, minSamples) {
   const min = Math.min(...all);
   const max = Math.max(...all);
   const range = max - min;
-  if (range === 0) return 0;
+  // BUG-41 (Audit 5/21): zero-range means signal has no variation in this
+  // sample, return null instead of 0 so the consistency checker skips it
+  // rather than counting it as agreement and inflating signMatches.
+  if (range === 0) return null;
 
   const normalize = (v) => (v - min) / range;
   const winMean  = mean(winVals.map(normalize));
