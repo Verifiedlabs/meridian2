@@ -26,10 +26,15 @@ export function stageSignals(poolAddress, signals) {
     ...signals,
     staged_at: Date.now(),
   });
-  // Clean up stale entries
+  // BUG-5 (Audit 5/21): clean up stale entries with explicit logging.
+  // Silent TTL eviction was the May-10 Darwin pipeline bug — when a
+  // signal evicts before deploy_position fires, the position deploys
+  // without signals attached and Darwin never learns from it.
   for (const [addr, data] of _staged) {
-    if (Date.now() - data.staged_at > STAGE_TTL_MS) {
+    const ageMs = Date.now() - data.staged_at;
+    if (ageMs > STAGE_TTL_MS) {
       _staged.delete(addr);
+      log("signals_warn", `TTL evicted ${addr.slice(0, 8)} after ${Math.round(ageMs / 1000)}s — signal lost from Darwin pipeline`);
     }
   }
 }
@@ -83,11 +88,12 @@ export function computeHiveConsensus(poolName, sharedLessons) {
     .split(/[-/]/)[0]
     ?.trim()
     .toLowerCase();
-  if (!symbol || symbol.length < 2) return false;
-  return sharedLessons.some((lesson) => {
-    const rule = String(lesson?.rule || "").toLowerCase();
-    return rule.includes(symbol);
-  });
+  // BUG-6 (Audit 5/21): require word boundary + min 3 chars to avoid
+  // false positives like "SOL", "TP", "SL" matching almost every lesson.
+  if (!symbol || symbol.length < 3) return false;
+  const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`\\b${escaped}\\b`, "i");
+  return sharedLessons.some((lesson) => re.test(String(lesson?.rule || "")));
 }
 
 /**
